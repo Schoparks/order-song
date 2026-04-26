@@ -1,0 +1,13 @@
+backend/.venv/
+backend/__pycache__/
+backend/.pytest_cache/
+backend/.ruff_cache/
+backend/*.sqlite3
+backend/*.db
+
+frontend/.cache/
+
+.DS_Store
+Thumbs.db
+*.log
+*.sqlite3
