@@ -1,5 +1,7 @@
 backend/.venv/
-backend/__pycache__/
+backend/app/__pycache__/
+backend/app/routers/__pycache__/
+backend/app/core/__pycache__/
 backend/.pytest_cache/
 backend/.ruff_cache/
 backend/*.sqlite3
