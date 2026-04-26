@@ -623,10 +623,22 @@ async function bootstrap() {
     stopRoomsRefresh();
     return;
   }
+  state.me = null;
+  setUserLabel(null);
   try {
     state.me = await api("/api/me");
     setUserLabel(state.me.username);
-  } catch (_) {}
+  } catch (e) {
+    if (e.status === 401) {
+      state.token = null;
+      localStorage.removeItem("token");
+      localStorage.removeItem("roomId");
+      state.roomId = null;
+      showView("viewAuth");
+      setChromeVisible(false);
+      return;
+    }
+  }
 
   if (!state.roomId) {
     showView("viewRooms");
@@ -863,6 +875,7 @@ document.getElementById("btnChangePassword").addEventListener("click", async () 
 });
 document.getElementById("btnLogout").addEventListener("click", async () => {
   state.token = null;
+  state.me = null;
   localStorage.removeItem("token");
   localStorage.removeItem("roomId");
   state.roomId = null;
