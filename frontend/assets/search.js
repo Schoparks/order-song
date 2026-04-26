@@ -1,9 +1,9 @@
 import { state } from './state.js';
 import { api } from './api.js';
-import { escapeHtml, trackKey } from './utils.js';
+import { escapeHtml, trackKey, reconcileList } from './utils.js';
 import { syncOrderButtonState, syncPlaylistButtonState } from './buttons.js';
 import { refreshQueue } from './queue.js';
-import { togglePlaylistItem } from './playlist.js';
+import { togglePlaylistItem, showPlaylistPicker } from './playlist.js';
 
 function getHistory() {
   try {
@@ -52,6 +52,44 @@ export function closeSearchOverlay() {
   document.getElementById("viewSearch").classList.add("hidden");
 }
 
+function buildSearchRow(t, idx) {
+  const el = document.createElement("div");
+  el.className = "item";
+  el.innerHTML = `
+    <div>
+      <div class="title">${escapeHtml(t.title || "-")}</div>
+      <div class="meta">${escapeHtml(t.source)} · ${escapeHtml(t.artist || "-")}</div>
+    </div>
+    <div class="actions">
+      <button class="btn small js-order">点歌</button>
+      <button class="btn small js-fav">加入歌单</button>
+    </div>
+  `;
+  const orderBtn = el.querySelector(".js-order");
+  orderBtn.setAttribute("data-track-key", trackKey(t));
+  syncOrderButtonState(orderBtn, t);
+  orderBtn.addEventListener("click", async () => {
+    await api(`/api/rooms/${state.roomId}/queue`, {
+      method: "POST",
+      json: {
+        source: t.source,
+        source_track_id: t.source_track_id,
+        title: t.title,
+        artist: t.artist,
+        duration_ms: t.duration_ms,
+        cover_url: t.cover_url,
+      },
+    });
+    await refreshQueue();
+    syncOrderButtonState(orderBtn, t);
+  });
+  const favBtn = el.querySelector(".js-fav");
+  favBtn.setAttribute("data-track-key", trackKey(t));
+  syncPlaylistButtonState(favBtn, t);
+  favBtn.addEventListener("click", () => showPlaylistPicker(t, favBtn));
+  return el;
+}
+
 export async function runSearch() {
   const q = document.getElementById("searchInput2").value.trim();
   if (!q) return;
@@ -63,91 +101,61 @@ export async function runSearch() {
   try {
     const items = await api(`/api/search?q=${encodeURIComponent(q)}`);
     items.forEach((t, idx) => {
-      const el = document.createElement("div");
-      el.className = "item";
-      el.style.animationDelay = `${idx * 40}ms`;
-      el.innerHTML = `
-        <div>
-          <div class="title">${escapeHtml(t.title || "-")}</div>
-          <div class="meta">${escapeHtml(t.source)} · ${escapeHtml(t.artist || "-")}</div>
-        </div>
-        <div class="actions">
-          <button class="btn small js-order">点歌</button>
-          <button class="btn small js-fav">加入歌单</button>
-        </div>
-      `;
-      const orderBtn = el.querySelector(".js-order");
-      orderBtn.setAttribute("data-track-key", trackKey(t));
-      syncOrderButtonState(orderBtn, t);
-      orderBtn.addEventListener("click", async () => {
-        await api(`/api/rooms/${state.roomId}/queue`, {
-          method: "POST",
-          json: {
-            source: t.source,
-            source_track_id: t.source_track_id,
-            title: t.title,
-            artist: t.artist,
-            duration_ms: t.duration_ms,
-            cover_url: t.cover_url,
-          },
-        });
-        await refreshQueue();
-        syncOrderButtonState(orderBtn, t);
-      });
-      const favBtn = el.querySelector(".js-fav");
-      favBtn.setAttribute("data-track-key", trackKey(t));
-      syncPlaylistButtonState(favBtn, t);
-      favBtn.addEventListener("click", () => togglePlaylistItem(t, favBtn));
-      resultsEl.appendChild(el);
+      resultsEl.appendChild(buildSearchRow(t, idx));
     });
   } catch (e) {
     resultsEl.innerHTML = `<div class="item"><div><div class="title">搜索失败</div><div class="meta">${escapeHtml(e.message)}</div></div></div>`;
   }
 }
 
+function buildTrendingRow(it, idx) {
+  const t = it.track;
+  const row = document.createElement("div");
+  row.className = "item";
+  row.innerHTML = `
+    <div>
+      <div class="title">${escapeHtml(t.title)}</div>
+      <div class="meta">${escapeHtml(t.source)} · ${escapeHtml(t.artist || "-")} · ${it.order_count}次</div>
+    </div>
+    <div class="actions">
+      <button class="btn small js-order">点歌</button>
+      <button class="btn small js-fav">加入歌单</button>
+    </div>
+  `;
+  const orderBtn = row.querySelector(".js-order");
+  orderBtn.setAttribute("data-track-key", trackKey(t));
+  syncOrderButtonState(orderBtn, t);
+  orderBtn.addEventListener("click", async () => {
+    if (!state.roomId) throw new Error("not in room");
+    await api(`/api/rooms/${state.roomId}/queue`, {
+      method: "POST",
+      json: {
+        source: t.source,
+        source_track_id: t.source_track_id,
+        title: t.title,
+        artist: t.artist,
+        duration_ms: t.duration_ms,
+        cover_url: t.cover_url,
+      },
+    });
+    await refreshQueue();
+    syncOrderButtonState(orderBtn, t);
+  });
+  const favBtn = row.querySelector(".js-fav");
+  favBtn.setAttribute("data-track-key", trackKey(t));
+  syncPlaylistButtonState(favBtn, t);
+  favBtn.addEventListener("click", () => showPlaylistPicker(t, favBtn));
+  return row;
+}
+
 export async function loadTrending() {
   if (!state.token) return;
   const items = await api("/api/trending?limit=20");
   const el = document.getElementById("tabTrending");
-  el.innerHTML = "";
-  items.forEach((it, idx) => {
-    const t = it.track;
-    const row = document.createElement("div");
-    row.className = "item";
-    row.style.animationDelay = `${idx * 40}ms`;
-    row.innerHTML = `
-      <div>
-        <div class="title">${escapeHtml(t.title)}</div>
-        <div class="meta">${escapeHtml(t.source)} · ${escapeHtml(t.artist || "-")} · ${it.order_count}次</div>
-      </div>
-      <div class="actions">
-        <button class="btn small js-order">点歌</button>
-        <button class="btn small js-fav">加入歌单</button>
-      </div>
-    `;
-    const orderBtn = row.querySelector(".js-order");
-    orderBtn.setAttribute("data-track-key", trackKey(t));
-    syncOrderButtonState(orderBtn, t);
-    orderBtn.addEventListener("click", async () => {
-      if (!state.roomId) throw new Error("not in room");
-      await api(`/api/rooms/${state.roomId}/queue`, {
-        method: "POST",
-        json: {
-          source: t.source,
-          source_track_id: t.source_track_id,
-          title: t.title,
-          artist: t.artist,
-          duration_ms: t.duration_ms,
-          cover_url: t.cover_url,
-        },
-      });
-      await refreshQueue();
-      syncOrderButtonState(orderBtn, t);
-    });
-    const favBtn = row.querySelector(".js-fav");
-    favBtn.setAttribute("data-track-key", trackKey(t));
-    syncPlaylistButtonState(favBtn, t);
-    favBtn.addEventListener("click", () => togglePlaylistItem(t, favBtn));
-    el.appendChild(row);
-  });
+  reconcileList(
+    el,
+    items,
+    (it) => `${it.track.source}:${it.track.source_track_id}`,
+    (it, idx) => buildTrendingRow(it, idx)
+  );
 }

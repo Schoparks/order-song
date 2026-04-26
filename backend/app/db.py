@@ -1,21 +1,41 @@
+import sqlite3
+
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.core.config import settings
 
 
 def _db_url() -> str:
-    # sqlite file under backend/ working directory
     return f"sqlite:///{settings.sqlite_path}"
 
 
 engine = create_engine(_db_url(), connect_args={"check_same_thread": False})
 
 
+def _migrate_columns():
+    """Add any missing columns to existing tables (lightweight migration)."""
+    migrations = [
+        ("users", "is_admin", "BOOLEAN DEFAULT 0"),
+    ]
+    conn = sqlite3.connect(settings.sqlite_path)
+    cur = conn.cursor()
+    for table, col, typedef in migrations:
+        try:
+            cur.execute(f"SELECT {col} FROM {table} LIMIT 1")
+        except sqlite3.OperationalError:
+            try:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+            except sqlite3.OperationalError:
+                pass
+    conn.commit()
+    conn.close()
+
+
 def init_db() -> None:
-    # Import models so they are registered on SQLModel.metadata
     from app import models  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
+    _migrate_columns()
 
 
 def get_session():

@@ -33,8 +33,8 @@ export function rerenderSearchButtons() {
 
 export function syncPlaylistButtonState(btn, t) {
   const key = trackKey(t);
-  const inPlaylist = state.playlistKeys.has(key);
-  if (inPlaylist) {
+  const info = state.playlistKeys.get(key);
+  if (info) {
     btn.textContent = "已添加";
     btn.classList.add("subtle");
   } else {
@@ -47,8 +47,8 @@ export function rerenderAllPlaylistButtons() {
   document.querySelectorAll(".js-fav[data-track-key]").forEach((btn) => {
     const key = btn.getAttribute("data-track-key");
     if (!key) return;
-    const inPlaylist = state.playlistKeys.has(key);
-    if (inPlaylist) {
+    const info = state.playlistKeys.get(key);
+    if (info) {
       btn.textContent = "已添加";
       btn.classList.add("subtle");
     } else {

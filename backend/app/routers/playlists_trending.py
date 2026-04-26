@@ -1,5 +1,7 @@
+import re
 from datetime import datetime
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, delete, select
 
@@ -13,8 +15,14 @@ router = APIRouter(prefix="/api", tags=["playlists", "trending"])
 
 @router.get("/playlists")
 def list_playlists(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pls = db.exec(select(UserPlaylist).where(UserPlaylist.user_id == user.id).order_by(UserPlaylist.created_at.desc())).all()
-    return [{"id": p.id, "name": p.name, "created_at": p.created_at} for p in pls]
+    pls = db.exec(select(UserPlaylist).where(UserPlaylist.user_id == user.id).order_by(UserPlaylist.created_at.asc())).all()
+    out = []
+    for p in pls:
+        count = db.exec(
+            select(UserPlaylistItem.id).where(UserPlaylistItem.playlist_id == p.id)
+        ).all()
+        out.append({"id": p.id, "name": p.name, "created_at": p.created_at, "item_count": len(count)})
+    return out
 
 
 @router.post("/playlists")
@@ -23,6 +31,21 @@ def create_playlist(payload: dict, db: Session = Depends(get_db), user: User = D
     if not name:
         raise HTTPException(status_code=400, detail="name required")
     pl = UserPlaylist(user_id=user.id, name=name)
+    db.add(pl)
+    db.commit()
+    db.refresh(pl)
+    return {"id": pl.id, "name": pl.name, "created_at": pl.created_at, "item_count": 0}
+
+
+@router.patch("/playlists/{playlist_id}")
+def rename_playlist(playlist_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    pl = db.get(UserPlaylist, playlist_id)
+    if not pl or pl.user_id != user.id:
+        raise HTTPException(status_code=404, detail="playlist not found")
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="name required")
+    pl.name = name
     db.add(pl)
     db.commit()
     db.refresh(pl)
@@ -122,6 +145,146 @@ def delete_playlist_item(playlist_id: int, item_id: int, db: Session = Depends(g
     return {"ok": True}
 
 
+@router.post("/playlists/{playlist_id}/items/{item_id}/move")
+def move_playlist_item(playlist_id: int, item_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Move a track from one playlist to another."""
+    pl = db.get(UserPlaylist, playlist_id)
+    if not pl or pl.user_id != user.id:
+        raise HTTPException(status_code=404, detail="playlist not found")
+    it = db.get(UserPlaylistItem, item_id)
+    if not it or it.playlist_id != playlist_id:
+        raise HTTPException(status_code=404, detail="item not found")
+    target_id = payload.get("target_playlist_id")
+    if not target_id:
+        raise HTTPException(status_code=400, detail="target_playlist_id required")
+    target = db.get(UserPlaylist, target_id)
+    if not target or target.user_id != user.id:
+        raise HTTPException(status_code=404, detail="target playlist not found")
+    existing = db.exec(
+        select(UserPlaylistItem).where(
+            UserPlaylistItem.playlist_id == target_id,
+            UserPlaylistItem.track_id == it.track_id,
+        )
+    ).first()
+    if existing:
+        db.delete(it)
+        db.commit()
+        return {"id": existing.id, "created_at": existing.created_at}
+    it.playlist_id = target_id
+    db.add(it)
+    db.commit()
+    db.refresh(it)
+    return {"id": it.id, "created_at": it.created_at}
+
+
+@router.get("/playlists/track-map")
+def track_playlist_map(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Returns a mapping of all tracks in user's playlists: {source:source_track_id -> {item_id, playlist_id}}"""
+    pls = db.exec(select(UserPlaylist).where(UserPlaylist.user_id == user.id)).all()
+    result = {}
+    for pl in pls:
+        items = db.exec(
+            select(UserPlaylistItem, Track)
+            .join(Track, Track.id == UserPlaylistItem.track_id)
+            .where(UserPlaylistItem.playlist_id == pl.id)
+        ).all()
+        for it, tr in items:
+            key = f"{tr.source}:{tr.source_track_id}"
+            result[key] = {"item_id": it.id, "playlist_id": pl.id, "playlist_name": pl.name}
+    return result
+
+
+@router.post("/playlists/import-netease")
+async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Import a NetEase Cloud Music playlist, excluding VIP-only songs."""
+    url_or_id = (payload.get("url") or payload.get("id") or "").strip()
+    if not url_or_id:
+        raise HTTPException(status_code=400, detail="url or id required")
+
+    playlist_id = None
+    m = re.search(r"id=(\d+)", url_or_id)
+    if m:
+        playlist_id = m.group(1)
+    elif url_or_id.isdigit():
+        playlist_id = url_or_id
+
+    if not playlist_id:
+        raise HTTPException(status_code=400, detail="无法解析歌单ID，请提供歌单链接或ID")
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.163.com/",
+        }) as client:
+            r = await client.get(
+                "https://music.163.com/api/playlist/detail",
+                params={"id": playlist_id},
+            )
+            r.raise_for_status()
+            data = r.json()
+    except Exception:
+        raise HTTPException(status_code=502, detail="请求网易云API失败")
+
+    result = data.get("result")
+    if not result:
+        raise HTTPException(status_code=400, detail="歌单不存在或无法访问")
+
+    netease_name = result.get("name") or f"网易云歌单{playlist_id}"
+    tracks_raw = result.get("tracks") or []
+
+    playlist_name = (payload.get("name") or "").strip() or netease_name
+    pl = UserPlaylist(user_id=user.id, name=playlist_name)
+    db.add(pl)
+    db.commit()
+    db.refresh(pl)
+
+    added = 0
+    skipped_vip = 0
+    for s in tracks_raw:
+        sid = s.get("id")
+        if sid is None:
+            continue
+        fee = s.get("fee", 0)
+        if fee == 1:
+            skipped_vip += 1
+            continue
+
+        artists = s.get("artists") or []
+        artist = artists[0].get("name") if artists else None
+        album = s.get("album") or {}
+        cover_url = album.get("picUrl")
+        duration_ms = s.get("duration")
+
+        tr = _get_or_create_track(
+            db,
+            source=TrackSource.netease,
+            source_track_id=str(sid),
+            title=s.get("name") or str(sid),
+            artist=artist,
+            duration_ms=duration_ms,
+            cover_url=cover_url,
+        )
+        existing = db.exec(
+            select(UserPlaylistItem).where(
+                UserPlaylistItem.playlist_id == pl.id,
+                UserPlaylistItem.track_id == tr.id,
+            )
+        ).first()
+        if not existing:
+            db.add(UserPlaylistItem(playlist_id=pl.id, track_id=tr.id))
+            added += 1
+
+    db.commit()
+    return {
+        "ok": True,
+        "playlist_id": pl.id,
+        "playlist_name": playlist_name,
+        "added": added,
+        "skipped_vip": skipped_vip,
+        "total": len(tracks_raw),
+    }
+
+
 @router.get("/trending")
 def trending(limit: int = 50, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     limit = max(1, min(200, int(limit)))
@@ -147,4 +310,3 @@ def trending(limit: int = 50, db: Session = Depends(get_db), user: User = Depend
         }
         for stats, tr in rows
     ]
-

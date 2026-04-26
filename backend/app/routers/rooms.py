@@ -115,6 +115,15 @@ async def remove_member_from_room(db: Session, room_id: int, user_id: int) -> bo
         return False
 
 
+@router.get("/rooms/{room_id}/check")
+def check_room(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    room = db.get(Room, room_id)
+    if not room:
+        return {"exists": False, "is_member": False}
+    member = db.exec(select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == user.id)).first()
+    return {"exists": True, "is_member": bool(member)}
+
+
 @router.post("/rooms/{room_id}/leave")
 async def leave_room(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     room = db.get(Room, room_id)

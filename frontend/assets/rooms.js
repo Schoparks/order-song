@@ -1,6 +1,6 @@
 import { state, stopPeriodicSync } from './state.js';
 import { api } from './api.js';
-import { escapeHtml } from './utils.js';
+import { escapeHtml, reconcileList } from './utils.js';
 import { showView, setChromeVisible } from './ui.js';
 import { audio, setNowPlaying } from './player.js';
 
@@ -29,35 +29,40 @@ export function formatMemberSummary(names, count) {
   return `${shown} 等${count}人`;
 }
 
+function buildRoomRow(r, idx) {
+  const row = document.createElement("div");
+  row.className = "item";
+  const summary = formatMemberSummary(r.member_names || [], r.member_count || 0);
+  row.innerHTML = `
+    <div>
+      <div class="title">${escapeHtml(r.name)}</div>
+      <div class="meta">${r.member_count || 0}人 · ${summary}</div>
+    </div>
+    <div class="actions"><button class="btn small">进入</button></div>
+  `;
+  row.querySelector("button").addEventListener("click", async () => {
+    state.roomId = r.id;
+    await api(`/api/rooms/${state.roomId}/join`, { method: "POST" });
+    localStorage.setItem("roomId", String(state.roomId));
+    const { bootstrap } = await import('./app.js');
+    await bootstrap();
+  });
+  return row;
+}
+
 export async function loadRooms() {
   const rooms = await api("/api/rooms");
   const el = document.getElementById("roomList");
-  el.innerHTML = "";
   if (!rooms.length) {
     el.innerHTML = `<div class="item"><div><div class="title">暂无房间</div><div class="meta">你可以创建一个房间</div></div></div>`;
     return;
   }
-  rooms.forEach((r, idx) => {
-    const row = document.createElement("div");
-    row.className = "item";
-    row.style.animationDelay = `${idx * 50}ms`;
-    const summary = formatMemberSummary(r.member_names || [], r.member_count || 0);
-    row.innerHTML = `
-      <div>
-        <div class="title">${escapeHtml(r.name)}</div>
-        <div class="meta">${r.member_count || 0}人 · ${summary}</div>
-      </div>
-      <div class="actions"><button class="btn small">进入</button></div>
-    `;
-    row.querySelector("button").addEventListener("click", async () => {
-      state.roomId = r.id;
-      await api(`/api/rooms/${state.roomId}/join`, { method: "POST" });
-      localStorage.setItem("roomId", String(state.roomId));
-      const { bootstrap } = await import('./app.js');
-      await bootstrap();
-    });
-    el.appendChild(row);
-  });
+  reconcileList(
+    el,
+    rooms,
+    (r) => String(r.id),
+    (r, idx) => buildRoomRow(r, idx)
+  );
 }
 
 export function startRoomsRefresh() {

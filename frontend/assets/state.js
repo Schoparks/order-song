@@ -30,6 +30,8 @@ export const state = {
   syncTimer: null,
   trendingSyncTimer: null,
   roomsRefreshTimer: null,
+  roomCheckTimer: null,
+  playlists: [],
 };
 
 export function stopPeriodicSync() {
@@ -40,5 +42,9 @@ export function stopPeriodicSync() {
   if (state.trendingSyncTimer) {
     clearInterval(state.trendingSyncTimer);
     state.trendingSyncTimer = null;
+  }
+  if (state.roomCheckTimer) {
+    clearInterval(state.roomCheckTimer);
+    state.roomCheckTimer = null;
   }
 }

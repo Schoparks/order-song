@@ -1,12 +1,11 @@
 import { state } from './state.js';
 import { api } from './api.js';
-import { escapeHtml, trackKey } from './utils.js';
+import { escapeHtml, trackKey, reconcileList } from './utils.js';
 import { rerenderSearchButtons, rerenderAllPlaylistButtons } from './buttons.js';
 
 export function buildQueueRow(it, index = 0) {
   const row = document.createElement("div");
   row.className = "item";
-  row.style.animationDelay = `${index * 40}ms`;
   row.innerHTML = `
     <div>
       <div class="title">${escapeHtml(it.track.title)}</div>
@@ -54,6 +53,17 @@ function buildShuffleBar() {
   return bar;
 }
 
+export function getQueueCount() {
+  return state.queuedKeys ? state.queuedKeys.size : 0;
+}
+
+export function updateQueueCountBadge() {
+  const count = getQueueCount();
+  for (const el of document.querySelectorAll(".queueCount")) {
+    el.textContent = count > 0 ? `${count}首` : "";
+  }
+}
+
 export async function refreshQueue() {
   if (!state.roomId) return;
   const items = await api(`/api/rooms/${state.roomId}/queue`);
@@ -61,18 +71,23 @@ export async function refreshQueue() {
   const queuedOnly = items.filter((it) => it.status === "queued");
   for (const container of [document.getElementById("queueList"), document.getElementById("queueListMobile")]) {
     if (!container) continue;
-    container.innerHTML = "";
-    if (queuedOnly.length > 1) container.appendChild(buildShuffleBar());
-    items.forEach((it, i) => container.appendChild(buildQueueRow(it, i)));
+    const prepend = queuedOnly.length > 1 ? [buildShuffleBar()] : [];
+    reconcileList(
+      container,
+      items,
+      (it) => String(it.id),
+      (it, i) => buildQueueRow(it, i),
+      { prepend }
+    );
   }
   rerenderSearchButtons();
   rerenderAllPlaylistButtons();
+  updateQueueCountBadge();
 }
 
 export function buildHistoryRow(it, index = 0) {
   const row = document.createElement("div");
   row.className = "item";
-  row.style.animationDelay = `${index * 40}ms`;
   row.innerHTML = `
     <div>
       <div class="title">${escapeHtml(it.track.title)}</div>
@@ -102,14 +117,17 @@ export async function refreshHistory() {
   if (!state.roomId) return;
   const items = await api(`/api/rooms/${state.roomId}/history`);
   const filtered = items.filter((it) => !state.queuedKeys.has(`${it.track.source}:${it.track.source_track_id}`));
-  const emptyHtml = `<div class="item"><div><div class="title">暂无</div><div class="meta">播完 / 切歌后会出现在这里</div></div></div>`;
   for (const container of [document.getElementById("historyList"), document.getElementById("historyListMobile")]) {
     if (!container) continue;
-    container.innerHTML = "";
     if (!filtered.length) {
-      container.innerHTML = emptyHtml;
+      container.innerHTML = `<div class="item"><div><div class="title">暂无</div><div class="meta">播完 / 切歌后会出现在这里</div></div></div>`;
       continue;
     }
-    filtered.forEach((it, i) => container.appendChild(buildHistoryRow(it, i)));
+    reconcileList(
+      container,
+      filtered,
+      (it) => String(it.id),
+      (it, i) => buildHistoryRow(it, i)
+    );
   }
 }

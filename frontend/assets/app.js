@@ -7,11 +7,12 @@ import {
   getDesiredPositionMs, getCurrentPositionMs, updateTimeDisplay,
 } from './player.js';
 import { showView, setChromeVisible, setUserLabel, toggleUserMenu } from './ui.js';
-import { refreshQueue, refreshHistory } from './queue.js';
+import { refreshQueue, refreshHistory, updateQueueCountBadge } from './queue.js';
 import { loadPlaylists } from './playlist.js';
 import { openSearchOverlay, closeSearchOverlay, runSearch, renderHistory, loadTrending } from './search.js';
 import { loadRooms, handleRoomGone, startRoomsRefresh, stopRoomsRefresh } from './rooms.js';
 import { connectWs } from './ws.js';
+import { adminLogin, initAdmin } from './admin.js';
 
 // --- Periodic sync ---
 
@@ -28,6 +29,27 @@ async function syncRoomState() {
   }
 }
 
+async function checkRoomAlive() {
+  if (!state.roomId || !state.token) return;
+  try {
+    const res = await api(`/api/rooms/${state.roomId}/check`);
+    if (!res.exists) {
+      handleRoomGone();
+    } else if (!res.is_member) {
+      try {
+        await api(`/api/rooms/${state.roomId}/join`, { method: "POST" });
+        connectWs();
+      } catch (_) {
+        handleRoomGone();
+      }
+    }
+  } catch (e) {
+    if (e.status === 401) {
+      handleRoomGone();
+    }
+  }
+}
+
 function startPeriodicSync() {
   stopPeriodicSync();
   state.syncTimer = setInterval(() => {
@@ -37,6 +59,9 @@ function startPeriodicSync() {
     loadTrending().catch(() => {});
     loadPlaylists().catch(() => {});
   }, TRENDING_SYNC_INTERVAL_MS);
+  state.roomCheckTimer = setInterval(() => {
+    checkRoomAlive().catch(() => {});
+  }, 15000);
 }
 
 // --- Bootstrap ---
@@ -272,6 +297,25 @@ document.getElementById("btnRegister").addEventListener("click", async () => {
     document.getElementById("authHint").textContent = `注册失败：${e.message}`;
   }
 });
+
+document.getElementById("btnAdminLogin").addEventListener("click", async () => {
+  const username = document.getElementById("authUsername").value.trim();
+  const password = document.getElementById("authPassword").value;
+  if (!username || !password) {
+    document.getElementById("authHint").textContent = "请输入账号密码后点击管理端登录";
+    return;
+  }
+  try {
+    await adminLogin(username, password);
+    document.getElementById("authHint").textContent = "";
+  } catch (e) {
+    let msg = "管理端登录失败";
+    try { msg = JSON.parse(e.message).detail || msg; } catch (_) { msg = e.message || msg; }
+    document.getElementById("authHint").textContent = msg;
+  }
+});
+
+initAdmin();
 
 // --- Event listeners: rooms ---
 

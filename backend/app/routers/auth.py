@@ -38,6 +38,17 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     return LoginOut(token=token, user=UserPublic.model_validate(user, from_attributes=True))
 
 
+@router.post("/auth/admin-login", response_model=LoginOut)
+def admin_login(payload: LoginIn, db: Session = Depends(get_db)):
+    user = db.exec(select(User).where(User.username == payload.username)).first()
+    if not user or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid username or password")
+    if not user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="not an admin account")
+    token = create_access_token(subject=str(user.id), extra={"admin": True})
+    return LoginOut(token=token, user=UserPublic.model_validate(user, from_attributes=True))
+
+
 @router.post("/auth/logout")
 def logout():
     # stateless JWT - frontend should just delete token

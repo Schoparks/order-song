@@ -23,9 +23,13 @@ export function connectWs() {
         await refreshHistory();
       }
       if (msg.type === "playback_updated") {
+        const prevQueueItemId = state.lastPb ? state.lastPb.current_queue_item_id : null;
+        const newQueueItemId = msg.playback_state ? msg.playback_state.current_queue_item_id : null;
         await onPlaybackUpdated(msg.playback_state, msg.current_track, msg.ordered_by);
-        await refreshQueue();
-        await refreshHistory();
+        if (prevQueueItemId !== newQueueItemId) {
+          await refreshQueue();
+          await refreshHistory();
+        }
       }
       if (msg.type === "room_destroyed") {
         handleRoomGone();

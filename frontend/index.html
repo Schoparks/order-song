@@ -37,8 +37,25 @@
         <div class="row" style="margin-top:10px">
           <button id="btnLogin" class="btn">登录</button>
           <button id="btnRegister" class="btn">注册</button>
+          <button id="btnAdminLogin" class="btn subtle" style="margin-left:auto">管理端</button>
         </div>
         <div id="authHint" class="hint"></div>
+      </section>
+
+      <!-- Admin view -->
+      <section id="viewAdmin" class="view hidden" style="overflow:auto;flex:1">
+        <div class="glass block" style="max-width:900px;margin:0 auto">
+          <div class="row" style="justify-content:space-between">
+            <div class="sectionTitle" style="margin:0">管理后台</div>
+            <button id="btnAdminLogout" class="btn small danger">退出管理端</button>
+          </div>
+          <div class="tabs" style="margin-top:14px">
+            <button class="tab active" data-admintab="users">用户管理</button>
+            <button class="tab" data-admintab="rooms">房间管理</button>
+          </div>
+          <div id="adminTabUsers"></div>
+          <div id="adminTabRooms" class="hidden"></div>
+        </div>
       </section>
 
       <!-- Room view -->
@@ -87,13 +104,13 @@
             <div class="tabs">
               <button class="tab active" data-tab="trending">热门</button>
               <button class="tab" data-tab="playlists">歌单</button>
-              <button id="queueTabBtn" class="tab" data-tab="queue">播放列表</button>
+              <button id="queueTabBtn" class="tab" data-tab="queue">播放列表 <span class="queueCount"></span></button>
             </div>
             <div id="tabTrending" class="list"></div>
             <div id="tabPlaylists" class="list hidden"></div>
             <div id="tabQueue" class="hidden">
               <div class="tabs mTabs">
-                <button class="tab active" data-mtab="queue">播放列表</button>
+                <button class="tab active" data-mtab="queue">播放列表 <span class="queueCount"></span></button>
                 <button class="tab" data-mtab="history">历史播放</button>
               </div>
               <div id="mobileTabQueue" class="mTabContent">
@@ -108,7 +125,7 @@
 
         <aside class="rightPane glass block">
           <div class="tabs rpTabs">
-            <button class="tab active" data-rtab="queue">播放列表</button>
+            <button class="tab active" data-rtab="queue">播放列表 <span class="queueCount"></span></button>
             <button class="tab" data-rtab="history">历史播放</button>
           </div>
           <div id="rightTabQueue" class="rpTabContent">
