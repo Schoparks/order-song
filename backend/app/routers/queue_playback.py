@@ -1,4 +1,5 @@
 import asyncio
+import random
 import subprocess
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -421,17 +422,20 @@ async def _set_playback(
             old_qi.status = QueueStatus.played
             db.add(old_qi)
             db.commit()
+    ordered_by = None
     if pb.current_queue_item_id:
         qi = db.get(RoomQueueItem, pb.current_queue_item_id)
         if qi:
             qi.status = QueueStatus.playing
             db.add(qi)
             db.commit()
+            u = db.get(User, qi.ordered_by_user_id)
+            if u:
+                ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
             if tr:
                 await _resolve_audio_url(db, tr)
                 current_track = TrackOut.model_validate(tr).model_dump(mode="json")
-                # Many bilibili audio URLs require Referer/Origin; proxy through backend to ensure playback.
                 if tr.source == TrackSource.bilibili and tr.audio_url:
                     current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
     await hub.broadcast(
@@ -441,6 +445,7 @@ async def _set_playback(
             "room_id": room_id,
             "playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"),
             "current_track": current_track,
+            "ordered_by": ordered_by,
         },
     )
     if current_queue_item_id is not _UNSET:
@@ -517,6 +522,27 @@ async def next_track(room_id: int, db: Session = Depends(get_db), user: User = D
 async def prev_track(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # Minimal behavior: restart current track
     await _set_playback(db, room_id, position_ms=0)
+    return {"ok": True}
+
+
+@router.post("/rooms/{room_id}/queue/shuffle")
+async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _get_room(db, room_id)
+    items = db.exec(
+        select(RoomQueueItem)
+        .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
+        .order_by(RoomQueueItem.created_at.asc())
+    ).all()
+    if len(items) <= 1:
+        return {"ok": True}
+    now = datetime.utcnow()
+    indices = list(range(len(items)))
+    random.shuffle(indices)
+    for new_pos, idx in enumerate(indices):
+        items[idx].created_at = now + timedelta(milliseconds=new_pos)
+        db.add(items[idx])
+    db.commit()
+    await hub.broadcast(room_id, {"type": "queue_updated"})
     return {"ok": True}
 
 

@@ -15,7 +15,7 @@
 conda create -n order-song python=3.11 -y
 conda activate order-song
 pip install -r backend/requirements.txt
-python -m uvicorn app.main:app --reload --host :: --port 5732 --app-dir backend
+python -m uvicorn app.main:app --reload --host "" --port 5732 --app-dir backend
 ```
 
 打开 `http://localhost:5732/health` 验证后端运行。

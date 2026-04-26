@@ -153,14 +153,18 @@ async def room_state(room_id: int, db: Session = Depends(get_db), user: User = D
     if not pb:
         raise HTTPException(status_code=404, detail="room not found")
     current_track = None
+    ordered_by = None
     if pb.current_queue_item_id:
         qi = db.get(RoomQueueItem, pb.current_queue_item_id)
         if qi:
+            u = db.get(User, qi.ordered_by_user_id)
+            if u:
+                ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
             if tr:
                 await _resolve_audio_url(db, tr)
                 current_track = TrackOut.model_validate(tr).model_dump(mode="json")
                 if tr.source == TrackSource.bilibili and tr.audio_url:
                     current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
-    return {"playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"), "current_track": current_track, "queue": []}
+    return {"playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"), "current_track": current_track, "ordered_by": ordered_by, "queue": []}
 

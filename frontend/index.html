@@ -3,8 +3,12 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#eef2ff" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <title>order-song</title>
     <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="icon" href="/favicon.ico" />
   </head>
   <body>
     <main class="app">
@@ -27,8 +31,8 @@
       <section id="viewAuth" class="glass block view">
         <div class="sectionTitle">登录 / 注册</div>
         <div class="row">
-          <input id="authUsername" class="input" placeholder="用户名（中英文）" />
-          <input id="authPassword" class="input" placeholder="密码" type="password" />
+          <input id="authUsername" class="input" placeholder="用户名（中英文）" autocomplete="username" />
+          <input id="authPassword" class="input" placeholder="密码" type="password" autocomplete="current-password" />
         </div>
         <div class="row" style="margin-top:10px">
           <button id="btnLogin" class="btn">登录</button>
@@ -51,7 +55,7 @@
       <!-- App view -->
       <section id="viewApp" class="content view hidden">
         <section class="leftPane">
-          <!-- Search overlay (covers left pane only on desktop) -->
+          <!-- Search overlay -->
           <section id="viewSearch" class="glass block view hidden searchOverlay">
             <div class="row" style="justify-content:space-between">
               <div class="sectionTitle" style="margin:0">搜索</div>
@@ -116,7 +120,7 @@
         </aside>
       </section>
 
-      <!-- User menu popover (under username) -->
+      <!-- User menu popover -->
       <div id="userMenu" class="popover glass hidden" role="dialog" aria-modal="false">
         <div class="sectionTitle" style="margin:0">账号</div>
         <div id="userMenuHint" class="hint"></div>
@@ -167,7 +171,6 @@
         </div>
       </footer>
     </main>
-    <script src="/assets/app.js"></script>
+    <script type="module" src="/assets/app.js"></script>
   </body>
 </html>
-
