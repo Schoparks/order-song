@@ -34,8 +34,8 @@ export function rerenderSearchButtons() {
 export function syncPlaylistButtonState(btn, t) {
   const key = trackKey(t);
   const info = state.playlistKeys.get(key);
-  if (info) {
-    btn.textContent = "已添加";
+  if (info && info.length > 0) {
+    btn.textContent = "在歌单中";
     btn.classList.add("subtle");
   } else {
     btn.textContent = "加入歌单";
@@ -48,8 +48,8 @@ export function rerenderAllPlaylistButtons() {
     const key = btn.getAttribute("data-track-key");
     if (!key) return;
     const info = state.playlistKeys.get(key);
-    if (info) {
-      btn.textContent = "已添加";
+    if (info && info.length > 0) {
+      btn.textContent = "在歌单中";
       btn.classList.add("subtle");
     } else {
       btn.textContent = "加入歌单";

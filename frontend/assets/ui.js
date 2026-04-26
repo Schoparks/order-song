@@ -11,13 +11,14 @@ export function setChromeVisible(isInRoom) {
 }
 
 export function setUserLabel(username = null) {
-  const btn = document.getElementById("userButton");
-  btn.textContent = username || (state.token ? "账号" : "登录");
+  const label = username || (state.token ? "账号" : "登录");
+  document.getElementById("userButton").textContent = label;
+  const roomBtn = document.getElementById("roomUserButton");
+  if (roomBtn) roomBtn.textContent = label;
 }
 
-export function toggleUserMenu(forceClose = false) {
+export function toggleUserMenu(forceClose = false, anchorEl = null) {
   const menu = document.getElementById("userMenu");
-  const btn = document.getElementById("userButton");
   if (forceClose) {
     menu.classList.add("hidden");
     return;
@@ -27,6 +28,7 @@ export function toggleUserMenu(forceClose = false) {
     menu.classList.add("hidden");
     return;
   }
+  const btn = anchorEl || document.getElementById("userButton");
   const r = btn.getBoundingClientRect();
   menu.style.left = `${Math.max(8, r.left)}px`;
   menu.style.top = `${r.bottom + 8}px`;

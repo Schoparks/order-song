@@ -9,7 +9,7 @@ export function showNeteaseImportModal() {
   modal.className = "modal";
   modal.innerHTML = `
     <div class="sectionTitle">导入网易云歌单</div>
-    <div class="muted" style="margin-bottom:10px">请输入网易云歌单链接或ID，VIP专属歌曲将被自动排除</div>
+    <div class="muted" style="margin-bottom:10px">请输入网易云歌单链接或ID，VIP及不可用歌曲将被自动排除</div>
     <div class="row">
       <input class="input js-url" placeholder="歌单链接或ID" />
     </div>
@@ -19,7 +19,7 @@ export function showNeteaseImportModal() {
     <div class="js-status hint"></div>
     <div class="actions">
       <button class="btn small js-cancel">取消</button>
-      <button class="btn js-import">导入</button>
+      <button class="btn small js-import">导入</button>
     </div>
   `;
 
@@ -29,7 +29,14 @@ export function showNeteaseImportModal() {
   const urlInput = modal.querySelector(".js-url");
   const nameInput = modal.querySelector(".js-name");
 
+  let importDone = false;
+
   importBtn.addEventListener("click", async () => {
+    if (importDone) {
+      overlay.remove();
+      loadPlaylists();
+      return;
+    }
     const url = urlInput.value.trim();
     if (!url) {
       statusEl.textContent = "请输入歌单链接或ID";
@@ -43,13 +50,10 @@ export function showNeteaseImportModal() {
         method: "POST",
         json: { url, name: nameInput.value.trim() || "" },
       });
-      statusEl.textContent = `导入成功！共${result.total}首，已添加${result.added}首${result.skipped_vip > 0 ? `，跳过VIP歌曲${result.skipped_vip}首` : ""}`;
+      statusEl.textContent = `导入成功！共${result.total}首，已添加${result.added}首${result.skipped > 0 ? `，跳过不可用歌曲${result.skipped}首` : ""}`;
+      importDone = true;
       importBtn.textContent = "完成";
       importBtn.disabled = false;
-      importBtn.addEventListener("click", () => {
-        overlay.remove();
-        loadPlaylists();
-      }, { once: true });
       cancelBtn.textContent = "关闭";
     } catch (e) {
       let msg = "导入失败";

@@ -149,7 +149,8 @@ document.getElementById("modeSwitch").addEventListener("change", (e) => {
 
 // --- Event listeners: topbar ---
 
-document.getElementById("userButton").addEventListener("click", () => toggleUserMenu());
+document.getElementById("userButton").addEventListener("click", (e) => toggleUserMenu(false, e.currentTarget));
+document.getElementById("roomUserButton").addEventListener("click", (e) => toggleUserMenu(false, e.currentTarget));
 
 document.getElementById("leaveRoom").addEventListener("click", async () => {
   if (!state.roomId) return;
@@ -333,7 +334,8 @@ document.addEventListener("mousedown", (e) => {
   const menu = document.getElementById("userMenu");
   if (menu.classList.contains("hidden")) return;
   const btn = document.getElementById("userButton");
-  if (menu.contains(e.target) || btn.contains(e.target)) return;
+  const roomBtn = document.getElementById("roomUserButton");
+  if (menu.contains(e.target) || btn.contains(e.target) || (roomBtn && roomBtn.contains(e.target))) return;
   toggleUserMenu(true);
 });
 

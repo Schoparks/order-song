@@ -6,6 +6,120 @@ import { refreshQueue } from './queue.js';
 
 let _currentPlaylistId = null;
 
+function openBaseModal(innerHtml) {
+  const overlay = document.createElement("div");
+  overlay.className = "modal-overlay";
+
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.innerHTML = innerHtml;
+
+  function close() {
+    overlay.remove();
+  }
+
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) close();
+  });
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+
+  return { overlay, modal, close };
+}
+
+function openTextInputModal({
+  title,
+  initialValue = "",
+  placeholder = "",
+  confirmText = "确定",
+  confirmBusyText = "保存中…",
+  onConfirm,
+}) {
+  const { modal, close } = openBaseModal(`
+    <div class="sectionTitle">${escapeHtml(title)}</div>
+    <div class="row">
+      <input class="input js-value" placeholder="${escapeHtml(placeholder)}" />
+    </div>
+    <div class="actions">
+      <button class="btn small js-cancel">取消</button>
+      <button class="btn small js-confirm">${escapeHtml(confirmText)}</button>
+    </div>
+  `);
+
+  const input = modal.querySelector(".js-value");
+  input.value = initialValue || "";
+  input.focus();
+  input.select?.();
+
+  const cancelBtn = modal.querySelector(".js-cancel");
+  const confirmBtn = modal.querySelector(".js-confirm");
+
+  cancelBtn.addEventListener("click", () => close());
+
+  async function doConfirm() {
+    const value = input.value.trim();
+    if (!value) return;
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    const oldText = confirmBtn.textContent;
+    confirmBtn.textContent = confirmBusyText;
+    try {
+      await onConfirm(value);
+      close();
+    } catch (e) {
+      console.error(e);
+      confirmBtn.disabled = false;
+      cancelBtn.disabled = false;
+      confirmBtn.textContent = oldText;
+    }
+  }
+
+  confirmBtn.addEventListener("click", doConfirm);
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doConfirm();
+  });
+}
+
+function openConfirmModal({
+  title,
+  bodyHtml = "",
+  confirmText = "确定",
+  confirmBusyText = "处理中…",
+  confirmBtnClass = "btn small",
+  onConfirm,
+}) {
+  const { modal, close } = openBaseModal(`
+    <div class="sectionTitle">${escapeHtml(title)}</div>
+    <div class="js-body">${bodyHtml}</div>
+    <div class="actions">
+      <button class="btn small js-cancel">取消</button>
+      <button class="${confirmBtnClass} js-confirm">${escapeHtml(confirmText)}</button>
+    </div>
+  `);
+
+  const cancelBtn = modal.querySelector(".js-cancel");
+  const confirmBtn = modal.querySelector(".js-confirm");
+
+  cancelBtn.addEventListener("click", () => close());
+
+  confirmBtn.addEventListener("click", async () => {
+    confirmBtn.disabled = true;
+    cancelBtn.disabled = true;
+    const oldText = confirmBtn.textContent;
+    confirmBtn.textContent = confirmBusyText;
+    try {
+      await onConfirm();
+      close();
+    } catch (e) {
+      console.error(e);
+      confirmBtn.disabled = false;
+      cancelBtn.disabled = false;
+      confirmBtn.textContent = oldText;
+    }
+  });
+}
+
 export async function loadPlaylistData() {
   if (!state.token) return;
   const pls = await api("/api/playlists").catch(() => []);
@@ -17,9 +131,13 @@ export async function loadPlaylistData() {
     newKeys.set(key, info);
   }
   state.playlistKeys = newKeys;
+  rerenderAllPlaylistButtons();
 }
 
 export async function addToPlaylist(playlistId, t) {
+  const key = trackKey(t);
+  const arr = state.playlistKeys.get(key) || [];
+  if (arr.some((x) => x.playlist_id === playlistId)) return;
   const result = await api(`/api/playlists/${playlistId}/items`, {
     method: "POST",
     json: {
@@ -32,27 +150,30 @@ export async function addToPlaylist(playlistId, t) {
     },
   });
   const pl = state.playlists.find((p) => p.id === playlistId);
-  state.playlistKeys.set(trackKey(t), {
-    item_id: result.id,
-    playlist_id: playlistId,
-    playlist_name: pl ? pl.name : "",
-  });
+  arr.push({ item_id: result.id, playlist_id: playlistId, playlist_name: pl ? pl.name : "" });
+  state.playlistKeys.set(key, arr);
   rerenderAllPlaylistButtons();
 }
 
-export async function removeFromPlaylist(t) {
+export async function removeFromPlaylist(t, playlistId) {
   const key = trackKey(t);
-  const info = state.playlistKeys.get(key);
-  if (!info) return;
-  await api(`/api/playlists/${info.playlist_id}/items/${info.item_id}`, { method: "DELETE" });
-  state.playlistKeys.delete(key);
+  const arr = state.playlistKeys.get(key) || [];
+  const entry = playlistId != null
+    ? arr.find((x) => x.playlist_id === playlistId)
+    : arr[0];
+  if (!entry) return;
+  await api(`/api/playlists/${entry.playlist_id}/items/${entry.item_id}`, { method: "DELETE" });
+  const newArr = arr.filter((x) => x !== entry);
+  if (newArr.length === 0) state.playlistKeys.delete(key);
+  else state.playlistKeys.set(key, newArr);
   rerenderAllPlaylistButtons();
 }
 
-export function showPlaylistPicker(t, triggerBtn) {
+export async function showPlaylistPicker(t, triggerBtn) {
+  await loadPlaylistData();
   const key = trackKey(t);
-  const existing = state.playlistKeys.get(key);
-  const isInPlaylist = !!existing;
+  const existing = state.playlistKeys.get(key) || [];
+  const originalPlIds = new Set(existing.map((x) => x.playlist_id));
 
   const overlay = document.createElement("div");
   overlay.className = "modal-overlay";
@@ -60,14 +181,16 @@ export function showPlaylistPicker(t, triggerBtn) {
   const modal = document.createElement("div");
   modal.className = "modal";
   modal.innerHTML = `
-    <div class="sectionTitle">${isInPlaylist ? "管理歌单收藏" : "添加到歌单"}</div>
+    <div class="sectionTitle">${existing.length ? "在歌单中" : "添加到歌单"}</div>
     <div class="playlistPickerList list"></div>
     <div class="row" style="margin-top:12px">
       <input class="input js-new-name" placeholder="新歌单名称" />
       <button class="btn small js-create-pl">创建</button>
     </div>
-    ${isInPlaylist ? '<div style="margin-top:12px"><button class="btn dangerWide js-remove">从歌单移除</button></div>' : ''}
-    <div class="actions"><button class="btn small js-cancel">取消</button></div>
+    <div class="actions">
+      <button class="btn small js-cancel">取消</button>
+      <button class="btn small js-confirm">完成</button>
+    </div>
   `;
 
   const listEl = modal.querySelector(".playlistPickerList");
@@ -79,29 +202,17 @@ export function showPlaylistPicker(t, triggerBtn) {
       return;
     }
     state.playlists.forEach((pl) => {
-      const opt = document.createElement("div");
+      const opt = document.createElement("label");
       opt.className = "playlistOption";
-      if (existing && existing.playlist_id === pl.id) opt.classList.add("selected");
-      opt.innerHTML = `<span>${escapeHtml(pl.name)}</span><span class="muted">${pl.item_count || 0}首</span>`;
-      opt.addEventListener("click", async () => {
-        if (isInPlaylist && existing.playlist_id === pl.id) return;
-        try {
-          if (isInPlaylist) {
-            await api(`/api/playlists/${existing.playlist_id}/items/${existing.item_id}/move`, {
-              method: "POST",
-              json: { target_playlist_id: pl.id },
-            });
-            state.playlistKeys.set(key, { item_id: existing.item_id, playlist_id: pl.id, playlist_name: pl.name });
-          } else {
-            await addToPlaylist(pl.id, t);
-          }
-          overlay.remove();
-          rerenderAllPlaylistButtons();
-          if (triggerBtn) syncPlaylistButtonState(triggerBtn, t);
-          await loadPlaylists();
-        } catch (e) {
-          console.error(e);
-        }
+      const checked = originalPlIds.has(pl.id);
+      if (checked) opt.classList.add("selected");
+      opt.innerHTML = `
+        <input type="checkbox" class="playlistCheck" data-pl-id="${pl.id}" ${checked ? "checked" : ""} />
+        <span class="playlistOptName">${escapeHtml(pl.name)}</span>
+        <span class="muted">${pl.item_count || 0}首</span>
+      `;
+      opt.querySelector("input").addEventListener("change", (e) => {
+        opt.classList.toggle("selected", e.target.checked);
       });
       listEl.appendChild(opt);
     });
@@ -116,19 +227,40 @@ export function showPlaylistPicker(t, triggerBtn) {
     state.playlists.push(pl);
     modal.querySelector(".js-new-name").value = "";
     renderOptions();
+    const newCb = listEl.querySelector(`input[data-pl-id="${pl.id}"]`);
+    if (newCb) {
+      newCb.checked = true;
+      newCb.closest(".playlistOption").classList.add("selected");
+    }
   });
 
-  if (isInPlaylist) {
-    modal.querySelector(".js-remove").addEventListener("click", async () => {
-      await removeFromPlaylist(t);
+  modal.querySelector(".js-confirm").addEventListener("click", async () => {
+    const confirmBtn = modal.querySelector(".js-confirm");
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = "保存中…";
+    try {
+      const checkedIds = new Set();
+      listEl.querySelectorAll(".playlistCheck").forEach((cb) => {
+        if (cb.checked) checkedIds.add(Number(cb.dataset.plId));
+      });
+      for (const plId of checkedIds) {
+        if (!originalPlIds.has(plId)) await addToPlaylist(plId, t);
+      }
+      for (const plId of originalPlIds) {
+        if (!checkedIds.has(plId)) await removeFromPlaylist(t, plId);
+      }
       overlay.remove();
+      rerenderAllPlaylistButtons();
       if (triggerBtn) syncPlaylistButtonState(triggerBtn, t);
       await loadPlaylists();
-    });
-  }
+    } catch (e) {
+      console.error(e);
+      confirmBtn.disabled = false;
+      confirmBtn.textContent = "完成";
+    }
+  });
 
   modal.querySelector(".js-cancel").addEventListener("click", () => overlay.remove());
-  overlay.addEventListener("click", (e) => { if (e.target === overlay) overlay.remove(); });
 
   overlay.appendChild(modal);
   document.body.appendChild(overlay);
@@ -147,9 +279,16 @@ function renderPlaylistListView() {
   `;
 
   header.querySelector(".js-create").addEventListener("click", () => {
-    const name = prompt("请输入歌单名称");
-    if (!name || !name.trim()) return;
-    api("/api/playlists", { method: "POST", json: { name: name.trim() } }).then(() => loadPlaylists());
+    openTextInputModal({
+      title: "创建歌单",
+      placeholder: "歌单名称",
+      confirmText: "创建",
+      confirmBusyText: "创建中…",
+      onConfirm: async (name) => {
+        await api("/api/playlists", { method: "POST", json: { name } });
+        await loadPlaylists();
+      },
+    });
   });
 
   header.querySelector(".js-import-netease").addEventListener("click", () => {
@@ -215,9 +354,21 @@ function renderPlaylistListView() {
       }
     });
     row.querySelector(".js-delete").addEventListener("click", async () => {
-      if (!confirm(`确定删除歌单「${pl.name}」及其所有歌曲？`)) return;
-      await api(`/api/playlists/${pl.id}`, { method: "DELETE" });
-      await loadPlaylists();
+      openConfirmModal({
+        title: "删除歌单？",
+        bodyHtml: `
+          <div class="muted" style="margin-top:-4px">
+            将删除歌单「<b>${escapeHtml(pl.name)}</b>」及其所有歌曲，且不可恢复。
+          </div>
+        `,
+        confirmText: "删除",
+        confirmBusyText: "删除中…",
+        confirmBtnClass: "btn small danger",
+        onConfirm: async () => {
+          await api(`/api/playlists/${pl.id}`, { method: "DELETE" });
+          await loadPlaylists();
+        },
+      });
     });
     el.appendChild(row);
   });
@@ -230,7 +381,11 @@ async function renderPlaylistDetailView(playlistId, playlistName) {
   const header = document.createElement("div");
   header.className = "playlistHeader";
   header.innerHTML = `
-    <button class="backLink js-back">&larr; 返回歌单列表</button>
+    <button class="iconBtn small js-back" title="返回歌单列表" aria-label="返回歌单列表">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M15 18l-6-6 6-6"></path>
+      </svg>
+    </button>
     <div class="sectionTitle" style="margin:0">${escapeHtml(playlistName)}</div>
     <button class="btn small js-rename">重命名</button>
   `;
@@ -239,11 +394,18 @@ async function renderPlaylistDetailView(playlistId, playlistName) {
     loadPlaylists();
   });
   header.querySelector(".js-rename").addEventListener("click", async () => {
-    const name = prompt("请输入新歌单名称", playlistName);
-    if (!name || !name.trim()) return;
-    await api(`/api/playlists/${playlistId}`, { method: "PATCH", json: { name: name.trim() } });
-    await loadPlaylistData();
-    renderPlaylistDetailView(playlistId, name.trim());
+    openTextInputModal({
+      title: "重命名歌单",
+      initialValue: playlistName,
+      placeholder: "歌单名称",
+      confirmText: "保存",
+      confirmBusyText: "保存中…",
+      onConfirm: async (name) => {
+        await api(`/api/playlists/${playlistId}`, { method: "PATCH", json: { name } });
+        await loadPlaylistData();
+        renderPlaylistDetailView(playlistId, name);
+      },
+    });
   });
   el.appendChild(header);
 
@@ -279,7 +441,7 @@ async function renderPlaylistDetailView(playlistId, playlistName) {
         </div>
         <div class="actions">
           <button class="btn small js-order">点歌</button>
-          <button class="btn small js-manage">管理</button>
+          <button class="btn small js-manage">在歌单中</button>
         </div>
       `;
       const orderBtn = row.querySelector(".js-order");

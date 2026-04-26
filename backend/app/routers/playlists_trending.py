@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime
 
@@ -189,8 +190,10 @@ def track_playlist_map(db: Session = Depends(get_db), user: User = Depends(get_c
             .where(UserPlaylistItem.playlist_id == pl.id)
         ).all()
         for it, tr in items:
-            key = f"{tr.source}:{tr.source_track_id}"
-            result[key] = {"item_id": it.id, "playlist_id": pl.id, "playlist_name": pl.name}
+            key = f"{tr.source.value}:{tr.source_track_id}"
+            if key not in result:
+                result[key] = []
+            result[key].append({"item_id": it.id, "playlist_id": pl.id, "playlist_name": pl.name})
     return result
 
 
@@ -205,32 +208,67 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
     m = re.search(r"id=(\d+)", url_or_id)
     if m:
         playlist_id = m.group(1)
-    elif url_or_id.isdigit():
+    if not playlist_id:
+        m = re.search(r"/playlist[/](\d+)", url_or_id)
+        if m:
+            playlist_id = m.group(1)
+    if not playlist_id and url_or_id.isdigit():
         playlist_id = url_or_id
 
     if not playlist_id:
         raise HTTPException(status_code=400, detail="无法解析歌单ID，请提供歌单链接或ID")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, headers={
-            "User-Agent": "Mozilla/5.0",
-            "Referer": "https://music.163.com/",
-        }) as client:
-            r = await client.get(
-                "https://music.163.com/api/playlist/detail",
-                params={"id": playlist_id},
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                "https://music.163.com/api/v3/playlist/detail",
+                data={"id": playlist_id, "n": "100000", "s": "8"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                    "Referer": "https://music.163.com/",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
             )
             r.raise_for_status()
             data = r.json()
     except Exception:
         raise HTTPException(status_code=502, detail="请求网易云API失败")
 
-    result = data.get("result")
-    if not result:
+    playlist_data = data.get("playlist") or data.get("result")
+    if data.get("code") not in (200, None) or not playlist_data:
         raise HTTPException(status_code=400, detail="歌单不存在或无法访问")
 
-    netease_name = result.get("name") or f"网易云歌单{playlist_id}"
-    tracks_raw = result.get("tracks") or []
+    netease_name = playlist_data.get("name") or f"网易云歌单{playlist_id}"
+    tracks_raw = playlist_data.get("tracks") or []
+    track_ids_raw = playlist_data.get("trackIds") or []
+    privileges = {p["id"]: p for p in (playlist_data.get("privileges") or data.get("privileges") or []) if "id" in p}
+
+    if track_ids_raw and len(tracks_raw) < len(track_ids_raw):
+        fetched_ids = {s.get("id") for s in tracks_raw if s.get("id") is not None}
+        missing_ids = [t["id"] for t in track_ids_raw if isinstance(t, dict) and t.get("id") not in fetched_ids]
+        if missing_ids:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as detail_client:
+                    for i in range(0, len(missing_ids), 500):
+                        batch = missing_ids[i:i+500]
+                        c_param = json.dumps([{"id": sid} for sid in batch])
+                        dr = await detail_client.post(
+                            "https://music.163.com/api/v3/song/detail",
+                            data={"c": c_param},
+                            headers={
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                                "Referer": "https://music.163.com/",
+                                "Content-Type": "application/x-www-form-urlencoded",
+                            },
+                        )
+                        dr.raise_for_status()
+                        detail_data = dr.json()
+                        tracks_raw.extend(detail_data.get("songs") or [])
+                        for p in (detail_data.get("privileges") or []):
+                            if "id" in p:
+                                privileges[p["id"]] = p
+            except Exception:
+                pass
 
     playlist_name = (payload.get("name") or "").strip() or netease_name
     pl = UserPlaylist(user_id=user.id, name=playlist_name)
@@ -239,21 +277,22 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
     db.refresh(pl)
 
     added = 0
-    skipped_vip = 0
+    skipped = 0
     for s in tracks_raw:
         sid = s.get("id")
         if sid is None:
             continue
         fee = s.get("fee", 0)
-        if fee == 1:
-            skipped_vip += 1
+        priv = privileges.get(sid, {})
+        if fee == 1 or s.get("noCopyrightRcmd") or priv.get("st", 0) < 0 or priv.get("pl", 1) == 0:
+            skipped += 1
             continue
 
-        artists = s.get("artists") or []
+        artists = s.get("ar") or s.get("artists") or []
         artist = artists[0].get("name") if artists else None
-        album = s.get("album") or {}
+        album = s.get("al") or s.get("album") or {}
         cover_url = album.get("picUrl")
-        duration_ms = s.get("duration")
+        duration_ms = s.get("dt") or s.get("duration")
 
         tr = _get_or_create_track(
             db,
@@ -280,7 +319,7 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
         "playlist_id": pl.id,
         "playlist_name": playlist_name,
         "added": added,
-        "skipped_vip": skipped_vip,
+        "skipped": skipped,
         "total": len(tracks_raw),
     }
 

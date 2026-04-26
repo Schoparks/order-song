@@ -101,7 +101,7 @@ async def search(q: str, user: User = Depends(get_current_user)):
 
     async def run_netease() -> list[SearchTrackOut]:
         async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}) as client:
-            r = await client.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 10})
+            r = await client.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 20})
             r.raise_for_status()
             data = r.json()
         songs = (((data or {}).get("result") or {}).get("songs")) or []
@@ -110,7 +110,12 @@ async def search(q: str, user: User = Depends(get_current_user)):
             sid = s.get("id")
             if sid is None:
                 continue
-            if s.get("fee") == 1:
+            fee = s.get("fee", 0)
+            if fee == 1 or s.get("noCopyrightRcmd"):
+                continue
+            status = s.get("status", 0)
+            privilege = s.get("privilege") or {}
+            if status < 0 or privilege.get("st", 0) < 0 or privilege.get("pl", 1) == 0:
                 continue
             artists = s.get("artists") or []
             artist = artists[0].get("name") if artists else None

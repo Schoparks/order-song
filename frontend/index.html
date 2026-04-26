@@ -60,7 +60,10 @@
 
       <!-- Room view -->
       <section id="viewRooms" class="glass block view hidden">
-        <div class="sectionTitle">选择房间</div>
+        <div class="row" style="justify-content:space-between;margin-bottom:10px">
+          <div class="sectionTitle" style="margin:0">选择房间</div>
+          <button id="roomUserButton" class="btn small subtle">账号</button>
+        </div>
         <div class="row">
           <input id="roomName" class="input" placeholder="房间名称（可空，默认：xxx的听歌房）" />
           <button id="btnCreateRoom" class="btn">创建并进入</button>

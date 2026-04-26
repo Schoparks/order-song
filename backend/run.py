@@ -58,14 +58,7 @@ def main():
     config = uvicorn.Config("app.main:app", log_level="info")
     server = uvicorn.Server(config)
 
-    async def serve():
-        config.setup_event_loop()
-        await server.startup(sockets=[sock])
-        if server.started:
-            await server.main_loop()
-        await server.shutdown(sockets=[sock])
-
-    asyncio.run(serve())
+    asyncio.run(server.serve(sockets=[sock]))
 
 
 if __name__ == "__main__":
