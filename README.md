@@ -66,7 +66,7 @@ sqlite3 backend/order_song.sqlite3 "UPDATE users SET is_admin = 1 WHERE username
 或使用：
 
 ```bash
-python -c "import sqlite3; c=sqlite3.connect('backend/order_song.sqlite3'); c.execute(\"UPDATE users SET is_admin=1 WHERE username='你的用户名'\"); c.commit()"
+python -c "import sqlite3; c=sqlite3.connect(r'backend/order_song.sqlite3'); c.execute('UPDATE users SET is_admin=1 WHERE username=?', ('你的用户名',)); c.commit()"
 ```
 
 之后在登录页输入账号密码，点击右侧「管理端」按钮即可进入管理后台。管理员可以：
