@@ -63,6 +63,12 @@ python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 5732 --app-dir bac
 sqlite3 backend/order_song.sqlite3 "UPDATE users SET is_admin = 1 WHERE username = '你的用户名';"
 ```
 
+或使用：
+
+```bash
+python -c "import sqlite3; c=sqlite3.connect('backend/order_song.sqlite3'); c.execute(\"UPDATE users SET is_admin=1 WHERE username='你的用户名'\"); c.commit()"
+```
+
 之后在登录页输入账号密码，点击右侧「管理端」按钮即可进入管理后台。管理员可以：
 
 - 查看/删除用户、设置/取消管理员权限
@@ -72,11 +78,13 @@ sqlite3 backend/order_song.sqlite3 "UPDATE users SET is_admin = 1 WHERE username
 
 通过环境变量或 `backend/.env` 文件配置，前缀为 `ORDER_SONG_`：
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `ORDER_SONG_JWT_SECRET` | `dev-secret-change-me` | JWT 签名密钥，生产环境务必修改 |
-| `ORDER_SONG_SQLITE_PATH` | `order_song.sqlite3` | SQLite 数据库文件路径 |
-| `ORDER_SONG_CORS_ALLOW_ORIGINS` | `*` | CORS 允许的来源 |
+
+| 变量                              | 默认值                    | 说明                |
+| ------------------------------- | ---------------------- | ----------------- |
+| `ORDER_SONG_JWT_SECRET`         | `dev-secret-change-me` | JWT 签名密钥，生产环境务必修改 |
+| `ORDER_SONG_SQLITE_PATH`        | `order_song.sqlite3`   | SQLite 数据库文件路径    |
+| `ORDER_SONG_CORS_ALLOW_ORIGINS` | `*`                    | CORS 允许的来源        |
+
 
 ## 技术栈
 
@@ -84,3 +92,4 @@ sqlite3 backend/order_song.sqlite3 "UPDATE users SET is_admin = 1 WHERE username
 - **前端**：原生 HTML/CSS/JavaScript（ES Modules），无构建步骤
 - **认证**：JWT（python-jose）
 - **音源**：B站（API + yt-dlp 降级）、网易云音乐
+
