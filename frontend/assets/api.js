@@ -1,11 +1,11 @@
 import { state } from './state.js';
 
-const BASE_PATH = (() => {
+export const BASE_PATH = (() => {
   const p = location.pathname || "/";
   return p === "/order-song" || p.startsWith("/order-song/") ? "/order-song" : "";
 })();
 
-function withBase(path) {
+export function withBase(path) {
   if (!BASE_PATH) return path;
   if (typeof path !== "string" || !path) return path;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(path)) return path; // http(s):// etc.

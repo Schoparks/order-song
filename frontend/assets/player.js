@@ -1,5 +1,5 @@
 import { state, NEXT_DEBOUNCE_MS, SEEK_TOLERANCE_S } from './state.js';
-import { api } from './api.js';
+import { api, withBase } from './api.js';
 import { formatTime, parsePlaybackTime } from './utils.js';
 
 export const audio = new Audio();
@@ -208,7 +208,7 @@ export async function onPlaybackUpdated(pb, currentTrack, orderedBy) {
 
   const track = state.lastTrack;
   if (track && track.audio_url) {
-    const newSrc = track.audio_url;
+    const newSrc = withBase(track.audio_url);
     const srcChanged = audioSrcChanged(newSrc);
     if (srcChanged) {
       audio.src = newSrc;
@@ -249,7 +249,8 @@ export function syncLocalAudioToRoom() {
   if (!state.lastPb || !state.lastTrack || !state.lastTrack.audio_url) return;
   const pb = state.lastPb;
   const tr = state.lastTrack;
-  if (audioSrcChanged(tr.audio_url)) audio.src = tr.audio_url;
+  const src = withBase(tr.audio_url);
+  if (audioSrcChanged(src)) audio.src = src;
   updateVolumeUi();
   const target = getSafeRoomPositionMs(pb) / 1000;
   if (isFinite(target) && target >= 0) {
