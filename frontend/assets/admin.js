@@ -5,6 +5,20 @@ import { showView, setChromeVisible } from './ui.js';
 
 let _adminToken = null;
 
+const BASE_PATH = (() => {
+  const p = location.pathname || "/";
+  return p === "/order-song" || p.startsWith("/order-song/") ? "/order-song" : "";
+})();
+
+function withBase(path) {
+  if (!BASE_PATH) return path;
+  if (typeof path !== "string" || !path) return path;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(path)) return path;
+  if (path.startsWith(BASE_PATH + "/")) return path;
+  if (path.startsWith("/")) return BASE_PATH + path;
+  return BASE_PATH + "/" + path;
+}
+
 function adminApi(path, options = {}) {
   const headers = options.headers || {};
   if (_adminToken) headers["Authorization"] = `Bearer ${_adminToken}`;
@@ -12,7 +26,7 @@ function adminApi(path, options = {}) {
     headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(options.json);
   }
-  return fetch(path, { ...options, headers }).then(async (res) => {
+  return fetch(withBase(path), { ...options, headers }).then(async (res) => {
     if (!res.ok) {
       const txt = await res.text();
       const err = new Error(txt || `HTTP ${res.status}`);

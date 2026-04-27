@@ -3,6 +3,19 @@ import { refreshQueue, refreshHistory } from './queue.js';
 import { onPlaybackUpdated } from './player.js';
 import { handleRoomGone } from './rooms.js';
 
+const BASE_PATH = (() => {
+  const p = location.pathname || "/";
+  return p === "/order-song" || p.startsWith("/order-song/") ? "/order-song" : "";
+})();
+
+function withBase(path) {
+  if (!BASE_PATH) return path;
+  if (typeof path !== "string" || !path) return path;
+  if (path.startsWith(BASE_PATH + "/")) return path;
+  if (path.startsWith("/")) return BASE_PATH + path;
+  return BASE_PATH + "/" + path;
+}
+
 export function connectWs() {
   if (!state.roomId) return;
   if (state.ws) {
@@ -10,7 +23,7 @@ export function connectWs() {
   }
   state._wsBackoff = 0;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  state.ws = new WebSocket(`${proto}://${location.host}/ws`);
+  state.ws = new WebSocket(`${proto}://${location.host}${withBase("/ws")}`);
   state.ws.addEventListener("open", () => {
     state._wsBackoff = 0;
     state.ws.send(JSON.stringify({ type: "join_room", room_id: state.roomId, token: state.token }));

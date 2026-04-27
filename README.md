@@ -43,12 +43,6 @@ python backend/run.py
 python backend/run.py --port=5732
 ```
 
-**开发模式**（带热重载，仅 IPv4）：
-
-```bash
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 5732 --app-dir backend
-```
-
 ### 3. 访问
 
 - 前端页面：`http://localhost:5732/`
@@ -73,23 +67,4 @@ python -c "import sqlite3; c=sqlite3.connect(r'backend/order_song.sqlite3'); c.e
 
 - 查看/删除用户、设置/取消管理员权限
 - 查看/删除房间、移除房间中的特定成员
-
-## 配置
-
-通过环境变量或 `backend/.env` 文件配置，前缀为 `ORDER_SONG_`：
-
-
-| 变量                              | 默认值                    | 说明                |
-| ------------------------------- | ---------------------- | ----------------- |
-| `ORDER_SONG_JWT_SECRET`         | `dev-secret-change-me` | JWT 签名密钥，生产环境务必修改 |
-| `ORDER_SONG_SQLITE_PATH`        | `order_song.sqlite3`   | SQLite 数据库文件路径    |
-| `ORDER_SONG_CORS_ALLOW_ORIGINS` | `*`                    | CORS 允许的来源        |
-
-
-## 技术栈
-
-- **后端**：Python、FastAPI、SQLModel（SQLite）、WebSocket、httpx、yt-dlp
-- **前端**：原生 HTML/CSS/JavaScript（ES Modules），无构建步骤
-- **认证**：JWT（python-jose）
-- **音源**：B站（API + yt-dlp 降级）、网易云音乐
 
