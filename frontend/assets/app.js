@@ -6,10 +6,10 @@ import {
   setNowPlaying, syncLocalAudioToRoom, onPlaybackUpdated,
   getDesiredPositionMs, getCurrentPositionMs, updateTimeDisplay,
 } from './player.js';
-import { showView, setChromeVisible, setUserLabel, toggleUserMenu } from './ui.js';
+import { showView, setChromeVisible, setUserLabel, toggleUserMenu, initScrollTopButtons } from './ui.js';
 import { refreshQueue, refreshHistory, updateQueueCountBadge } from './queue.js';
 import { loadPlaylists } from './playlist.js';
-import { openSearchOverlay, closeSearchOverlay, runSearch, renderHistory, loadTrending } from './search.js';
+import { openSearchOverlay, closeSearchOverlay, runSearch, renderHistory, loadTrending } from './search.js?v=1.0';
 import { loadRooms, handleRoomGone, startRoomsRefresh, stopRoomsRefresh } from './rooms.js';
 import { connectWs } from './ws.js';
 import { adminLogin, initAdmin } from './admin.js';
@@ -124,6 +124,7 @@ export async function bootstrap() {
 // --- Initial UI setup ---
 
 setUserLabel(null);
+initScrollTopButtons();
 
 document.getElementById("pauseBtn").innerHTML =
   '<svg viewBox="0 0 24 24"><path d="M8 6v12"/><path d="M16 6v12"/></svg>';

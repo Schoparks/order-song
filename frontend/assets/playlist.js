@@ -309,6 +309,8 @@ function renderPlaylistListView() {
     const row = document.createElement("div");
     row.className = "item";
     row.setAttribute("data-list-key", `pl-${pl.id}`);
+    row.setAttribute("role", "button");
+    row.tabIndex = 0;
     row.innerHTML = `
       <div>
         <div class="title">${escapeHtml(pl.name)}</div>
@@ -317,12 +319,21 @@ function renderPlaylistListView() {
       <div class="actions">
         <button class="btn small js-queue-all">一键点歌</button>
         <button class="btn small danger js-delete">删除</button>
-        <button class="btn small js-enter">进入</button>
       </div>
     `;
-    row.querySelector(".js-enter").addEventListener("click", () => {
+    const enterPlaylist = () => {
       _currentPlaylistId = pl.id;
       renderPlaylistDetailView(pl.id, pl.name);
+    };
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      enterPlaylist();
+    });
+    row.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      if (e.target.closest("button")) return;
+      e.preventDefault();
+      enterPlaylist();
     });
     row.querySelector(".js-queue-all").addEventListener("click", async () => {
       if (!state.roomId) return;
@@ -433,7 +444,7 @@ async function renderPlaylistDetailView(playlistId, playlistName) {
     items.forEach((it, idx) => {
       const t = it.track;
       const row = document.createElement("div");
-      row.className = "item";
+      row.className = "item songItem";
       row.innerHTML = `
         <div>
           <div class="title">${escapeHtml(t.title)}</div>

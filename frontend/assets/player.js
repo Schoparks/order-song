@@ -168,7 +168,7 @@ export function updateProgressTimer() {
     clearInterval(state.progressTimer);
     state.progressTimer = null;
   }
-  if (state.lastPb && state.lastPb.current_queue_item_id && state.lastTrack && state.lastTrack.duration_ms) {
+  if (state.lastPb && state.lastPb.current_queue_item_id) {
     state.progressTimer = setInterval(() => {
       if (!state.playEnabled || audio.paused || !audio.src) updateProgressFromRoom();
       updateTimeDisplay();
@@ -267,10 +267,12 @@ export function syncLocalAudioToRoom() {
 
 audio.addEventListener("ended", () => debouncedNext());
 audio.addEventListener("timeupdate", () => {
-  updateProgressFromAudio();
+  if (state.playEnabled) updateProgressFromAudio();
+  else updateProgressFromRoom();
   updateTimeDisplay();
 });
 audio.addEventListener("loadedmetadata", () => {
-  updateProgressFromAudio(true);
+  if (state.playEnabled) updateProgressFromAudio(true);
+  else updateProgressFromRoom(true);
   updateTimeDisplay();
 });

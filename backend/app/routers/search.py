@@ -1,3 +1,4 @@
+import asyncio
 import re
 from typing import Any
 
@@ -13,29 +14,81 @@ router = APIRouter(prefix="/api", tags=["search"])
 
 
 _BV_IN_TEXT_RE = re.compile(r"(BV[0-9A-Za-z]{10})", re.IGNORECASE)
+_BILI_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://search.bilibili.com/",
+    "Origin": "https://search.bilibili.com",
+}
+
+
+def _parse_bili_duration_ms(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value * 1000)
+    parts = str(value).strip().split(":")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds * 1000
+
+
+async def _get_json_with_retries(
+    url: str,
+    *,
+    params: dict[str, Any],
+    headers: dict[str, str],
+    attempts: int = 3,
+    timeout: float = 12.0,
+) -> dict[str, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+                r = await client.get(url, params=params)
+                r.raise_for_status()
+                return r.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.25 * (attempt + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _bili_video_by_bv(bv: str) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}) as client:
-        r = await client.get("https://api.bilibili.com/x/web-interface/view", params={"bvid": bv})
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") != 0:
-            raise HTTPException(status_code=400, detail="bilibili view api error")
-        return data["data"]
+    for attempt in range(2):
+        data = await _get_json_with_retries(
+            "https://api.bilibili.com/x/web-interface/view",
+            params={"bvid": bv},
+            headers={**_BILI_HEADERS, "Referer": "https://www.bilibili.com/"},
+        )
+        if data.get("code") == 0:
+            return data["data"]
+        if attempt == 0:
+            await asyncio.sleep(0.25)
+    raise HTTPException(status_code=400, detail="bilibili view api error")
 
 
 async def _bili_search(keyword: str, page: int = 1) -> list[dict[str, Any]]:
-    async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}) as client:
-        r = await client.get(
+    for attempt in range(2):
+        data = await _get_json_with_retries(
             "https://api.bilibili.com/x/web-interface/search/type",
-            params={"search_type": "video", "keyword": keyword, "page": page},
+            params={"search_type": "video", "keyword": keyword, "page": page, "page_size": 20},
+            headers=_BILI_HEADERS,
         )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("code") != 0:
-            raise HTTPException(status_code=400, detail="bilibili search api error")
-        return data.get("data", {}).get("result", []) or []
+        if data.get("code") == 0:
+            return data.get("data", {}).get("result", []) or []
+        if attempt == 0:
+            await asyncio.sleep(0.25)
+    raise HTTPException(status_code=400, detail="bilibili search api error")
 
 
 @router.get("/search", response_model=list[SearchTrackOut])
@@ -91,7 +144,7 @@ async def search(q: str, user: User = Depends(get_current_user)):
                         source_track_id=bvid,
                         title=(item.get("title") or "").replace("<em class=\"keyword\">", "").replace("</em>", ""),
                         artist=item.get("author"),
-                        duration_ms=None,
+                        duration_ms=_parse_bili_duration_ms(item.get("duration")),
                         cover_url=("https:" + item["pic"]) if isinstance(item.get("pic"), str) and item["pic"].startswith("//") else item.get("pic"),
                     )
                 )
@@ -101,7 +154,7 @@ async def search(q: str, user: User = Depends(get_current_user)):
 
     async def run_netease() -> list[SearchTrackOut]:
         async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}) as client:
-            r = await client.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 20})
+            r = await client.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 50})
             r.raise_for_status()
             data = r.json()
         songs = (((data or {}).get("result") or {}).get("songs")) or []
@@ -129,7 +182,7 @@ async def search(q: str, user: User = Depends(get_current_user)):
                     cover_url=((s.get("album") or {}).get("picUrl")),
                 )
             )
-            if len(out2) >= 10:
+            if len(out2) >= 24:
                 break
         return out2
 

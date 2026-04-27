@@ -1,6 +1,6 @@
 import { state } from './state.js';
 import { api } from './api.js';
-import { escapeHtml, trackKey, reconcileList } from './utils.js';
+import { escapeHtml, trackKey } from './utils.js';
 import { syncOrderButtonState, syncPlaylistButtonState } from './buttons.js';
 import { refreshQueue } from './queue.js';
 import { togglePlaylistItem, showPlaylistPicker } from './playlist.js';
@@ -15,6 +15,35 @@ function getHistory() {
 
 function saveHistory(list) {
   localStorage.setItem("searchHistory", JSON.stringify(list.slice(0, 30)));
+}
+
+function applyExpandableSongTitle(row) {
+  const info = row.firstElementChild;
+  const title = row.querySelector(".title");
+  const actions = row.querySelector(".actions");
+  row.style.alignItems = "flex-start";
+  row.style.height = "auto";
+  if (info) {
+    info.style.flex = "1 1 0";
+    info.style.width = "0";
+    info.style.minWidth = "0";
+    info.style.maxWidth = "100%";
+  }
+  if (title) {
+    title.style.display = "block";
+    title.style.width = "100%";
+    title.style.maxWidth = "100%";
+    title.style.minWidth = "0";
+    title.style.overflow = "visible";
+    title.style.textOverflow = "clip";
+    title.style.whiteSpace = "normal";
+    title.style.overflowWrap = "anywhere";
+    title.style.wordBreak = "break-all";
+    title.style.lineHeight = "1.35";
+  }
+  if (actions) {
+    actions.style.flex = "0 0 auto";
+  }
 }
 
 export function renderHistory() {
@@ -54,7 +83,7 @@ export function closeSearchOverlay() {
 
 function buildSearchRow(t, idx) {
   const el = document.createElement("div");
-  el.className = "item";
+  el.className = "item songItem";
   el.innerHTML = `
     <div>
       <div class="title">${escapeHtml(t.title || "-")}</div>
@@ -87,6 +116,7 @@ function buildSearchRow(t, idx) {
   favBtn.setAttribute("data-track-key", trackKey(t));
   syncPlaylistButtonState(favBtn, t);
   favBtn.addEventListener("click", () => showPlaylistPicker(t, favBtn));
+  applyExpandableSongTitle(el);
   return el;
 }
 
@@ -111,7 +141,7 @@ export async function runSearch() {
 function buildTrendingRow(it, idx) {
   const t = it.track;
   const row = document.createElement("div");
-  row.className = "item";
+  row.className = "item songItem";
   row.innerHTML = `
     <div>
       <div class="title">${escapeHtml(t.title)}</div>
@@ -145,6 +175,7 @@ function buildTrendingRow(it, idx) {
   favBtn.setAttribute("data-track-key", trackKey(t));
   syncPlaylistButtonState(favBtn, t);
   favBtn.addEventListener("click", () => showPlaylistPicker(t, favBtn));
+  applyExpandableSongTitle(row);
   return row;
 }
 
@@ -152,10 +183,10 @@ export async function loadTrending() {
   if (!state.token) return;
   const items = await api("/api/trending?limit=20");
   const el = document.getElementById("tabTrending");
-  reconcileList(
-    el,
-    items,
-    (it) => `${it.track.source}:${it.track.source_track_id}`,
-    (it, idx) => buildTrendingRow(it, idx)
-  );
+  el.innerHTML = "";
+  items.forEach((it, idx) => {
+    const row = buildTrendingRow(it, idx);
+    row.setAttribute("data-list-key", `${it.track.source}:${it.track.source_track_id}`);
+    el.appendChild(row);
+  });
 }
