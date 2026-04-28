@@ -10,7 +10,7 @@ import { showView, setChromeVisible, setUserLabel, toggleUserMenu, initScrollTop
 import { refreshQueue, refreshHistory, updateQueueCountBadge } from './queue.js';
 import { loadPlaylists } from './playlist.js';
 import { openSearchOverlay, closeSearchOverlay, runSearch, renderHistory, loadTrending } from './search.js?v=1.0';
-import { loadRooms, handleRoomGone, startRoomsRefresh, stopRoomsRefresh } from './rooms.js';
+import { loadRooms, handleRoomGone, setEnterRoomHandler, startRoomsRefresh, stopRoomsRefresh } from './rooms.js';
 import { connectWs } from './ws.js';
 import { adminLogin, initAdmin } from './admin.js';
 
@@ -128,6 +128,8 @@ export async function bootstrap() {
   startPeriodicSync();
   if (state.playEnabled) syncLocalAudioToRoom();
 }
+
+setEnterRoomHandler(bootstrap);
 
 // --- Initial UI setup ---
 

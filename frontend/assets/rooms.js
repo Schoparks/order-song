@@ -4,6 +4,12 @@ import { escapeHtml, reconcileList } from './utils.js';
 import { showView, setChromeVisible } from './ui.js';
 import { audio, setNowPlaying } from './player.js';
 
+let enterRoomHandler = null;
+
+export function setEnterRoomHandler(handler) {
+  enterRoomHandler = handler;
+}
+
 export function handleRoomGone() {
   localStorage.removeItem("roomId");
   state.roomId = null;
@@ -44,8 +50,7 @@ function buildRoomRow(r, idx) {
     state.roomId = r.id;
     await api(`/api/rooms/${state.roomId}/join`, { method: "POST" });
     localStorage.setItem("roomId", String(state.roomId));
-    const { bootstrap } = await import('./app.js');
-    await bootstrap();
+    if (enterRoomHandler) await enterRoomHandler();
   });
   return row;
 }
