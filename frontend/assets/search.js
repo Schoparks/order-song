@@ -1,6 +1,6 @@
-import { state } from './state.js';
+import { state, clientConfig } from './state.js';
 import { api } from './api.js';
-import { escapeHtml, trackKey } from './utils.js';
+import { escapeHtml, trackKey, reconcileList } from './utils.js';
 import { syncOrderButtonState, syncPlaylistButtonState } from './buttons.js';
 import { refreshQueue } from './queue.js';
 import { togglePlaylistItem, showPlaylistPicker } from './playlist.js';
@@ -14,7 +14,7 @@ function getHistory() {
 }
 
 function saveHistory(list) {
-  localStorage.setItem("searchHistory", JSON.stringify(list.slice(0, 30)));
+  localStorage.setItem("searchHistory", JSON.stringify(list.slice(0, clientConfig.client.search_history_limit)));
 }
 
 function applyExpandableSongTitle(row) {
@@ -181,12 +181,13 @@ function buildTrendingRow(it, idx) {
 
 export async function loadTrending() {
   if (!state.token) return;
-  const items = await api("/api/trending?limit=50");
+  const limit = clientConfig.trending.limit;
+  const items = await api(`/api/trending?limit=${encodeURIComponent(limit)}`);
   const el = document.getElementById("tabTrending");
-  el.innerHTML = "";
-  items.forEach((it, idx) => {
-    const row = buildTrendingRow(it, idx);
-    row.setAttribute("data-list-key", `${it.track.source}:${it.track.source_track_id}`);
-    el.appendChild(row);
-  });
+  reconcileList(
+    el,
+    items,
+    (it) => `${it.track.source}:${it.track.source_track_id}`,
+    (it, idx) => buildTrendingRow(it, idx)
+  );
 }

@@ -1,4 +1,4 @@
-import { state, SYNC_INTERVAL_MS, TRENDING_SYNC_INTERVAL_MS, stopPeriodicSync } from './state.js';
+import { state, clientConfig, applyClientConfig, stopPeriodicSync } from './state.js';
 import { api } from './api.js';
 import { escapeHtml } from './utils.js';
 import {
@@ -54,14 +54,22 @@ function startPeriodicSync() {
   stopPeriodicSync();
   state.syncTimer = setInterval(() => {
     syncRoomState().catch(() => {});
-  }, SYNC_INTERVAL_MS);
+  }, clientConfig.client.sync_interval_ms);
   state.trendingSyncTimer = setInterval(() => {
     loadTrending().catch(() => {});
     loadPlaylists().catch(() => {});
-  }, TRENDING_SYNC_INTERVAL_MS);
+  }, clientConfig.client.trending_sync_interval_ms);
   state.roomCheckTimer = setInterval(() => {
     checkRoomAlive().catch(() => {});
-  }, 15000);
+  }, clientConfig.client.room_check_interval_ms);
+}
+
+async function loadPublicConfig() {
+  try {
+    applyClientConfig(await api("/api/config"));
+  } catch (_) {
+    applyClientConfig({});
+  }
 }
 
 // --- Bootstrap ---
@@ -431,4 +439,6 @@ document.addEventListener("mousedown", (e) => {
 
 // --- Start ---
 
-bootstrap().catch(() => {});
+loadPublicConfig()
+  .then(() => bootstrap())
+  .catch(() => {});

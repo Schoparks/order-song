@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, delete, select
 
+from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Track, TrackOrderStats, TrackSource, User, UserPlaylist, UserPlaylistItem
 from app.routers.queue_playback import _get_or_create_track
@@ -219,7 +220,7 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
         raise HTTPException(status_code=400, detail="无法解析歌单ID，请提供歌单链接或ID")
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=settings.upstream.netease_playlist_timeout_s) as client:
             r = await client.post(
                 "https://music.163.com/api/v3/playlist/detail",
                 data={"id": playlist_id, "n": "100000", "s": "8"},
@@ -248,9 +249,10 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
         missing_ids = [t["id"] for t in track_ids_raw if isinstance(t, dict) and t.get("id") not in fetched_ids]
         if missing_ids:
             try:
-                async with httpx.AsyncClient(timeout=30.0) as detail_client:
-                    for i in range(0, len(missing_ids), 500):
-                        batch = missing_ids[i:i+500]
+                async with httpx.AsyncClient(timeout=settings.upstream.netease_playlist_detail_timeout_s) as detail_client:
+                    batch_size = settings.upstream.netease_playlist_detail_batch_size
+                    for i in range(0, len(missing_ids), batch_size):
+                        batch = missing_ids[i:i + batch_size]
                         c_param = json.dumps([{"id": sid} for sid in batch])
                         dr = await detail_client.post(
                             "https://music.163.com/api/v3/song/detail",
@@ -325,8 +327,8 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
 
 
 @router.get("/trending")
-def trending(limit: int = 50, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    limit = max(1, min(200, int(limit)))
+def trending(limit: int | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    limit = max(1, int(limit if limit is not None else settings.trending.limit))
     rows = db.exec(
         select(TrackOrderStats, Track)
         .join(Track, Track.id == TrackOrderStats.track_id)

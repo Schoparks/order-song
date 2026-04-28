@@ -1,6 +1,7 @@
 import sqlite3
+from pathlib import Path
 
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, func, select
 
 from app.core.config import settings
 
@@ -9,6 +10,7 @@ def _db_url() -> str:
     return f"sqlite:///{settings.sqlite_path}"
 
 
+Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
 engine = create_engine(_db_url(), connect_args={"check_same_thread": False})
 
 
@@ -36,6 +38,25 @@ def init_db() -> None:
 
     SQLModel.metadata.create_all(engine)
     _migrate_columns()
+    _bootstrap_default_admin()
+
+
+def _bootstrap_default_admin() -> None:
+    from app.core.security import hash_password
+    from app.models import User
+
+    bootstrap = settings.admin.bootstrap
+    username = bootstrap.username.strip()
+    if not bootstrap.enabled or not username or not bootstrap.password:
+        return
+
+    with Session(engine) as session:
+        user_count = session.exec(select(func.count()).select_from(User)).one()
+        if int(user_count) > 0:
+            return
+        user = User(username=username, password_hash=hash_password(bootstrap.password), is_admin=True)
+        session.add(user)
+        session.commit()
 
 
 def get_session():

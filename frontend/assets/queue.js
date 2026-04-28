@@ -113,6 +113,13 @@ export function buildHistoryRow(it, index = 0) {
   return row;
 }
 
+function buildHistoryEmptyRow() {
+  const row = document.createElement("div");
+  row.className = "item";
+  row.innerHTML = `<div><div class="title">暂无</div><div class="meta">播完 / 切歌后会出现在这里</div></div>`;
+  return row;
+}
+
 export async function refreshHistory() {
   if (!state.roomId) return;
   const items = await api(`/api/rooms/${state.roomId}/history`);
@@ -120,7 +127,12 @@ export async function refreshHistory() {
   for (const container of [document.getElementById("historyList"), document.getElementById("historyListMobile")]) {
     if (!container) continue;
     if (!filtered.length) {
-      container.innerHTML = `<div class="item"><div><div class="title">暂无</div><div class="meta">播完 / 切歌后会出现在这里</div></div></div>`;
+      reconcileList(
+        container,
+        [{ id: "__history_empty" }],
+        (it) => it.id,
+        () => buildHistoryEmptyRow()
+      );
       continue;
     }
     reconcileList(

@@ -1,4 +1,4 @@
-import { state, stopPeriodicSync } from './state.js';
+import { state, clientConfig, stopPeriodicSync } from './state.js';
 import { api } from './api.js';
 import { escapeHtml, reconcileList } from './utils.js';
 import { showView, setChromeVisible } from './ui.js';
@@ -69,7 +69,7 @@ export function startRoomsRefresh() {
   stopRoomsRefresh();
   state.roomsRefreshTimer = setInterval(() => {
     loadRooms().catch(() => {});
-  }, 5000);
+  }, clientConfig.client.rooms_refresh_interval_ms);
 }
 
 export function stopRoomsRefresh() {

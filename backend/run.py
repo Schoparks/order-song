@@ -22,6 +22,8 @@ os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import uvicorn
 
+from app.core.config import settings
+
 
 def make_socket(port: int) -> socket.socket:
     try:
@@ -48,7 +50,7 @@ def make_socket(port: int) -> socket.socket:
 
 
 def main():
-    port = 5732
+    port = settings.server.port
     for arg in sys.argv[1:]:
         if arg.startswith("--port="):
             port = int(arg.split("=", 1)[1])

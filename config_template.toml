@@ -1,0 +1,98 @@
+[app]
+# 应用名称；会用于 FastAPI 标题和 /health 返回值。
+name = "order-song"
+
+[server]
+# 后端默认监听端口；命令行 --port= 会优先于这里。
+port = 5732
+# 允许访问 API 的前端来源。自带前端同源访问时可保持 "*"。
+# 如果前端以后独立部署，建议写成 "https://example.com,https://admin.example.com"。
+cors_allow_origins = "*"
+
+[database]
+# SQLite 数据库路径；相对路径按项目根目录解析。
+sqlite_path = "backend/order_song.sqlite3"
+
+[auth]
+# JWT 签名密钥。长期使用务必改成随机长字符串，不要提交 config.toml。
+jwt_secret = "dev-secret-change-me"
+# JWT 签名算法，默认 HS256；不了解时不要改。
+jwt_algorithm = "HS256"
+# 登录有效期，单位分钟；默认 14 天。
+jwt_exp_minutes = 20160
+
+[admin.bootstrap]
+# 是否启用默认管理员初始化。
+enabled = false
+# 仅用户表为空时创建；已有用户时不覆盖密码、不新增管理员。
+username = "admin"
+# 默认管理员密码；启用前必须修改。
+password = ""
+
+[search]
+# 搜索聚合结果最终最多返回多少首。
+aggregate_limit = 40
+# 上游搜索请求重试次数。
+attempts = 3
+# 搜索类上游请求超时，单位秒。
+timeout_s = 12.0
+
+[search.bilibili]
+# 是否启用 B 站搜索。
+enabled = true
+# 请求 B 站搜索 API 时的 page_size。
+page_size = 20
+# B 站结果最多保留多少条。
+result_limit = 10
+
+[search.netease]
+# 是否启用网易云搜索。
+enabled = true
+# 请求网易云搜索 API 时的 limit。
+api_limit = 50
+# 网易云可用歌曲最多保留多少条。
+result_limit = 24
+
+[trending]
+# 热门歌曲数量。前端会请求这个数量，后端未传 limit 时也使用这个数量。
+limit = 50
+
+[rooms]
+# 房间列表最多返回多少个房间。
+list_limit = 200
+# 房间卡片预览多少个成员名。
+member_preview_count = 3
+# 播放历史最多返回多少条。
+history_limit = 200
+# 新房间默认音量。
+default_volume = 50
+# 后台清理离线成员的检查间隔，单位秒。
+stale_check_interval_s = 300
+# 用户断开超过多久视为离线成员，单位秒。
+stale_timeout_s = 1800
+
+[client]
+# 房间播放状态同步间隔，单位毫秒。
+sync_interval_ms = 5000
+# 热门榜单和歌单刷新间隔，单位毫秒。
+trending_sync_interval_ms = 60000
+# 房间存活检查间隔，单位毫秒。
+room_check_interval_ms = 15000
+# 房间列表刷新间隔，单位毫秒。
+rooms_refresh_interval_ms = 5000
+# 本地搜索历史最多保存多少条。
+search_history_limit = 30
+
+[upstream]
+# yt-dlp 解析 B 站音频超时，单位秒。
+yt_dlp_timeout_s = 20
+# B 站音频 API 解析超时，单位秒。
+bilibili_audio_timeout_s = 10
+# 后端代理音频流的上游读取超时，单位秒。
+stream_timeout_s = 60
+# 网易云歌单导入详情请求超时，单位秒。
+netease_playlist_timeout_s = 15
+# 网易云补全歌曲详情请求超时，单位秒。
+netease_playlist_detail_timeout_s = 30
+# 网易云批量补全歌曲详情时每批歌曲数量。
+netease_playlist_detail_batch_size = 500

@@ -3,6 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, delete, func, select
 
+from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, TrackSource, User
 from app.schemas import CreateRoomIn, PlaybackStateOut, RoomOut, TrackOut
@@ -19,7 +20,7 @@ def _default_room_name(username: str) -> str:
 
 @router.get("/rooms")
 def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    rooms = db.exec(select(Room).order_by(Room.created_at.desc()).limit(200)).all()
+    rooms = db.exec(select(Room).order_by(Room.created_at.desc()).limit(settings.rooms.list_limit)).all()
     out = []
     for r in rooms:
         members = db.exec(
@@ -31,7 +32,7 @@ def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_u
         out.append({
             **RoomOut.model_validate(r).model_dump(mode="json"),
             "member_count": len(members),
-            "member_names": list(members[:3]),
+            "member_names": list(members[: settings.rooms.member_preview_count]),
         })
     return out
 
@@ -62,7 +63,7 @@ def create_room(payload: CreateRoomIn, db: Session = Depends(get_db), user: User
     member = RoomMember(room_id=room.id, user_id=user.id)
     db.add(member)
     # initialize playback row
-    pb = RoomPlaybackState(room_id=room.id, mode=RoomMode.order_only, is_playing=False, position_ms=0, volume=50)
+    pb = RoomPlaybackState(room_id=room.id, mode=RoomMode.order_only, is_playing=False, position_ms=0, volume=settings.rooms.default_volume)
     db.add(pb)
     user.last_active_room_id = room.id
     db.add(user)

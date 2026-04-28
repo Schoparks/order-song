@@ -169,6 +169,14 @@ export async function removeFromPlaylist(t, playlistId) {
   rerenderAllPlaylistButtons();
 }
 
+async function queuePlaylistTracks(playlistId) {
+  if (!state.roomId) return { ok: true, added: 0, skipped: 0 };
+  return await api(`/api/rooms/${state.roomId}/queue/playlist`, {
+    method: "POST",
+    json: { playlist_id: playlistId },
+  });
+}
+
 export async function showPlaylistPicker(t, triggerBtn) {
   await loadPlaylistData();
   const key = trackKey(t);
@@ -341,23 +349,7 @@ function renderPlaylistListView() {
       btn.disabled = true;
       btn.textContent = "添加中…";
       try {
-        const items = await api(`/api/playlists/${pl.id}/items`);
-        for (const it of items) {
-          const t = it.track;
-          const k = trackKey(t);
-          if (state.queuedKeys.has(k)) continue;
-          await api(`/api/rooms/${state.roomId}/queue`, {
-            method: "POST",
-            json: {
-              source: t.source,
-              source_track_id: t.source_track_id,
-              title: t.title,
-              artist: t.artist,
-              duration_ms: t.duration_ms,
-              cover_url: t.cover_url,
-            },
-          });
-        }
+        await queuePlaylistTracks(pl.id);
         await refreshQueue();
       } finally {
         btn.disabled = false;
@@ -484,18 +476,278 @@ async function renderPlaylistDetailView(playlistId, playlistName) {
   }
 }
 
+function prepareStablePlaylistView(viewKey) {
+  const el = document.getElementById("tabPlaylists");
+  if (el.dataset.playlistView !== viewKey) {
+    el.innerHTML = "";
+    el.dataset.playlistView = viewKey;
+  }
+  return el;
+}
+
+function buildStablePlaylistHeader() {
+  const header = document.createElement("div");
+  header.className = "playlistHeader";
+  header.innerHTML = `
+    <div class="sectionTitle">我的歌单</div>
+    <button class="btn small js-import-netease">导入网易云歌单</button>
+    <button class="btn small js-create">创建歌单</button>
+  `;
+  header.querySelector(".js-create").addEventListener("click", () => {
+    openTextInputModal({
+      title: "创建歌单",
+      placeholder: "歌单名称",
+      confirmText: "创建",
+      confirmBusyText: "创建中...",
+      onConfirm: async (name) => {
+        await api("/api/playlists", { method: "POST", json: { name } });
+        await loadPlaylists();
+      },
+    });
+  });
+  header.querySelector(".js-import-netease").addEventListener("click", () => {
+    import('./netease_import.js').then((m) => m.showNeteaseImportModal());
+  });
+  return header;
+}
+
+function buildStablePlaylistRow(pl) {
+  const row = document.createElement("div");
+  row.className = "item";
+  row.setAttribute("role", "button");
+  row.tabIndex = 0;
+  row.innerHTML = `
+    <div>
+      <div class="title">${escapeHtml(pl.name)}</div>
+      <div class="meta">${pl.item_count || 0}首歌曲</div>
+    </div>
+    <div class="actions">
+      <button class="btn small js-queue-all">一键点歌</button>
+      <button class="btn small danger js-delete">删除</button>
+    </div>
+  `;
+  const enterPlaylist = () => {
+    _currentPlaylistId = pl.id;
+    renderPlaylistDetailViewStable(pl.id, pl.name).catch(() => {});
+  };
+  row.addEventListener("click", (e) => {
+    if (e.target.closest("button")) return;
+    enterPlaylist();
+  });
+  row.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    if (e.target.closest("button")) return;
+    e.preventDefault();
+    enterPlaylist();
+  });
+  row.querySelector(".js-queue-all").addEventListener("click", async () => {
+    if (!state.roomId) return;
+    const btn = row.querySelector(".js-queue-all");
+    btn.disabled = true;
+    btn.textContent = "添加中...";
+    try {
+      await queuePlaylistTracks(pl.id);
+      await refreshQueue();
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "一键点歌";
+    }
+  });
+  row.querySelector(".js-delete").addEventListener("click", async () => {
+    openConfirmModal({
+      title: "删除歌单？",
+      bodyHtml: `
+        <div class="muted" style="margin-top:-4px">
+          将删除歌单「<b>${escapeHtml(pl.name)}</b>」及其所有歌曲，且不可恢复。
+        </div>
+      `,
+      confirmText: "删除",
+      confirmBusyText: "删除中...",
+      confirmBtnClass: "btn small danger",
+      onConfirm: async () => {
+        await api(`/api/playlists/${pl.id}`, { method: "DELETE" });
+        await loadPlaylists();
+      },
+    });
+  });
+  return row;
+}
+
+function buildStablePlaylistEmptyRow() {
+  const row = document.createElement("div");
+  row.className = "item";
+  row.innerHTML = `<div><div class="title">暂无歌单</div><div class="meta">点击上方按钮创建歌单</div></div>`;
+  return row;
+}
+
+function renderPlaylistListViewStable() {
+  const el = prepareStablePlaylistView("list");
+  const header = buildStablePlaylistHeader();
+  if (!state.playlists.length) {
+    reconcileList(
+      el,
+      [{ id: "__playlist_empty" }],
+      (it) => it.id,
+      () => buildStablePlaylistEmptyRow(),
+      { prepend: [header] }
+    );
+    return;
+  }
+  reconcileList(
+    el,
+    state.playlists,
+    (pl) => `pl-${pl.id}`,
+    (pl) => buildStablePlaylistRow(pl),
+    { prepend: [header] }
+  );
+}
+
+function buildStablePlaylistDetailHeader(playlistId, playlistName) {
+  const header = document.createElement("div");
+  header.className = "playlistHeader";
+  header.innerHTML = `
+    <button class="iconBtn small js-back" title="返回歌单列表" aria-label="返回歌单列表">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M15 18l-6-6 6-6"></path>
+      </svg>
+    </button>
+    <div class="sectionTitle" style="margin:0">${escapeHtml(playlistName)}</div>
+    <button class="btn small js-rename">重命名</button>
+  `;
+  header.querySelector(".js-back").addEventListener("click", () => {
+    _currentPlaylistId = null;
+    loadPlaylists();
+  });
+  header.querySelector(".js-rename").addEventListener("click", async () => {
+    openTextInputModal({
+      title: "重命名歌单",
+      initialValue: playlistName,
+      placeholder: "歌单名称",
+      confirmText: "保存",
+      confirmBusyText: "保存中...",
+      onConfirm: async (name) => {
+        await api(`/api/playlists/${playlistId}`, { method: "PATCH", json: { name } });
+        await loadPlaylistData();
+        await renderPlaylistDetailViewStable(playlistId, name);
+      },
+    });
+  });
+  return header;
+}
+
+function buildStablePlaylistDetailRow(it) {
+  const t = it.track;
+  const row = document.createElement("div");
+  row.className = "item songItem";
+  row.innerHTML = `
+    <div>
+      <div class="title">${escapeHtml(t.title)}</div>
+      <div class="meta">${escapeHtml(t.source)} · ${escapeHtml(t.artist || "-")}</div>
+    </div>
+    <div class="actions">
+      <button class="btn small js-order">点歌</button>
+      <button class="btn small js-manage">在歌单中</button>
+    </div>
+  `;
+  const orderBtn = row.querySelector(".js-order");
+  orderBtn.setAttribute("data-track-key", trackKey(t));
+  syncOrderButtonState(orderBtn, t);
+  orderBtn.addEventListener("click", async () => {
+    if (!state.roomId) return;
+    await api(`/api/rooms/${state.roomId}/queue`, {
+      method: "POST",
+      json: {
+        source: t.source,
+        source_track_id: t.source_track_id,
+        title: t.title,
+        artist: t.artist,
+        duration_ms: t.duration_ms,
+        cover_url: t.cover_url,
+      },
+    });
+    await refreshQueue();
+    syncOrderButtonState(orderBtn, t);
+  });
+  row.querySelector(".js-manage").addEventListener("click", () => {
+    showPlaylistPicker(t, null);
+  });
+  return row;
+}
+
+function buildStablePlaylistDetailEmptyRow() {
+  const row = document.createElement("div");
+  row.className = "item";
+  row.innerHTML = `<div><div class="title">暂无歌曲</div><div class="meta">搜索后可将歌曲加入此歌单</div></div>`;
+  return row;
+}
+
+function buildStablePlaylistMessageRow(title, meta = "") {
+  const row = document.createElement("div");
+  row.className = "item";
+  row.innerHTML = `<div><div class="title">${escapeHtml(title)}</div><div class="meta">${escapeHtml(meta)}</div></div>`;
+  return row;
+}
+
+async function renderPlaylistDetailViewStable(playlistId, playlistName) {
+  const el = prepareStablePlaylistView(`detail:${playlistId}`);
+  const header = buildStablePlaylistDetailHeader(playlistId, playlistName);
+  if (!el.children.length) {
+    reconcileList(
+      el,
+      [{ id: "__playlist_loading", title: "加载中...", meta: "" }],
+      (it) => it.id,
+      (it) => buildStablePlaylistMessageRow(it.title, it.meta),
+      { prepend: [header] }
+    );
+  }
+
+  try {
+    const items = await api(`/api/playlists/${playlistId}/items`);
+    if (_currentPlaylistId !== playlistId) return;
+    const latest = state.playlists.find((p) => p.id === playlistId);
+    const latestName = latest ? latest.name : playlistName;
+    const latestHeader = buildStablePlaylistDetailHeader(playlistId, latestName);
+    if (!items.length) {
+      reconcileList(
+        el,
+        [{ id: "__playlist_detail_empty" }],
+        (it) => it.id,
+        () => buildStablePlaylistDetailEmptyRow(),
+        { prepend: [latestHeader] }
+      );
+      return;
+    }
+    reconcileList(
+      el,
+      items,
+      (it) => `pli-${it.id}`,
+      (it) => buildStablePlaylistDetailRow(it),
+      { prepend: [latestHeader] }
+    );
+  } catch (e) {
+    if (_currentPlaylistId !== playlistId) return;
+    reconcileList(
+      el,
+      [{ id: "__playlist_error", title: "加载失败", meta: "" }],
+      (it) => it.id,
+      (it) => buildStablePlaylistMessageRow(it.title, it.meta),
+      { prepend: [header] }
+    );
+  }
+}
+
 export async function loadPlaylists() {
   if (!state.token) return;
   await loadPlaylistData();
   if (_currentPlaylistId) {
     const pl = state.playlists.find((p) => p.id === _currentPlaylistId);
     if (pl) {
-      renderPlaylistDetailView(_currentPlaylistId, pl.name);
+      await renderPlaylistDetailViewStable(_currentPlaylistId, pl.name);
       return;
     }
     _currentPlaylistId = null;
   }
-  renderPlaylistListView();
+  renderPlaylistListViewStable();
 }
 
 export async function togglePlaylistItem(t, btn) {

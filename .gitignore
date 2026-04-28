@@ -2,10 +2,12 @@ backend/.venv/
 backend/app/__pycache__/
 backend/app/routers/__pycache__/
 backend/app/core/__pycache__/
+__pycache__/
 backend/.pytest_cache/
 backend/.ruff_cache/
 backend/*.sqlite3
 backend/*.db
+config.toml
 
 frontend/.cache/
 

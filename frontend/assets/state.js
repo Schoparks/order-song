@@ -9,6 +9,36 @@ export const SYNC_INTERVAL_MS = 5000;
 export const TRENDING_SYNC_INTERVAL_MS = 60000;
 export const SEEK_TOLERANCE_S = 10;
 
+export const clientConfig = {
+  trending: {
+    limit: 50,
+  },
+  client: {
+    sync_interval_ms: SYNC_INTERVAL_MS,
+    trending_sync_interval_ms: TRENDING_SYNC_INTERVAL_MS,
+    room_check_interval_ms: 15000,
+    rooms_refresh_interval_ms: 5000,
+    search_history_limit: 30,
+  },
+};
+
+function readConfigNumber(value, fallback, min = 1) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.max(min, Math.floor(num));
+}
+
+export function applyClientConfig(config = {}) {
+  const trending = config.trending || {};
+  const client = config.client || {};
+  clientConfig.trending.limit = readConfigNumber(trending.limit, clientConfig.trending.limit);
+  clientConfig.client.sync_interval_ms = readConfigNumber(client.sync_interval_ms, clientConfig.client.sync_interval_ms);
+  clientConfig.client.trending_sync_interval_ms = readConfigNumber(client.trending_sync_interval_ms, clientConfig.client.trending_sync_interval_ms);
+  clientConfig.client.room_check_interval_ms = readConfigNumber(client.room_check_interval_ms, clientConfig.client.room_check_interval_ms);
+  clientConfig.client.rooms_refresh_interval_ms = readConfigNumber(client.rooms_refresh_interval_ms, clientConfig.client.rooms_refresh_interval_ms);
+  clientConfig.client.search_history_limit = readConfigNumber(client.search_history_limit, clientConfig.client.search_history_limit);
+}
+
 export const state = {
   token: localStorage.getItem("token") || null,
   playEnabled: (localStorage.getItem("playEnabled") || "0") === "1",

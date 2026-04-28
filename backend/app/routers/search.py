@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.core.config import settings
 from app.deps import get_current_user
 from app.models import TrackSource, User
 from app.schemas import SearchTrackOut
@@ -45,26 +46,28 @@ async def _get_json_with_retries(
     *,
     params: dict[str, Any],
     headers: dict[str, str],
-    attempts: int = 3,
-    timeout: float = 12.0,
+    attempts: int | None = None,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     last_exc: Exception | None = None
-    for attempt in range(attempts):
+    max_attempts = attempts if attempts is not None else settings.search.attempts
+    request_timeout = timeout if timeout is not None else settings.search.timeout_s
+    for attempt in range(max_attempts):
         try:
-            async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=request_timeout, headers=headers, follow_redirects=True) as client:
                 r = await client.get(url, params=params)
                 r.raise_for_status()
                 return r.json()
         except Exception as exc:
             last_exc = exc
-            if attempt + 1 < attempts:
+            if attempt + 1 < max_attempts:
                 await asyncio.sleep(0.25 * (attempt + 1))
     assert last_exc is not None
     raise last_exc
 
 
 async def _bili_video_by_bv(bv: str) -> dict[str, Any]:
-    for attempt in range(2):
+    for attempt in range(settings.search.attempts):
         data = await _get_json_with_retries(
             "https://api.bilibili.com/x/web-interface/view",
             params={"bvid": bv},
@@ -72,21 +75,21 @@ async def _bili_video_by_bv(bv: str) -> dict[str, Any]:
         )
         if data.get("code") == 0:
             return data["data"]
-        if attempt == 0:
+        if attempt + 1 < settings.search.attempts:
             await asyncio.sleep(0.25)
     raise HTTPException(status_code=400, detail="bilibili view api error")
 
 
 async def _bili_search(keyword: str, page: int = 1) -> list[dict[str, Any]]:
-    for attempt in range(2):
+    for attempt in range(settings.search.attempts):
         data = await _get_json_with_retries(
             "https://api.bilibili.com/x/web-interface/search/type",
-            params={"search_type": "video", "keyword": keyword, "page": page, "page_size": 20},
+            params={"search_type": "video", "keyword": keyword, "page": page, "page_size": settings.search.bilibili.page_size},
             headers=_BILI_HEADERS,
         )
         if data.get("code") == 0:
             return data.get("data", {}).get("result", []) or []
-        if attempt == 0:
+        if attempt + 1 < settings.search.attempts:
             await asyncio.sleep(0.25)
     raise HTTPException(status_code=400, detail="bilibili search api error")
 
@@ -112,6 +115,8 @@ async def search(q: str, user: User = Depends(get_current_user)):
 
     # bilibili (BV direct or keyword)
     async def run_bilibili() -> list[SearchTrackOut]:
+        if not settings.search.bilibili.enabled:
+            return []
         m = _BV_IN_TEXT_RE.search(q)
         if m:
             bv = m.group(1)
@@ -134,7 +139,7 @@ async def search(q: str, user: User = Depends(get_current_user)):
         try:
             results = await _bili_search(q, page=1)
             out2: list[SearchTrackOut] = []
-            for item in results[:10]:
+            for item in results[: settings.search.bilibili.result_limit]:
                 bvid = item.get("bvid")
                 if not bvid:
                     continue
@@ -153,8 +158,10 @@ async def search(q: str, user: User = Depends(get_current_user)):
             return []
 
     async def run_netease() -> list[SearchTrackOut]:
-        async with httpx.AsyncClient(timeout=10.0, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}) as client:
-            r = await client.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": 50})
+        if not settings.search.netease.enabled:
+            return []
+        async with httpx.AsyncClient(timeout=settings.search.timeout_s, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"}) as client:
+            r = await client.get("https://music.163.com/api/search/get", params={"s": q, "type": 1, "limit": settings.search.netease.api_limit})
             r.raise_for_status()
             data = r.json()
         songs = (((data or {}).get("result") or {}).get("songs")) or []
@@ -182,7 +189,7 @@ async def search(q: str, user: User = Depends(get_current_user)):
                     cover_url=((s.get("album") or {}).get("picUrl")),
                 )
             )
-            if len(out2) >= 24:
+            if len(out2) >= settings.search.netease.result_limit:
                 break
         return out2
 
@@ -201,5 +208,5 @@ async def search(q: str, user: User = Depends(get_current_user)):
             continue
         out.extend(r)
 
-    return _dedupe(out)[:40]
+    return _dedupe(out)[: settings.search.aggregate_limit]
 

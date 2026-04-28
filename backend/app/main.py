@@ -33,10 +33,6 @@ app.add_middleware(
 )
 
 
-STALE_MEMBER_CHECK_INTERVAL_S = 300
-STALE_MEMBER_TIMEOUT_S = 1800
-
-
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
@@ -50,9 +46,9 @@ async def _startup_bg_tasks() -> None:
 async def _cleanup_stale_members() -> None:
     """Remove members who have been disconnected for 30+ minutes."""
     while True:
-        await asyncio.sleep(STALE_MEMBER_CHECK_INTERVAL_S)
+        await asyncio.sleep(settings.rooms.stale_check_interval_s)
         try:
-            stale = await hub.get_stale_users(timeout_seconds=STALE_MEMBER_TIMEOUT_S)
+            stale = await hub.get_stale_users(timeout_seconds=settings.rooms.stale_timeout_s)
             for room_id, user_id in stale:
                 try:
                     with Session(engine) as db:
@@ -67,6 +63,11 @@ async def _cleanup_stale_members() -> None:
 @app.get("/health")
 def health():
     return {"ok": True, "app": settings.app_name}
+
+
+@app.get("/api/config")
+def public_config():
+    return settings.public_config()
 
 
 app.include_router(auth_router)
