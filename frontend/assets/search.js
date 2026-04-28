@@ -181,7 +181,7 @@ function buildTrendingRow(it, idx) {
 
 export async function loadTrending() {
   if (!state.token) return;
-  const items = await api("/api/trending?limit=20");
+  const items = await api("/api/trending?limit=50");
   const el = document.getElementById("tabTrending");
   el.innerHTML = "";
   items.forEach((it, idx) => {
