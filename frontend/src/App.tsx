@@ -60,9 +60,11 @@ type AdminUser = UserPublic & { last_active_room_id?: number | null };
 type AdminRoom = Room & { created_by: string; members: Array<{ id: number; username: string }> };
 
 const KEYBOARD_HEIGHT_DELTA = 120;
+const IOS_VIEWPORT_TOP_OFFSET_LIMIT = 80;
 let stableViewportHeight = 0;
 let stableViewportWidth = 0;
 let freezeViewportUntil = 0;
+let sawIosKeyboardInteraction = false;
 
 function isIosSafari() {
   const ua = navigator.userAgent;
@@ -71,14 +73,8 @@ function isIosSafari() {
 }
 
 function syncSafeAreaOverrides() {
-  if (!isIosSafari()) {
-    document.documentElement.style.removeProperty("--safe-top");
-    document.documentElement.style.removeProperty("--safe-bottom");
-    return;
-  }
-
-  document.documentElement.style.setProperty("--safe-top", "0px");
-  document.documentElement.style.setProperty("--safe-bottom", "0px");
+  document.documentElement.style.removeProperty("--safe-top");
+  document.documentElement.style.removeProperty("--safe-bottom");
 }
 
 function readViewportSize() {
@@ -93,6 +89,26 @@ function isEditableElement(element: Element | null): boolean {
   if (!(element instanceof HTMLElement)) return false;
   const tagName = element.tagName.toLowerCase();
   return tagName === "input" || tagName === "textarea" || element.isContentEditable;
+}
+
+function noteIosKeyboardInteraction() {
+  if (isIosSafari()) sawIosKeyboardInteraction = true;
+}
+
+function syncIosViewportTopOffset() {
+  const root = document.documentElement;
+  if (!isIosSafari() || !sawIosKeyboardInteraction || isEditableElement(document.activeElement)) {
+    root.style.setProperty("--ios-viewport-top-offset", "0px");
+    return;
+  }
+
+  const viewport = window.visualViewport;
+  const offsetTop = Math.max(0, Math.round(viewport?.offsetTop || 0));
+  if (offsetTop > 1 && offsetTop <= IOS_VIEWPORT_TOP_OFFSET_LIMIT) {
+    root.style.setProperty("--ios-viewport-top-offset", `${offsetTop}px`);
+  } else {
+    root.style.setProperty("--ios-viewport-top-offset", "0px");
+  }
 }
 
 function freezeViewportForKeyboard(ms = 1400) {
@@ -127,18 +143,45 @@ function useStableViewportHeight() {
   useLayoutEffect(() => {
     syncSafeAreaOverrides();
     syncStableViewportHeight(true);
+    syncIosViewportTopOffset();
     const scheduleSync = () => window.requestAnimationFrame(() => {
       syncSafeAreaOverrides();
       syncStableViewportHeight();
+      syncIosViewportTopOffset();
     });
+    const scheduleKeyboardRecovery = () => {
+      scheduleSync();
+      window.setTimeout(scheduleSync, 80);
+      window.setTimeout(scheduleSync, 260);
+      window.setTimeout(scheduleSync, 600);
+      window.setTimeout(scheduleSync, 1000);
+      queueIosSafariViewportNudges();
+    };
+    const handleFocusIn = (event: FocusEvent) => {
+      if (!isEditableElement(event.target as Element | null)) return;
+      noteIosKeyboardInteraction();
+      document.documentElement.style.setProperty("--ios-viewport-top-offset", "0px");
+      freezeViewportForKeyboard(2200);
+      scheduleSync();
+    };
+    const handleFocusOut = (event: FocusEvent) => {
+      if (!isEditableElement(event.target as Element | null)) return;
+      noteIosKeyboardInteraction();
+      freezeViewportForKeyboard(2200);
+      scheduleKeyboardRecovery();
+    };
     const viewport = window.visualViewport;
     window.addEventListener("resize", scheduleSync);
     window.addEventListener("orientationchange", scheduleSync);
+    document.addEventListener("focusin", handleFocusIn, true);
+    document.addEventListener("focusout", handleFocusOut, true);
     viewport?.addEventListener("resize", scheduleSync);
     viewport?.addEventListener("scroll", scheduleSync);
     return () => {
       window.removeEventListener("resize", scheduleSync);
       window.removeEventListener("orientationchange", scheduleSync);
+      document.removeEventListener("focusin", handleFocusIn, true);
+      document.removeEventListener("focusout", handleFocusOut, true);
       viewport?.removeEventListener("resize", scheduleSync);
       viewport?.removeEventListener("scroll", scheduleSync);
     };
@@ -148,6 +191,7 @@ function useStableViewportHeight() {
 function blurActiveElement() {
   const active = document.activeElement;
   if (active instanceof HTMLElement) {
+    if (isEditableElement(active)) noteIosKeyboardInteraction();
     freezeViewportForKeyboard();
     active.blur();
   }
@@ -159,11 +203,69 @@ function restoreViewportScroll() {
   document.body.scrollTop = 0;
 }
 
+function nudgeIosSafariViewport() {
+  if (!isIosSafari() || !sawIosKeyboardInteraction || isEditableElement(document.activeElement)) return;
+
+  const { body, documentElement } = document;
+  if (body.style.position === "fixed") return;
+
+  const previous = {
+    htmlOverflowY: documentElement.style.overflowY,
+    htmlScrollBehavior: documentElement.style.scrollBehavior,
+    bodyOverflowY: body.style.overflowY,
+    bodyHeight: body.style.height,
+    bodyMinHeight: body.style.minHeight,
+  };
+  const minHeight = Math.max(window.innerHeight, documentElement.clientHeight, Math.round(window.visualViewport?.height || 0)) + 2;
+
+  documentElement.style.scrollBehavior = "auto";
+  documentElement.style.overflowY = "auto";
+  body.style.overflowY = "auto";
+  body.style.height = "auto";
+  body.style.minHeight = `${minHeight}px`;
+
+  window.scrollTo(0, 1);
+  documentElement.scrollTop = 1;
+  body.scrollTop = 1;
+
+  window.requestAnimationFrame(() => {
+    restoreViewportScroll();
+    window.requestAnimationFrame(() => {
+      documentElement.style.overflowY = previous.htmlOverflowY;
+      documentElement.style.scrollBehavior = previous.htmlScrollBehavior;
+      body.style.overflowY = previous.bodyOverflowY;
+      body.style.height = previous.bodyHeight;
+      body.style.minHeight = previous.bodyMinHeight;
+      restoreViewportScroll();
+      syncIosViewportTopOffset();
+    });
+  });
+}
+
+function queueIosSafariViewportNudges() {
+  if (!isIosSafari() || !sawIosKeyboardInteraction) return;
+  window.setTimeout(nudgeIosSafariViewport, 80);
+  window.setTimeout(nudgeIosSafariViewport, 260);
+  window.setTimeout(nudgeIosSafariViewport, 600);
+}
+
+function beginMobileKeyboardDismissal() {
+  noteIosKeyboardInteraction();
+  freezeViewportForKeyboard(2200);
+  blurActiveElement();
+  restoreViewportScroll();
+  syncStableViewportHeight();
+  syncIosViewportTopOffset();
+  queueIosSafariViewportNudges();
+}
+
 function resetMobileViewport() {
   freezeViewportForKeyboard();
   blurActiveElement();
   const restore = restoreViewportScroll;
   syncStableViewportHeight();
+  syncIosViewportTopOffset();
+  queueIosSafariViewportNudges();
   restore();
   window.requestAnimationFrame(restore);
   window.setTimeout(restore, 80);
@@ -178,7 +280,7 @@ function wait(ms: number) {
 }
 
 async function settleMobileViewportBeforeRouteChange() {
-  blurActiveElement();
+  beginMobileKeyboardDismissal();
   restoreViewportScroll();
   const viewport = window.visualViewport;
   if (!viewport) {
@@ -193,6 +295,7 @@ async function settleMobileViewportBeforeRouteChange() {
   while (Date.now() - startedAt < 700) {
     await wait(50);
     syncStableViewportHeight();
+    syncIosViewportTopOffset();
     const heightDelta = Math.abs(viewport.height - lastHeight);
     const offsetSettled = Math.abs(viewport.offsetTop) < 1;
     stableFrames = heightDelta < 1 && offsetSettled ? stableFrames + 1 : 0;
@@ -748,6 +851,7 @@ function AuthView({
 
   async function submit(kind: "login" | "register" | "admin") {
     if (!username.trim() || !password) return;
+    beginMobileKeyboardDismissal();
     setBusy(kind);
     onHint("");
     try {

@@ -4,6 +4,7 @@
   --app-height: 100dvh;
   --safe-top: env(safe-area-inset-top);
   --safe-bottom: env(safe-area-inset-bottom);
+  --ios-viewport-top-offset: 0px;
   --text: #10202d;
   --muted: rgba(16, 32, 45, 0.62);
   --hairline: rgba(255, 255, 255, 0.64);
@@ -115,7 +116,7 @@ svg {
   display: grid;
   place-items: center;
   padding:
-    calc(24px + var(--safe-top))
+    calc(24px + var(--safe-top) + var(--ios-viewport-top-offset))
     calc(24px + env(safe-area-inset-right))
     calc(24px + var(--safe-bottom))
     calc(24px + env(safe-area-inset-left));
@@ -325,7 +326,7 @@ svg {
   grid-template-rows: auto 1fr auto;
   gap: 14px;
   padding:
-    calc(14px + var(--safe-top))
+    calc(14px + var(--safe-top) + var(--ios-viewport-top-offset))
     calc(14px + env(safe-area-inset-right))
     calc(14px + var(--safe-bottom))
     calc(14px + env(safe-area-inset-left));
@@ -786,7 +787,7 @@ input[type="range"] {
   display: grid;
   place-items: center;
   padding:
-    calc(18px + var(--safe-top))
+    calc(18px + var(--safe-top) + var(--ios-viewport-top-offset))
     calc(18px + env(safe-area-inset-right))
     calc(18px + var(--safe-bottom))
     calc(18px + env(safe-area-inset-left));
@@ -859,7 +860,7 @@ input[type="range"] {
   display: grid;
   place-items: center;
   padding:
-    calc(18px + var(--safe-top))
+    calc(18px + var(--safe-top) + var(--ios-viewport-top-offset))
     calc(18px + env(safe-area-inset-right))
     calc(18px + var(--safe-bottom))
     calc(18px + env(safe-area-inset-left));
@@ -1188,7 +1189,7 @@ input[type="range"] {
   .adminScene,
   .appFrame {
     padding:
-      calc(8px + var(--safe-top))
+      calc(8px + var(--safe-top) + var(--ios-viewport-top-offset))
       calc(8px + env(safe-area-inset-right))
       calc(8px + var(--safe-bottom))
       calc(8px + env(safe-area-inset-left));
