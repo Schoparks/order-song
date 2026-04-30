@@ -72,21 +72,24 @@ function isIosSafari() {
 
 function syncSafariSafeAreaFallback() {
   if (!isIosSafari()) {
-    document.documentElement.style.setProperty("--safari-safe-top", "0px");
+    document.documentElement.style.removeProperty("--safe-top");
+    document.documentElement.style.removeProperty("--safe-bottom");
     return;
   }
 
   const viewport = window.visualViewport;
   const portrait = (viewport?.height || window.innerHeight) >= (viewport?.width || window.innerWidth);
   if (!portrait) {
-    document.documentElement.style.setProperty("--safari-safe-top", "0px");
+    document.documentElement.style.removeProperty("--safe-top");
+    document.documentElement.style.removeProperty("--safe-bottom");
     return;
   }
 
   const longSide = Math.max(window.screen.width, window.screen.height);
-  const notchFallback = longSide >= 852 ? 54 : longSide >= 812 ? 44 : 24;
+  const notchFallback = longSide >= 852 ? 34 : longSide >= 812 ? 30 : 20;
   const visualOffset = Math.max(0, Math.round(viewport?.offsetTop || 0));
-  document.documentElement.style.setProperty("--safari-safe-top", `${Math.max(notchFallback, visualOffset)}px`);
+  document.documentElement.style.setProperty("--safe-top", `${Math.min(Math.max(notchFallback, visualOffset), 40)}px`);
+  document.documentElement.style.setProperty("--safe-bottom", "0px");
 }
 
 function readViewportSize() {
