@@ -64,6 +64,19 @@ function blurActiveElement() {
   if (active instanceof HTMLElement) active.blur();
 }
 
+function resetMobileViewport() {
+  blurActiveElement();
+  const restore = () => {
+    window.scrollTo(0, 0);
+    document.documentElement.scrollTop = 0;
+    document.body.scrollTop = 0;
+  };
+  restore();
+  window.requestAnimationFrame(restore);
+  window.setTimeout(restore, 80);
+  window.setTimeout(restore, 260);
+}
+
 function useDialogViewportLock() {
   useLayoutEffect(() => {
     const { body, documentElement } = document;
@@ -455,6 +468,7 @@ export function App() {
         loading={roomsQuery.isLoading}
         onLogout={logout}
         onEnter={(id) => {
+          resetMobileViewport();
           if (audio.playEnabled) audio.unlockAudio();
           setRoomId(id);
         }}
@@ -616,6 +630,7 @@ function AuthView({
         method: "POST",
         json: { username: username.trim(), password },
       });
+      resetMobileViewport();
       if (kind === "admin") onAdminLogin(out);
       else onLogin(out);
     } catch (error) {
