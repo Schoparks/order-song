@@ -64,6 +64,31 @@ let stableViewportHeight = 0;
 let stableViewportWidth = 0;
 let freezeViewportUntil = 0;
 
+function isIosSafari() {
+  const ua = navigator.userAgent;
+  const isIOS = /iP(hone|od|ad)/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  return isIOS && /Safari/i.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS/i.test(ua);
+}
+
+function syncSafariSafeAreaFallback() {
+  if (!isIosSafari()) {
+    document.documentElement.style.setProperty("--safari-safe-top", "0px");
+    return;
+  }
+
+  const viewport = window.visualViewport;
+  const portrait = (viewport?.height || window.innerHeight) >= (viewport?.width || window.innerWidth);
+  if (!portrait) {
+    document.documentElement.style.setProperty("--safari-safe-top", "0px");
+    return;
+  }
+
+  const longSide = Math.max(window.screen.width, window.screen.height);
+  const notchFallback = longSide >= 852 ? 54 : longSide >= 812 ? 44 : 24;
+  const visualOffset = Math.max(0, Math.round(viewport?.offsetTop || 0));
+  document.documentElement.style.setProperty("--safari-safe-top", `${Math.max(notchFallback, visualOffset)}px`);
+}
+
 function readViewportSize() {
   const viewport = window.visualViewport;
   return {
@@ -83,6 +108,7 @@ function freezeViewportForKeyboard(ms = 1400) {
 }
 
 function syncStableViewportHeight(force = false) {
+  syncSafariSafeAreaFallback();
   const { height, width } = readViewportSize();
   const widthChanged = stableViewportWidth > 0 && Math.abs(width - stableViewportWidth) > 48;
   if (!stableViewportHeight || widthChanged) {
@@ -102,14 +128,20 @@ function syncStableViewportHeight(force = false) {
 
 function useStableViewportHeight() {
   useLayoutEffect(() => {
+    syncSafariSafeAreaFallback();
     syncStableViewportHeight(true);
-    const scheduleSync = () => window.requestAnimationFrame(() => syncStableViewportHeight());
+    const scheduleSync = () => window.requestAnimationFrame(() => {
+      syncSafariSafeAreaFallback();
+      syncStableViewportHeight();
+    });
     const viewport = window.visualViewport;
     window.addEventListener("resize", scheduleSync);
+    window.addEventListener("orientationchange", scheduleSync);
     viewport?.addEventListener("resize", scheduleSync);
     viewport?.addEventListener("scroll", scheduleSync);
     return () => {
       window.removeEventListener("resize", scheduleSync);
+      window.removeEventListener("orientationchange", scheduleSync);
       viewport?.removeEventListener("resize", scheduleSync);
       viewport?.removeEventListener("scroll", scheduleSync);
     };
