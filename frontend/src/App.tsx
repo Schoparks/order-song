@@ -487,8 +487,8 @@ export function App() {
         rooms={roomsQuery.data || []}
         loading={roomsQuery.isLoading}
         onLogout={logout}
-        onEnter={async (id) => {
-          await settleMobileViewportBeforeRouteChange();
+        onEnter={(id) => {
+          resetMobileViewport();
           if (audio.playEnabled) audio.unlockAudio();
           setRoomId(id);
         }}
