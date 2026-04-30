@@ -59,9 +59,69 @@ interface PlaylistMembership {
 type AdminUser = UserPublic & { last_active_room_id?: number | null };
 type AdminRoom = Room & { created_by: string; members: Array<{ id: number; username: string }> };
 
+const KEYBOARD_HEIGHT_DELTA = 120;
+let stableViewportHeight = 0;
+let stableViewportWidth = 0;
+let freezeViewportUntil = 0;
+
+function readViewportSize() {
+  const viewport = window.visualViewport;
+  return {
+    height: Math.round(viewport?.height || window.innerHeight),
+    width: Math.round(viewport?.width || window.innerWidth),
+  };
+}
+
+function isEditableElement(element: Element | null): boolean {
+  if (!(element instanceof HTMLElement)) return false;
+  const tagName = element.tagName.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || element.isContentEditable;
+}
+
+function freezeViewportForKeyboard(ms = 1400) {
+  freezeViewportUntil = Math.max(freezeViewportUntil, Date.now() + ms);
+}
+
+function syncStableViewportHeight(force = false) {
+  const { height, width } = readViewportSize();
+  const widthChanged = stableViewportWidth > 0 && Math.abs(width - stableViewportWidth) > 48;
+  if (!stableViewportHeight || widthChanged) {
+    stableViewportHeight = height;
+    stableViewportWidth = width;
+  }
+
+  const keyboardSized = stableViewportHeight - height > KEYBOARD_HEIGHT_DELTA;
+  const shouldFreeze = keyboardSized && (isEditableElement(document.activeElement) || Date.now() < freezeViewportUntil);
+  if (force || !shouldFreeze) {
+    stableViewportHeight = height;
+    stableViewportWidth = width;
+  }
+
+  document.documentElement.style.setProperty("--app-height", `${stableViewportHeight}px`);
+}
+
+function useStableViewportHeight() {
+  useLayoutEffect(() => {
+    syncStableViewportHeight(true);
+    const scheduleSync = () => window.requestAnimationFrame(() => syncStableViewportHeight());
+    const viewport = window.visualViewport;
+    window.addEventListener("resize", scheduleSync);
+    viewport?.addEventListener("resize", scheduleSync);
+    viewport?.addEventListener("scroll", scheduleSync);
+    return () => {
+      window.removeEventListener("resize", scheduleSync);
+      viewport?.removeEventListener("resize", scheduleSync);
+      viewport?.removeEventListener("scroll", scheduleSync);
+    };
+  }, []);
+}
+
 function blurActiveElement() {
   const active = document.activeElement;
-  if (active instanceof HTMLElement) active.blur();
+  if (active instanceof HTMLElement) {
+    freezeViewportForKeyboard();
+    active.blur();
+  }
 }
 
 function restoreViewportScroll() {
@@ -71,8 +131,10 @@ function restoreViewportScroll() {
 }
 
 function resetMobileViewport() {
+  freezeViewportForKeyboard();
   blurActiveElement();
   const restore = restoreViewportScroll;
+  syncStableViewportHeight();
   restore();
   window.requestAnimationFrame(restore);
   window.setTimeout(restore, 80);
@@ -101,6 +163,7 @@ async function settleMobileViewportBeforeRouteChange() {
   let stableFrames = 0;
   while (Date.now() - startedAt < 700) {
     await wait(50);
+    syncStableViewportHeight();
     const heightDelta = Math.abs(viewport.height - lastHeight);
     const offsetSettled = Math.abs(viewport.offsetTop) < 1;
     stableFrames = heightDelta < 1 && offsetSettled ? stableFrames + 1 : 0;
@@ -276,6 +339,7 @@ function TrackCover({ track }: { track: Track }) {
 }
 
 export function App() {
+  useStableViewportHeight();
   const queryClient = useQueryClient();
   const [token, setToken] = useState(() => localStorage.getItem("token"));
   const [adminToken, setAdminToken] = useState<string | null>(null);

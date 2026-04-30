@@ -1,6 +1,7 @@
 :root {
   color-scheme: light;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --app-height: 100dvh;
   --text: #10202d;
   --muted: rgba(16, 32, 45, 0.62);
   --hairline: rgba(255, 255, 255, 0.64);
@@ -24,7 +25,9 @@ html,
 body,
 #root {
   height: 100%;
+  height: var(--app-height);
   min-height: 100%;
+  min-height: var(--app-height);
   margin: 0;
 }
 
@@ -96,8 +99,10 @@ svg {
 .roomScene,
 .adminScene {
   min-height: 100vh;
+  min-height: var(--app-height);
   height: 100vh;
   height: 100dvh;
+  height: var(--app-height);
   overflow: auto;
   display: grid;
   place-items: center;
@@ -306,6 +311,7 @@ svg {
 .appFrame {
   height: 100vh;
   height: 100dvh;
+  height: var(--app-height);
   min-height: 0;
   display: grid;
   grid-template-rows: auto 1fr auto;
