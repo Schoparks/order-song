@@ -6,7 +6,12 @@ import { spawnSync } from "node:child_process";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const assets = join(dist, "assets");
-const esbuildExe = join(root, "node_modules", "@esbuild", "win32-x64", "esbuild.exe");
+const esbuildExe = join(
+  root,
+  "node_modules",
+  ".bin",
+  process.platform === "win32" ? "esbuild.cmd" : "esbuild",
+);
 
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(assets, { recursive: true });
