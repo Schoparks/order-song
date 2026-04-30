@@ -89,7 +89,24 @@ function wait(ms: number) {
 async function settleMobileViewportBeforeRouteChange() {
   blurActiveElement();
   restoreViewportScroll();
-  await wait(380);
+  const viewport = window.visualViewport;
+  if (!viewport) {
+    await wait(250);
+    resetMobileViewport();
+    return;
+  }
+
+  const startedAt = Date.now();
+  let lastHeight = viewport.height;
+  let stableFrames = 0;
+  while (Date.now() - startedAt < 700) {
+    await wait(50);
+    const heightDelta = Math.abs(viewport.height - lastHeight);
+    const offsetSettled = Math.abs(viewport.offsetTop) < 1;
+    stableFrames = heightDelta < 1 && offsetSettled ? stableFrames + 1 : 0;
+    lastHeight = viewport.height;
+    if (stableFrames >= 2) break;
+  }
   resetMobileViewport();
 }
 

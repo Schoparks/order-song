@@ -28,23 +28,12 @@ body,
   margin: 0;
 }
 
-html,
-body {
-  overflow: hidden;
-}
-
 body {
   min-height: 100vh;
   overflow: hidden;
   background:
     linear-gradient(132deg, rgba(255, 255, 255, 0.78), rgba(221, 238, 236, 0.72) 38%, rgba(235, 241, 229, 0.86) 72%, rgba(232, 237, 245, 0.82)),
     conic-gradient(from 210deg at 78% 12%, rgba(117, 164, 171, 0.24), rgba(255, 255, 255, 0), rgba(160, 178, 112, 0.24), rgba(255, 255, 255, 0));
-}
-
-#root {
-  position: fixed;
-  inset: 0;
-  overflow: hidden;
 }
 
 button,
