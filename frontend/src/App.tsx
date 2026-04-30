@@ -112,6 +112,11 @@ function freezeViewportForKeyboard(ms = 1400) {
 
 function syncStableViewportHeight(force = false) {
   syncSafariSafeAreaFallback();
+  if (isIosSafari()) {
+    document.documentElement.style.removeProperty("--app-height");
+    return;
+  }
+
   const { height, width } = readViewportSize();
   const widthChanged = stableViewportWidth > 0 && Math.abs(width - stableViewportWidth) > 48;
   if (!stableViewportHeight || widthChanged) {

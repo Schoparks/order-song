@@ -19,6 +19,12 @@
   color: var(--text);
 }
 
+@supports (height: 100svh) {
+  :root {
+    --app-height: 100svh;
+  }
+}
+
 * {
   box-sizing: border-box;
 }
