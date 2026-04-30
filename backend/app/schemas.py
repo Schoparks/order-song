@@ -83,3 +83,12 @@ class PlaybackStateOut(BaseModel):
     volume: int
     updated_at: datetime
 
+
+class PlaybackControlIn(BaseModel):
+    position_ms: Optional[int] = None
+    expected_queue_item_id: Optional[int] = None
+
+
+class VolumeControlIn(BaseModel):
+    volume: int = Field(default=50, ge=0, le=100)
+

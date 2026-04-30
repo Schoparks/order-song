@@ -1,70 +1,88 @@
 # order-song
 
-在线点歌/听歌 Web 平台，支持多人房间、实时同步播放、歌单管理、B站/网易云搜索。
+## 项目介绍
 
-## 目录结构
+`order-song` 是一个多人在线点歌与房间同步播放平台。用户可以在浏览器中注册登录、创建或加入房间、搜索歌曲、加入播放队列，并在多台设备之间同步播放状态。
 
-- `backend/` — FastAPI + SQLite + WebSocket 后端
-- `frontend/` — 纯 HTML/JS/CSS 静态前端（由后端一并托管）
+项目由 FastAPI 后端和 React 前端组成：
 
-## 功能概览
+- 后端：`backend/`，提供用户认证、房间、队列、播放同步、歌单、搜索和管理相关 API。
+- 前端：`frontend/`，基于 React + TypeScript + Vite 构建浏览器界面。
+- 数据库：默认使用 SQLite，适合本地部署和轻量使用。
 
-- 用户注册/登录，房间创建/加入/退出
-- 搜索点歌（B站视频、网易云音乐）
-- 播放列表管理（顶歌、删除、打乱、下一首）
-- 多歌单管理（创建、重命名、删除、歌曲在歌单间移动）
-- 导入网易云歌单（自动排除 VIP 专属歌曲）
-- 热门歌曲排行
-- 仅点歌 / 可放歌 模式切换
-- 实时 WebSocket 同步（播放状态、队列变更）
-- 管理后台（用户管理、房间管理、成员管理）
+主要功能包括：
 
-## 本地启动
+- 多用户房间与播放队列管理。
+- Bilibili 和网易云音乐搜索。
+- 网易云歌单导入。
+- WebSocket 播放状态同步。
+- 歌单收藏、热门歌曲和播放历史。
+- 管理端用户与房间查看。
 
-### 1. 安装依赖
+## 环境部署
 
-```bash
-conda create -n order-song python=3.11 -y
-conda activate order-song
-pip install -r backend/requirements.txt
+### 后端环境
+
+建议使用 Python 3.10 或更高版本。
+
+创建并启用虚拟环境：
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 ```
 
-### 2. 启动服务
+安装后端依赖：
 
-**推荐方式**（IPv4 + IPv6 双栈）：
+```powershell
+python -m pip install -r backend/requirements.txt
+```
 
-```bash
+复制配置模板：
+
+```powershell
+Copy-Item config_template.toml config.toml
+```
+
+首次部署时建议检查并修改 `config.toml` 中的配置，尤其是 `auth.jwt_secret`。
+
+### 前端环境
+
+建议使用 Node.js 18 或更高版本。
+
+安装前端依赖并构建：
+
+```powershell
+cd frontend
+npm install
+npm run build
+cd ..
+```
+
+构建完成后会生成 `frontend/dist/`，后端启动后会自动托管该目录中的前端页面。
+
+## 启动方法
+
+在项目根目录启动后端服务：
+
+```powershell
 python backend/run.py
 ```
 
-默认监听端口 `5732`，可通过 `--port=` 自定义：
+默认访问地址：
 
-```bash
+- 应用首页：`http://localhost:5732/`
+- 健康检查：`http://localhost:5732/health`
+
+如需指定端口：
+
+```powershell
 python backend/run.py --port=5732
 ```
 
-### 3. 访问
+开发前端时，也可以单独启动 Vite 开发服务器：
 
-- 前端页面：`http://localhost:5732/`
-- 健康检查：`http://localhost:5732/health`
-- 局域网访问：`http://<本机IP>:5732/`
-
-## 管理后台
-
-首次设置管理员需手动更新数据库：
-
-```bash
-sqlite3 backend/order_song.sqlite3 "UPDATE users SET is_admin = 1 WHERE username = '你的用户名';"
+```powershell
+cd frontend
+npm run dev
 ```
-
-或使用：
-
-```bash
-python -c "import sqlite3; c=sqlite3.connect(r'backend/order_song.sqlite3'); c.execute('UPDATE users SET is_admin=1 WHERE username=?', ('你的用户名',)); c.commit()"
-```
-
-之后在登录页输入账号密码，点击右侧「管理端」按钮即可进入管理后台。管理员可以：
-
-- 查看/删除用户、设置/取消管理员权限
-- 查看/删除房间、移除房间中的特定成员
-

@@ -6,8 +6,8 @@ from sqlmodel import Session, delete, func, select
 from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, TrackSource, User
-from app.schemas import CreateRoomIn, PlaybackStateOut, RoomOut, TrackOut
-from app.routers.queue_playback import _resolve_audio_url
+from app.schemas import CreateRoomIn, RoomOut, TrackOut
+from app.routers.queue_playback import _playback_state_payload, _resolve_audio_url
 from app.ws import hub
 
 
@@ -151,7 +151,7 @@ async def set_room_mode(room_id: int, payload: dict, db: Session = Depends(get_d
         {
             "type": "playback_updated",
             "room_id": room_id,
-            "playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"),
+            **_playback_state_payload(pb),
         },
     )
     return {"ok": True}
@@ -174,7 +174,12 @@ async def room_state(room_id: int, db: Session = Depends(get_db), user: User = D
             if tr:
                 await _resolve_audio_url(db, tr)
                 current_track = TrackOut.model_validate(tr).model_dump(mode="json")
-                if tr.source == TrackSource.bilibili and tr.audio_url:
+                if tr.audio_url:
                     current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
-    return {"playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"), "current_track": current_track, "ordered_by": ordered_by, "queue": []}
+    return {
+        **_playback_state_payload(pb),
+        "current_track": current_track,
+        "ordered_by": ordered_by,
+        "queue": [],
+    }
 

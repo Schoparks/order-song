@@ -9,7 +9,7 @@ from sqlmodel import Session, delete, select
 from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Track, TrackOrderStats, TrackSource, User, UserPlaylist, UserPlaylistItem
-from app.routers.queue_playback import _get_or_create_track
+from app.routers.queue_playback import _ensure_bilibili_metadata, _get_or_create_track
 
 
 router = APIRouter(prefix="/api", tags=["playlists", "trending"])
@@ -96,7 +96,7 @@ def playlist_items(playlist_id: int, db: Session = Depends(get_db), user: User =
 
 
 @router.post("/playlists/{playlist_id}/items")
-def add_playlist_item(playlist_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def add_playlist_item(playlist_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     pl = db.get(UserPlaylist, playlist_id)
     if not pl or pl.user_id != user.id:
         raise HTTPException(status_code=404, detail="playlist not found")
@@ -119,6 +119,8 @@ def add_playlist_item(playlist_id: int, payload: dict, db: Session = Depends(get
         cover_url=payload.get("cover_url"),
         audio_url=payload.get("audio_url"),
     )
+    if tr.source == TrackSource.bilibili and not tr.cover_url:
+        await _ensure_bilibili_metadata(db, tr)
     existing = db.exec(
         select(UserPlaylistItem).where(
             UserPlaylistItem.playlist_id == playlist_id,

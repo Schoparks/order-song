@@ -1,0 +1,304 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api, withBase } from "../lib/api";
+import { clamp, formatTime, parsePlaybackTime } from "../lib/time";
+import { readStoredBoolean, readStoredNumber, writeStoredBoolean } from "../lib/storage";
+import type { PlaybackEnvelope, PlaybackState, Track } from "../types";
+
+const SEEK_TOLERANCE_MS = 3000;
+const NEXT_DEBOUNCE_MS = 2500;
+
+interface SyncAnchor {
+  serverTsMs: number;
+  effectivePositionMs: number;
+}
+
+function roomPositionFromState(pb: PlaybackState | null, anchor: SyncAnchor | null): number {
+  if (!pb) return 0;
+  if (anchor) {
+    return pb.is_playing
+      ? Math.max(0, anchor.effectivePositionMs + Date.now() - anchor.serverTsMs)
+      : Math.max(0, anchor.effectivePositionMs);
+  }
+  let position = Number(pb.position_ms || 0);
+  if (pb.is_playing && pb.updated_at) {
+    const updatedAt = parsePlaybackTime(pb.updated_at);
+    if (Number.isFinite(updatedAt)) position += Math.max(0, Date.now() - updatedAt);
+  }
+  return Math.max(0, position);
+}
+
+function playableAudioUrl(track: Track): string | null {
+  if (track.id && (track.source === "netease" || track.source === "bilibili" || /^https?:\/\//i.test(track.audio_url || ""))) {
+    return `/api/tracks/${track.id}/stream`;
+  }
+  return track.audio_url || null;
+}
+
+export function useAudioController(roomId: number | null, token: string | null) {
+  const audio = useMemo(() => {
+    const element = new Audio();
+    element.preload = "none";
+    return element;
+  }, []);
+  const [playEnabled, setPlayEnabledState] = useState(() => readStoredBoolean("playEnabled"));
+  const [normalizerEnabled, setNormalizerEnabledState] = useState(() => readStoredBoolean("volumeNormalizer"));
+  const [volume, setVolumeState] = useState(() => readStoredNumber("volume", 50));
+  const [previousVolume, setPreviousVolume] = useState(() => readStoredNumber("previousVolume", 50, 1, 100));
+  const [playback, setPlayback] = useState<PlaybackState | null>(null);
+  const [track, setTrack] = useState<Track | null>(null);
+  const [orderedBy, setOrderedBy] = useState<{ id: number; username: string } | null>(null);
+  const [positionMs, setPositionMs] = useState(0);
+  const [durationMs, setDurationMs] = useState(0);
+  const [isSeeking, setIsSeeking] = useState(false);
+
+  const anchorRef = useRef<SyncAnchor | null>(null);
+  const lastNextAtRef = useRef(0);
+  const currentQueueItemRef = useRef<number | null>(null);
+  const audioGraphRef = useRef<{
+    ctx: AudioContext;
+    source: MediaElementAudioSourceNode;
+    gain: GainNode;
+    compressor: DynamicsCompressorNode;
+  } | null>(null);
+
+  const getDurationMs = useCallback(() => {
+    if (audio.duration && Number.isFinite(audio.duration) && audio.duration > 0) {
+      return audio.duration * 1000;
+    }
+    return Number(track?.duration_ms || 0);
+  }, [audio, track]);
+
+  const getRoomPositionMs = useCallback(() => {
+    const duration = getDurationMs();
+    const raw = roomPositionFromState(playback, anchorRef.current);
+    return duration > 0 ? clamp(raw, 0, duration) : raw;
+  }, [getDurationMs, playback]);
+
+  const ensureAudioGraph = useCallback(async () => {
+    if (audioGraphRef.current) {
+      if (audioGraphRef.current.ctx.state === "suspended") await audioGraphRef.current.ctx.resume().catch(() => {});
+      return audioGraphRef.current;
+    }
+    const AudioCtx = window.AudioContext || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioCtx) return null;
+    const ctx = new AudioCtx();
+    const source = ctx.createMediaElementSource(audio);
+    const gain = ctx.createGain();
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = -26;
+    compressor.knee.value = 24;
+    compressor.ratio.value = 7;
+    compressor.attack.value = 0.004;
+    compressor.release.value = 0.22;
+    source.connect(gain);
+    gain.connect(ctx.destination);
+    audioGraphRef.current = { ctx, source, gain, compressor };
+    return audioGraphRef.current;
+  }, [audio]);
+
+  const applyAudioGraph = useCallback(async (enabled: boolean) => {
+    const graph = await ensureAudioGraph();
+    if (!graph) return;
+    for (const node of [graph.source, graph.gain, graph.compressor]) {
+      try {
+        node.disconnect();
+      } catch {
+        // Disconnect is not idempotent for all AudioNode implementations.
+      }
+    }
+    if (enabled) {
+      graph.source.connect(graph.compressor);
+      graph.compressor.connect(graph.gain);
+    } else {
+      graph.source.connect(graph.gain);
+    }
+    graph.gain.connect(graph.ctx.destination);
+  }, [ensureAudioGraph]);
+
+  const setPlayEnabled = useCallback((value: boolean) => {
+    setPlayEnabledState(value);
+    writeStoredBoolean("playEnabled", value);
+    if (!value) audio.pause();
+  }, [audio]);
+
+  const setNormalizerEnabled = useCallback((value: boolean) => {
+    setNormalizerEnabledState(value);
+    writeStoredBoolean("volumeNormalizer", value);
+    applyAudioGraph(value).catch(() => {});
+  }, [applyAudioGraph]);
+
+  const setVolume = useCallback((value: number) => {
+    const safe = clamp(value, 0, 100);
+    setVolumeState(safe);
+    localStorage.setItem("volume", String(safe));
+    if (safe > 0) {
+      setPreviousVolume(safe);
+      localStorage.setItem("previousVolume", String(safe));
+    }
+    audio.volume = safe / 100;
+  }, [audio]);
+
+  const toggleMute = useCallback(() => {
+    setVolume(volume > 0 ? 0 : previousVolume || 50);
+  }, [previousVolume, setVolume, volume]);
+
+  const syncAudioToRoom = useCallback((force = false) => {
+    const audioUrl = track ? playableAudioUrl(track) : null;
+    if (!playback || !audioUrl) {
+      audio.pause();
+      if (!audioUrl) audio.removeAttribute("src");
+      currentQueueItemRef.current = null;
+      return;
+    }
+    if (currentQueueItemRef.current !== playback.current_queue_item_id) {
+      currentQueueItemRef.current = playback.current_queue_item_id;
+      force = true;
+    }
+    const nextSrc = withBase(audioUrl);
+    if (audio.src !== new URL(nextSrc, location.href).href) {
+      audio.src = nextSrc;
+      force = true;
+    }
+
+    const duration = getDurationMs();
+    const targetMs = roomPositionFromState(playback, anchorRef.current);
+    if (playEnabled && Number.isFinite(targetMs) && targetMs >= 0) {
+      const boundedMs = duration > 1000 ? clamp(targetMs, 0, duration - 500) : targetMs;
+      const diffMs = Math.abs((audio.currentTime || 0) * 1000 - boundedMs);
+      if (force || diffMs > SEEK_TOLERANCE_MS) {
+        try {
+          audio.currentTime = boundedMs / 1000;
+        } catch {
+          // Some streams reject early seeks until metadata is loaded.
+        }
+      }
+    }
+
+    if (!playEnabled) {
+      audio.pause();
+      return;
+    }
+    if (playback.is_playing) {
+      if (!normalizerEnabled && !audioGraphRef.current) {
+        audio.play().catch(() => {});
+        return;
+      }
+      ensureAudioGraph().then(() => applyAudioGraph(normalizerEnabled)).finally(() => {
+        audio.play().catch(() => {});
+      });
+    } else {
+      audio.pause();
+    }
+  }, [applyAudioGraph, audio, ensureAudioGraph, getDurationMs, normalizerEnabled, playEnabled, playback, track]);
+
+  const applyPlaybackEnvelope = useCallback((envelope: PlaybackEnvelope) => {
+    setPlayback(envelope.playback_state);
+    setTrack((previous) => envelope.current_track || (envelope.playback_state.current_queue_item_id ? previous : null));
+    setOrderedBy((previous) => envelope.ordered_by ?? (envelope.playback_state.current_queue_item_id ? previous : null));
+    anchorRef.current = {
+      serverTsMs: envelope.server_ts_ms || Date.now(),
+      effectivePositionMs:
+        envelope.effective_position_ms ??
+        roomPositionFromState(envelope.playback_state, null),
+    };
+  }, []);
+
+  const next = useCallback(async () => {
+    if (!roomId || !token) return;
+    const now = Date.now();
+    if (now - lastNextAtRef.current < NEXT_DEBOUNCE_MS) return;
+    lastNextAtRef.current = now;
+    await api(`/api/rooms/${roomId}/controls/next`, {
+      method: "POST",
+      token,
+      json: { expected_queue_item_id: playback?.current_queue_item_id ?? null },
+    }).catch(() => {});
+  }, [playback?.current_queue_item_id, roomId, token]);
+
+  const playPause = useCallback(async () => {
+    if (!roomId || !token) return;
+    if (playback?.current_queue_item_id && playback.is_playing) {
+      const pos = Math.round(playEnabled && !audio.paused ? audio.currentTime * 1000 : getRoomPositionMs());
+      await api(`/api/rooms/${roomId}/controls/pause`, {
+        method: "POST",
+        token,
+        json: { position_ms: pos, expected_queue_item_id: playback.current_queue_item_id },
+      });
+    } else {
+      await api(`/api/rooms/${roomId}/controls/play`, { method: "POST", token });
+    }
+  }, [audio, getRoomPositionMs, playEnabled, playback, roomId, token]);
+
+  const commitSeek = useCallback(async (ratio: number) => {
+    if (!roomId || !token) return;
+    const duration = getDurationMs();
+    const desired = Math.floor(clamp(ratio, 0, 1) * duration);
+    setIsSeeking(false);
+    await api(`/api/rooms/${roomId}/controls/position`, {
+      method: "PATCH",
+      token,
+      json: { position_ms: desired, expected_queue_item_id: playback?.current_queue_item_id ?? null },
+    }).catch(() => {});
+  }, [getDurationMs, playback?.current_queue_item_id, roomId, token]);
+
+  useEffect(() => {
+    audio.volume = volume / 100;
+  }, [audio, volume]);
+
+  useEffect(() => {
+    syncAudioToRoom(false);
+  }, [syncAudioToRoom]);
+
+  useEffect(() => {
+    const onEnded = () => next();
+    const onMetadata = () => setDurationMs(getDurationMs());
+    const onTime = () => {
+      if (!isSeeking) {
+        setPositionMs(playEnabled && !audio.paused ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
+      }
+      setDurationMs(getDurationMs());
+    };
+    audio.addEventListener("ended", onEnded);
+    audio.addEventListener("loadedmetadata", onMetadata);
+    audio.addEventListener("timeupdate", onTime);
+    return () => {
+      audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("loadedmetadata", onMetadata);
+      audio.removeEventListener("timeupdate", onTime);
+    };
+  }, [audio, getDurationMs, getRoomPositionMs, isSeeking, next, playEnabled]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (!isSeeking) setPositionMs(playEnabled && !audio.paused ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
+      setDurationMs(getDurationMs());
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [audio, getDurationMs, getRoomPositionMs, isSeeking, playEnabled]);
+
+  return {
+    audio,
+    playback,
+    track,
+    orderedBy,
+    playEnabled,
+    normalizerEnabled,
+    volume,
+    positionMs,
+    durationMs,
+    progressRatio: durationMs > 0 ? clamp(positionMs / durationMs, 0, 1) : 0,
+    currentTimeLabel: formatTime(positionMs),
+    durationLabel: formatTime(durationMs),
+    isSeeking,
+    setIsSeeking,
+    setPlayEnabled,
+    setNormalizerEnabled,
+    setVolume,
+    toggleMute,
+    applyPlaybackEnvelope,
+    playPause,
+    next,
+    commitSeek,
+    setPositionMs,
+  };
+}

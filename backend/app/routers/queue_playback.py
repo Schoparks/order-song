@@ -1,12 +1,13 @@
 import asyncio
 import random
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from starlette.responses import StreamingResponse
+from starlette.responses import Response, StreamingResponse
 from sqlmodel import Session, func, select
 
 from app.core.config import settings
@@ -23,7 +24,7 @@ from app.models import (
     UserPlaylist,
     UserPlaylistItem,
 )
-from app.schemas import PlaybackStateOut, TrackOut
+from app.schemas import PlaybackControlIn, PlaybackStateOut, TrackOut, VolumeControlIn
 from app.ws import hub
 
 
@@ -31,6 +32,61 @@ router = APIRouter(prefix="/api", tags=["queue"])
 
 
 _UNSET: Any = object()
+_NEXT_LOCKS: dict[int, asyncio.Lock] = {}
+_COVER_PROXY_HOST_SUFFIXES = (
+    "bilibili.com",
+    "biliimg.com",
+    "hdslb.com",
+)
+
+
+def _next_lock(room_id: int) -> asyncio.Lock:
+    lock = _NEXT_LOCKS.get(room_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _NEXT_LOCKS[room_id] = lock
+    return lock
+
+
+def _effective_position_ms(pb: RoomPlaybackState, *, now: datetime | None = None) -> int:
+    current = now or datetime.utcnow()
+    position = max(0, int(pb.position_ms or 0))
+    if pb.is_playing and pb.current_queue_item_id and pb.updated_at:
+        elapsed_ms = max(0, int((current - pb.updated_at).total_seconds() * 1000))
+        position += elapsed_ms
+    return position
+
+
+def _utc_timestamp_ms(value: datetime) -> int:
+    current = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return int(current.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def _playback_state_payload(pb: RoomPlaybackState, *, now: datetime | None = None) -> dict[str, Any]:
+    current = now or datetime.utcnow()
+    return {
+        "playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"),
+        "server_time": current.isoformat() + "Z",
+        "server_ts_ms": _utc_timestamp_ms(current),
+        "effective_position_ms": _effective_position_ms(pb, now=current),
+    }
+
+
+def _is_stale_control(pb: RoomPlaybackState, payload: PlaybackControlIn | None) -> bool:
+    return (
+        payload is not None
+        and payload.expected_queue_item_id is not None
+        and pb.current_queue_item_id != payload.expected_queue_item_id
+    )
+
+
+def _stale_control_response(pb: RoomPlaybackState) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "ignored": True,
+        "reason": "stale_current_queue_item",
+        **_playback_state_payload(pb),
+    }
 
 
 def _get_room(db: Session, room_id: int) -> Room:
@@ -104,6 +160,69 @@ def _record_track_order(db: Session, track_id: int, ordered_at: datetime) -> Non
     db.add(stats)
 
 
+def _normalize_bilibili_pic(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    pic = value.strip()
+    if pic.startswith("//"):
+        return f"https:{pic}"
+    return pic
+
+
+async def _fetch_bilibili_video_metadata(bv: str) -> dict[str, Any] | None:
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.upstream.bilibili_audio_timeout_s,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://www.bilibili.com/",
+            },
+        ) as client:
+            r = await client.get(
+                "https://api.bilibili.com/x/web-interface/view",
+                params={"bvid": bv},
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data.get("code") != 0:
+                return None
+            return data.get("data") or None
+    except Exception:
+        return None
+
+
+async def _ensure_bilibili_metadata(db: Session, track: Track) -> dict[str, Any] | None:
+    if track.source != TrackSource.bilibili:
+        return None
+    video = await _fetch_bilibili_video_metadata(track.source_track_id)
+    if not video:
+        return None
+
+    changed = False
+    cover_url = _normalize_bilibili_pic(video.get("pic"))
+    owner = video.get("owner") or {}
+    duration = video.get("duration")
+
+    if cover_url and not track.cover_url:
+        track.cover_url = cover_url
+        changed = True
+    if isinstance(owner, dict) and owner.get("name") and not track.artist:
+        track.artist = owner["name"]
+        changed = True
+    if duration is not None and not track.duration_ms:
+        track.duration_ms = int(duration) * 1000
+        changed = True
+    if video.get("title") and (not track.title or track.title == track.source_track_id):
+        track.title = video["title"]
+        changed = True
+
+    if changed:
+        db.add(track)
+        db.commit()
+        db.refresh(track)
+    return video
+
+
 def _enqueue_track_payload(
     db: Session,
     room_id: int,
@@ -154,7 +273,17 @@ def _enqueue_track_payload(
     return qi, True
 
 
+async def _ensure_queue_item_metadata(db: Session, queue_item: RoomQueueItem) -> None:
+    track = db.get(Track, queue_item.track_id)
+    if track and track.source == TrackSource.bilibili and not track.cover_url:
+        await _ensure_bilibili_metadata(db, track)
+
+
 async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) -> Optional[str]:
+    video: dict[str, Any] | None = None
+    if track.source == TrackSource.bilibili and not track.cover_url:
+        video = await _ensure_bilibili_metadata(db, track)
+
     if track.audio_url and not force:
         return track.audio_url
 
@@ -167,7 +296,9 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         return track.audio_url
 
     if track.source == TrackSource.bilibili:
-        audio_url = await _resolve_bilibili_audio(track.source_track_id)
+        if video is None:
+            video = await _ensure_bilibili_metadata(db, track)
+        audio_url = await _resolve_bilibili_audio(track.source_track_id, video_data=video)
 
         if not audio_url:
             page_url = f"https://www.bilibili.com/video/{track.source_track_id}"
@@ -200,22 +331,26 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     return None
 
 
-async def _resolve_bilibili_audio(bv: str) -> Optional[str]:
+async def _resolve_bilibili_audio(bv: str, *, video_data: dict[str, Any] | None = None) -> Optional[str]:
     """Resolve audio stream URL via bilibili's playurl API (no yt-dlp needed)."""
     try:
         async with httpx.AsyncClient(timeout=settings.upstream.bilibili_audio_timeout_s, headers={
             "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.bilibili.com/",
         }) as client:
-            r = await client.get(
-                "https://api.bilibili.com/x/web-interface/view",
-                params={"bvid": bv},
-            )
-            r.raise_for_status()
-            data = r.json()
-            if data.get("code") != 0:
+            vid = video_data
+            if not vid:
+                r = await client.get(
+                    "https://api.bilibili.com/x/web-interface/view",
+                    params={"bvid": bv},
+                )
+                r.raise_for_status()
+                data = r.json()
+                if data.get("code") != 0:
+                    return None
+                vid = data["data"]
+            if not vid:
                 return None
-            vid = data["data"]
             cid = vid.get("cid")
             if not cid and vid.get("pages"):
                 cid = vid["pages"][0].get("cid")
@@ -245,6 +380,33 @@ async def _resolve_bilibili_audio(bv: str) -> Optional[str]:
         return None
 
 
+@router.get("/media/cover")
+async def proxy_cover(url: str):
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"} or not any(host == suffix or host.endswith(f".{suffix}") for suffix in _COVER_PROXY_HOST_SUFFIXES):
+        raise HTTPException(status_code=400, detail="unsupported cover host")
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.bilibili.com/",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=settings.upstream.bilibili_audio_timeout_s, follow_redirects=True, headers=headers) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+    except Exception:
+        raise HTTPException(status_code=502, detail="cover fetch failed")
+
+    content_type = r.headers.get("content-type") or "image/jpeg"
+    return Response(
+        content=r.content,
+        media_type=content_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
 @router.get("/tracks/{track_id}/stream")
 async def stream_track(track_id: int, request: Request, db: Session = Depends(get_db)):
     tr = db.get(Track, track_id)
@@ -265,6 +427,8 @@ async def stream_track(track_id: int, request: Request, db: Session = Depends(ge
             headers["Origin"] = "https://www.bilibili.com"
             headers["Accept"] = "*/*"
             headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.6"
+        if tr.source == TrackSource.netease:
+            headers["Referer"] = "https://music.163.com/"
 
         if rng:
             headers["Range"] = rng
@@ -369,6 +533,7 @@ async def add_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db
     _get_room(db, room_id)
 
     qi, added = _enqueue_track_payload(db, room_id, payload, user.id)
+    await _ensure_queue_item_metadata(db, qi)
     if not added:
         return {"ok": True, "queue_item_id": qi.id, "already_queued": True}
 
@@ -413,6 +578,7 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
             user.id,
             created_at=now + timedelta(milliseconds=added_count),
         )
+        await _ensure_queue_item_metadata(db, qi)
         if added:
             added_count += 1
             queue_item_ids.append(qi.id)
@@ -478,6 +644,7 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
             user.id,
             created_at=now + timedelta(milliseconds=added_count),
         )
+        await _ensure_queue_item_metadata(db, qi)
         if added:
             added_count += 1
             queue_item_ids.append(qi.id)
@@ -588,14 +755,14 @@ async def _set_playback(
             if tr:
                 await _resolve_audio_url(db, tr)
                 current_track = TrackOut.model_validate(tr).model_dump(mode="json")
-                if tr.source == TrackSource.bilibili and tr.audio_url:
+                if tr.audio_url:
                     current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
     await hub.broadcast(
         room_id,
         {
             "type": "playback_updated",
             "room_id": room_id,
-            "playback_state": PlaybackStateOut.model_validate(pb).model_dump(mode="json"),
+            **_playback_state_payload(pb),
             "current_track": current_track,
             "ordered_by": ordered_by,
         },
@@ -632,21 +799,18 @@ async def play(room_id: int, db: Session = Depends(get_db), user: User = Depends
 
 
 @router.post("/rooms/{room_id}/controls/pause")
-async def pause(room_id: int, request: Request, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pos = None
-    try:
-        body = await request.json()
-        if isinstance(body, dict):
-            pos = body.get("position_ms")
-            if pos is not None:
-                pos = max(0, int(pos))
-    except Exception:
-        pass
+async def pause(room_id: int, payload: PlaybackControlIn | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    pb = db.get(RoomPlaybackState, room_id)
+    if not pb:
+        raise HTTPException(status_code=404, detail="room not found")
+    if _is_stale_control(pb, payload):
+        return _stale_control_response(pb)
+    pos = payload.position_ms if payload else None
+    if pos is not None:
+        pos = max(0, int(pos))
     if pos is None:
-        pb = db.get(RoomPlaybackState, room_id)
         if pb and pb.is_playing and pb.current_queue_item_id:
-            elapsed_ms = max(0, int((datetime.utcnow() - pb.updated_at).total_seconds() * 1000))
-            pos = pb.position_ms + elapsed_ms
+            pos = _effective_position_ms(pb)
     if pos is not None:
         await _set_playback(db, room_id, is_playing=False, position_ms=pos)
     else:
@@ -655,18 +819,23 @@ async def pause(room_id: int, request: Request, db: Session = Depends(get_db), u
 
 
 @router.post("/rooms/{room_id}/controls/next")
-async def next_track(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pb = db.get(RoomPlaybackState, room_id)
-    if not pb:
-        raise HTTPException(status_code=404, detail="room not found")
-    if pb.current_queue_item_id:
-        cur = db.get(RoomQueueItem, pb.current_queue_item_id)
-        if cur:
-            cur.status = QueueStatus.played
-            db.add(cur)
-            db.commit()
-    next_id = _pick_next_queue_item_id(db, room_id)
-    await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=next_id is not None, position_ms=0)
+async def next_track(room_id: int, payload: PlaybackControlIn | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    async with _next_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb:
+            raise HTTPException(status_code=404, detail="room not found")
+        if (
+            _is_stale_control(pb, payload)
+        ):
+            return _stale_control_response(pb)
+        if pb.current_queue_item_id:
+            cur = db.get(RoomQueueItem, pb.current_queue_item_id)
+            if cur:
+                cur.status = QueueStatus.played
+                db.add(cur)
+                db.commit()
+        next_id = _pick_next_queue_item_id(db, room_id)
+        await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=next_id is not None, position_ms=0)
     return {"ok": True}
 
 
@@ -699,18 +868,23 @@ async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User 
 
 
 @router.patch("/rooms/{room_id}/controls/position")
-async def set_position(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    await _set_playback(db, room_id, position_ms=payload.get("position_ms", 0))
+async def set_position(room_id: int, payload: PlaybackControlIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    pb = db.get(RoomPlaybackState, room_id)
+    if not pb:
+        raise HTTPException(status_code=404, detail="room not found")
+    if _is_stale_control(pb, payload):
+        return _stale_control_response(pb)
+    await _set_playback(db, room_id, position_ms=payload.position_ms or 0)
     return {"ok": True}
 
 
 @router.patch("/rooms/{room_id}/controls/volume")
-async def set_volume(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def set_volume(room_id: int, payload: VolumeControlIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     pb = db.get(RoomPlaybackState, room_id)
     if not pb:
         raise HTTPException(status_code=404, detail="room not found")
     if pb.mode.value != "play_enabled":
         raise HTTPException(status_code=403, detail="volume only allowed in play_enabled mode")
-    await _set_playback(db, room_id, volume=payload.get("volume", settings.rooms.default_volume))
+    await _set_playback(db, room_id, volume=payload.volume)
     return {"ok": True}
 
