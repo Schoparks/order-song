@@ -1,46 +1,34 @@
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { build } from "esbuild";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const assets = join(dist, "assets");
-const esbuildExe = join(
-  root,
-  "node_modules",
-  ".bin",
-  process.platform === "win32" ? "esbuild.cmd" : "esbuild",
-);
 
 rmSync(dist, { recursive: true, force: true });
 mkdirSync(assets, { recursive: true });
 
-const result = spawnSync(
-  esbuildExe,
-  [
-    "src/main.tsx",
-    "--bundle",
-    "--format=esm",
-    "--target=es2020",
-    "--jsx=automatic",
-    "--loader:.ts=ts",
-    "--loader:.tsx=tsx",
-    "--loader:.css=css",
-    "--define:process.env.NODE_ENV=\"production\"",
-    "--outfile=dist/assets/main.js",
-    "--minify",
-  ],
-  {
-    cwd: root,
-    stdio: "inherit",
-    windowsHide: true,
+await build({
+  entryPoints: ["src/main.tsx"],
+  bundle: true,
+  format: "esm",
+  target: "es2020",
+  jsx: "automatic",
+  loader: {
+    ".ts": "ts",
+    ".tsx": "tsx",
+    ".css": "css",
   },
-);
-
-if (result.status !== 0) {
-  process.exit(result.status || 1);
-}
+  define: {
+    "process.env.NODE_ENV": '"production"',
+  },
+  outfile: "dist/assets/main.js",
+  minify: true,
+  logLevel: "info",
+  absWorkingDir: root,
+});
 
 writeFileSync(
   join(dist, "index.html"),
