@@ -50,6 +50,7 @@ pnpm-debug.log*
 # OS files
 .DS_Store
 Thumbs.db
+.vscode/
 
 # Local notes
 需求描述.md
