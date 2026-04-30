@@ -43,7 +43,7 @@ writeFileSync(
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <meta name="theme-color" content="#eef3f8" />
     <title>order-song</title>
     <script type="module" crossorigin src="./assets/main.js"></script>

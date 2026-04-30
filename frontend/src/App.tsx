@@ -70,25 +70,14 @@ function isIosSafari() {
   return isIOS && /Safari/i.test(ua) && !/CriOS|FxiOS|EdgiOS|OPiOS/i.test(ua);
 }
 
-function syncSafariSafeAreaFallback() {
+function syncSafeAreaOverrides() {
   if (!isIosSafari()) {
     document.documentElement.style.removeProperty("--safe-top");
     document.documentElement.style.removeProperty("--safe-bottom");
     return;
   }
 
-  const viewport = window.visualViewport;
-  const portrait = (viewport?.height || window.innerHeight) >= (viewport?.width || window.innerWidth);
-  if (!portrait) {
-    document.documentElement.style.removeProperty("--safe-top");
-    document.documentElement.style.removeProperty("--safe-bottom");
-    return;
-  }
-
-  const longSide = Math.max(window.screen.width, window.screen.height);
-  const notchFallback = longSide >= 852 ? 34 : longSide >= 812 ? 30 : 20;
-  const visualOffset = Math.max(0, Math.round(viewport?.offsetTop || 0));
-  document.documentElement.style.setProperty("--safe-top", `${Math.min(Math.max(notchFallback, visualOffset), 40)}px`);
+  document.documentElement.style.setProperty("--safe-top", "0px");
   document.documentElement.style.setProperty("--safe-bottom", "0px");
 }
 
@@ -111,7 +100,7 @@ function freezeViewportForKeyboard(ms = 1400) {
 }
 
 function syncStableViewportHeight(force = false) {
-  syncSafariSafeAreaFallback();
+  syncSafeAreaOverrides();
   if (isIosSafari()) {
     document.documentElement.style.removeProperty("--app-height");
     return;
@@ -136,10 +125,10 @@ function syncStableViewportHeight(force = false) {
 
 function useStableViewportHeight() {
   useLayoutEffect(() => {
-    syncSafariSafeAreaFallback();
+    syncSafeAreaOverrides();
     syncStableViewportHeight(true);
     const scheduleSync = () => window.requestAnimationFrame(() => {
-      syncSafariSafeAreaFallback();
+      syncSafeAreaOverrides();
       syncStableViewportHeight();
     });
     const viewport = window.visualViewport;
