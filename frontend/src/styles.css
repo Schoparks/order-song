@@ -96,7 +96,11 @@ svg {
   overflow: auto;
   display: grid;
   place-items: center;
-  padding: 24px;
+  padding:
+    calc(24px + env(safe-area-inset-top))
+    calc(24px + env(safe-area-inset-right))
+    calc(24px + env(safe-area-inset-bottom))
+    calc(24px + env(safe-area-inset-left));
 }
 
 .authCard {
@@ -297,7 +301,11 @@ svg {
   display: grid;
   grid-template-rows: auto 1fr auto;
   gap: 14px;
-  padding: 14px;
+  padding:
+    calc(14px + env(safe-area-inset-top))
+    calc(14px + env(safe-area-inset-right))
+    calc(14px + env(safe-area-inset-bottom))
+    calc(14px + env(safe-area-inset-left));
 }
 
 .topBar {
@@ -746,7 +754,11 @@ input[type="range"] {
   z-index: 20;
   display: grid;
   place-items: center;
-  padding: 18px;
+  padding:
+    calc(18px + env(safe-area-inset-top))
+    calc(18px + env(safe-area-inset-right))
+    calc(18px + env(safe-area-inset-bottom))
+    calc(18px + env(safe-area-inset-left));
   background: rgba(224, 233, 235, 0.42);
   backdrop-filter: blur(12px);
 }
@@ -815,7 +827,11 @@ input[type="range"] {
   z-index: 80;
   display: grid;
   place-items: center;
-  padding: 18px;
+  padding:
+    calc(18px + env(safe-area-inset-top))
+    calc(18px + env(safe-area-inset-right))
+    calc(18px + env(safe-area-inset-bottom))
+    calc(18px + env(safe-area-inset-left));
   background: rgba(224, 233, 235, 0.38);
   backdrop-filter: blur(10px);
 }
@@ -1140,7 +1156,11 @@ input[type="range"] {
   .roomScene,
   .adminScene,
   .appFrame {
-    padding: 8px;
+    padding:
+      calc(8px + env(safe-area-inset-top))
+      calc(8px + env(safe-area-inset-right))
+      calc(8px + env(safe-area-inset-bottom))
+      calc(8px + env(safe-area-inset-left));
   }
 
   .appFrame {

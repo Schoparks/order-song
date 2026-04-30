@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -59,6 +59,50 @@ interface PlaylistMembership {
 type AdminUser = UserPublic & { last_active_room_id?: number | null };
 type AdminRoom = Room & { created_by: string; members: Array<{ id: number; username: string }> };
 
+function blurActiveElement() {
+  const active = document.activeElement;
+  if (active instanceof HTMLElement) active.blur();
+}
+
+function useDialogViewportLock() {
+  useLayoutEffect(() => {
+    const { body, documentElement } = document;
+    const scrollX = window.scrollX;
+    const scrollY = window.scrollY;
+    const previous = {
+      bodyPosition: body.style.position,
+      bodyTop: body.style.top,
+      bodyLeft: body.style.left,
+      bodyRight: body.style.right,
+      bodyWidth: body.style.width,
+      bodyOverflow: body.style.overflow,
+      htmlOverflow: documentElement.style.overflow,
+    };
+
+    body.style.position = "fixed";
+    body.style.top = `-${scrollY}px`;
+    body.style.left = `-${scrollX}px`;
+    body.style.right = "0";
+    body.style.width = "100%";
+    body.style.overflow = "hidden";
+    documentElement.style.overflow = "hidden";
+
+    return () => {
+      body.style.position = previous.bodyPosition;
+      body.style.top = previous.bodyTop;
+      body.style.left = previous.bodyLeft;
+      body.style.right = previous.bodyRight;
+      body.style.width = previous.bodyWidth;
+      body.style.overflow = previous.bodyOverflow;
+      documentElement.style.overflow = previous.htmlOverflow;
+
+      const restoreScroll = () => window.scrollTo(scrollX, scrollY);
+      window.requestAnimationFrame(restoreScroll);
+      window.setTimeout(restoreScroll, 80);
+    };
+  }, []);
+}
+
 function isPlaybackMessage(msg: WsMessage): msg is Extract<WsMessage, { type: "playback_updated" }> {
   return msg.type === "playback_updated" && !!(msg as { playback_state?: unknown }).playback_state;
 }
@@ -114,12 +158,18 @@ function CardDialog({
   children: ReactNode;
   onClose: () => void;
 }) {
+  useDialogViewportLock();
+  const closeDialog = useCallback(() => {
+    blurActiveElement();
+    onClose();
+  }, [onClose]);
+
   return createPortal(
-    <div className="dialogOverlay" onMouseDown={onClose}>
+    <div className="dialogOverlay" onMouseDown={closeDialog}>
       <section className="dialogCard glassPanel" onMouseDown={(event) => event.stopPropagation()}>
         <div className="sheetHeader">
           <h3>{title}</h3>
-          <button className="iconButton" onClick={onClose}><X /></button>
+          <button className="iconButton" onClick={closeDialog}><X /></button>
         </div>
         {children}
       </section>
@@ -1200,7 +1250,7 @@ function PlaylistsView({
                 renamePlaylist();
               }}
             >
-              <input value={renameName} onChange={(event) => setRenameName(event.target.value)} placeholder="歌单名称" autoFocus />
+              <input value={renameName} onChange={(event) => setRenameName(event.target.value)} placeholder="歌单名称" />
               <div className="dialogActions">
                 <button type="button" className="glassButton" onClick={() => setRenameOpen(false)}>取消</button>
                 <button className="primaryButton" disabled={!renameName.trim()}><Check />保存</button>
@@ -1271,7 +1321,7 @@ function PlaylistsView({
               createPlaylist();
             }}
           >
-            <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="歌单名称" autoFocus />
+            <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="歌单名称" />
             <div className="dialogActions">
               <button type="button" className="glassButton" onClick={() => setCreateOpen(false)}>取消</button>
               <button className="primaryButton" disabled={!newName.trim()}><Plus />创建</button>
@@ -1288,7 +1338,7 @@ function PlaylistsView({
               importNeteasePlaylist();
             }}
           >
-            <input value={neteaseUrl} onChange={(event) => setNeteaseUrl(event.target.value)} placeholder="网易云歌单链接或 ID" autoFocus />
+            <input value={neteaseUrl} onChange={(event) => setNeteaseUrl(event.target.value)} placeholder="网易云歌单链接或 ID" />
             <input value={neteaseName} onChange={(event) => setNeteaseName(event.target.value)} placeholder="导入后的歌单名，可留空" />
             <div className="dialogActions">
               <button type="button" className="glassButton" onClick={() => setImportOpen(false)} disabled={importing}>取消</button>
