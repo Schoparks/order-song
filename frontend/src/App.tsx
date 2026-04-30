@@ -454,7 +454,10 @@ export function App() {
         rooms={roomsQuery.data || []}
         loading={roomsQuery.isLoading}
         onLogout={logout}
-        onEnter={(id) => setRoomId(id)}
+        onEnter={(id) => {
+          if (audio.playEnabled) audio.unlockAudio();
+          setRoomId(id);
+        }}
       />
     );
   }

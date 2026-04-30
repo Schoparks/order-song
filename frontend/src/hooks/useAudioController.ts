@@ -53,6 +53,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
 
   const anchorRef = useRef<SyncAnchor | null>(null);
   const lastNextAtRef = useRef(0);
+  const playRetryTimerRef = useRef<number | null>(null);
   const currentQueueItemRef = useRef<number | null>(null);
   const audioGraphRef = useRef<{
     ctx: AudioContext;
@@ -115,11 +116,51 @@ export function useAudioController(roomId: number | null, token: string | null) 
     graph.gain.connect(graph.ctx.destination);
   }, [ensureAudioGraph]);
 
+  const clearPlayRetry = useCallback(() => {
+    if (playRetryTimerRef.current != null) {
+      window.clearTimeout(playRetryTimerRef.current);
+      playRetryTimerRef.current = null;
+    }
+  }, []);
+
+  const requestAudioPlay = useCallback((retries = 2) => {
+    if (!audio.src) return;
+    clearPlayRetry();
+    const attempt = (remaining: number) => {
+      const graph = audioGraphRef.current;
+      const resumeGraph =
+        graph && graph.ctx.state === "suspended"
+          ? graph.ctx.resume().catch(() => {})
+          : Promise.resolve();
+      resumeGraph.finally(() => {
+        audio.play()
+          .then(() => {
+            clearPlayRetry();
+          })
+          .catch(() => {
+            if (remaining <= 0) return;
+            playRetryTimerRef.current = window.setTimeout(() => attempt(remaining - 1), 350);
+          });
+      });
+    };
+    attempt(retries);
+  }, [audio, clearPlayRetry]);
+
+  const unlockAudio = useCallback(() => {
+    ensureAudioGraph()
+      .then(() => applyAudioGraph(normalizerEnabled))
+      .catch(() => {});
+  }, [applyAudioGraph, ensureAudioGraph, normalizerEnabled]);
+
   const setPlayEnabled = useCallback((value: boolean) => {
     setPlayEnabledState(value);
     writeStoredBoolean("playEnabled", value);
-    if (!value) audio.pause();
-  }, [audio]);
+    if (value) unlockAudio();
+    else {
+      clearPlayRetry();
+      audio.pause();
+    }
+  }, [audio, clearPlayRetry, unlockAudio]);
 
   const setNormalizerEnabled = useCallback((value: boolean) => {
     setNormalizerEnabledState(value);
@@ -145,6 +186,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const syncAudioToRoom = useCallback((force = false) => {
     const audioUrl = track ? playableAudioUrl(track) : null;
     if (!playback || !audioUrl) {
+      clearPlayRetry();
       audio.pause();
       if (!audioUrl) audio.removeAttribute("src");
       currentQueueItemRef.current = null;
@@ -175,21 +217,23 @@ export function useAudioController(roomId: number | null, token: string | null) 
     }
 
     if (!playEnabled) {
+      clearPlayRetry();
       audio.pause();
       return;
     }
     if (playback.is_playing) {
       if (!normalizerEnabled && !audioGraphRef.current) {
-        audio.play().catch(() => {});
+        requestAudioPlay();
         return;
       }
       ensureAudioGraph().then(() => applyAudioGraph(normalizerEnabled)).finally(() => {
-        audio.play().catch(() => {});
+        requestAudioPlay();
       });
     } else {
+      clearPlayRetry();
       audio.pause();
     }
-  }, [applyAudioGraph, audio, ensureAudioGraph, getDurationMs, normalizerEnabled, playEnabled, playback, track]);
+  }, [applyAudioGraph, audio, clearPlayRetry, ensureAudioGraph, getDurationMs, normalizerEnabled, playEnabled, playback, requestAudioPlay, track]);
 
   const applyPlaybackEnvelope = useCallback((envelope: PlaybackEnvelope) => {
     setPlayback(envelope.playback_state);
@@ -217,6 +261,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
 
   const playPause = useCallback(async () => {
     if (!roomId || !token) return;
+    unlockAudio();
     if (playback?.current_queue_item_id && playback.is_playing) {
       const pos = Math.round(playEnabled && !audio.paused ? audio.currentTime * 1000 : getRoomPositionMs());
       await api(`/api/rooms/${roomId}/controls/pause`, {
@@ -227,7 +272,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
     } else {
       await api(`/api/rooms/${roomId}/controls/play`, { method: "POST", token });
     }
-  }, [audio, getRoomPositionMs, playEnabled, playback, roomId, token]);
+  }, [audio, getRoomPositionMs, playEnabled, playback, roomId, token, unlockAudio]);
 
   const commitSeek = useCallback(async (ratio: number) => {
     if (!roomId || !token) return;
@@ -248,6 +293,34 @@ export function useAudioController(roomId: number | null, token: string | null) 
   useEffect(() => {
     syncAudioToRoom(false);
   }, [syncAudioToRoom]);
+
+  useEffect(() => {
+    const onCanPlay = () => {
+      if (playEnabled && playback?.is_playing) requestAudioPlay(1);
+    };
+    audio.addEventListener("canplay", onCanPlay);
+    audio.addEventListener("loadeddata", onCanPlay);
+    return () => {
+      audio.removeEventListener("canplay", onCanPlay);
+      audio.removeEventListener("loadeddata", onCanPlay);
+    };
+  }, [audio, playEnabled, playback?.is_playing, requestAudioPlay]);
+
+  useEffect(() => {
+    const onUserActivation = () => {
+      const graph = audioGraphRef.current;
+      if ((playEnabled || normalizerEnabled || graph) && (!graph || graph.ctx.state === "suspended")) unlockAudio();
+      if (playEnabled && playback?.is_playing) requestAudioPlay(1);
+    };
+    window.addEventListener("pointerdown", onUserActivation, { passive: true });
+    window.addEventListener("keydown", onUserActivation);
+    return () => {
+      window.removeEventListener("pointerdown", onUserActivation);
+      window.removeEventListener("keydown", onUserActivation);
+    };
+  }, [normalizerEnabled, playback?.is_playing, playEnabled, requestAudioPlay, unlockAudio]);
+
+  useEffect(() => () => clearPlayRetry(), [clearPlayRetry]);
 
   useEffect(() => {
     const onEnded = () => next();
@@ -295,6 +368,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
     setNormalizerEnabled,
     setVolume,
     toggleMute,
+    unlockAudio,
     applyPlaybackEnvelope,
     playPause,
     next,
