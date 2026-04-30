@@ -64,17 +64,33 @@ function blurActiveElement() {
   if (active instanceof HTMLElement) active.blur();
 }
 
+function restoreViewportScroll() {
+  window.scrollTo(0, 0);
+  document.documentElement.scrollTop = 0;
+  document.body.scrollTop = 0;
+}
+
 function resetMobileViewport() {
   blurActiveElement();
-  const restore = () => {
-    window.scrollTo(0, 0);
-    document.documentElement.scrollTop = 0;
-    document.body.scrollTop = 0;
-  };
+  const restore = restoreViewportScroll;
   restore();
   window.requestAnimationFrame(restore);
   window.setTimeout(restore, 80);
   window.setTimeout(restore, 260);
+  window.setTimeout(restore, 600);
+}
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function settleMobileViewportBeforeRouteChange() {
+  blurActiveElement();
+  restoreViewportScroll();
+  await wait(380);
+  resetMobileViewport();
 }
 
 function useDialogViewportLock() {
@@ -338,6 +354,10 @@ export function App() {
     if (!queueTabInPrimary && tab === "queue") setTab("trending");
   }, [queueTabInPrimary, tab]);
 
+  useEffect(() => {
+    if (token) resetMobileViewport();
+  }, [roomId, token]);
+
   const refreshRoomData = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ["queue", roomId, token] });
     queryClient.invalidateQueries({ queryKey: ["history", roomId, token] });
@@ -467,8 +487,8 @@ export function App() {
         rooms={roomsQuery.data || []}
         loading={roomsQuery.isLoading}
         onLogout={logout}
-        onEnter={(id) => {
-          resetMobileViewport();
+        onEnter={async (id) => {
+          await settleMobileViewportBeforeRouteChange();
           if (audio.playEnabled) audio.unlockAudio();
           setRoomId(id);
         }}
@@ -630,7 +650,7 @@ function AuthView({
         method: "POST",
         json: { username: username.trim(), password },
       });
-      resetMobileViewport();
+      await settleMobileViewportBeforeRouteChange();
       if (kind === "admin") onAdminLogin(out);
       else onLogin(out);
     } catch (error) {
