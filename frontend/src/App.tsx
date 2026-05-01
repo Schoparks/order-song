@@ -61,10 +61,36 @@ type AdminRoom = Room & { created_by: string; members: Array<{ id: number; usern
 
 const KEYBOARD_HEIGHT_DELTA = 120;
 const IOS_VIEWPORT_TOP_OFFSET_LIMIT = 80;
+const TOKEN_STORAGE_KEY = "token";
+const SESSION_USER_ID_KEY = "sessionUserId";
+const LEGACY_ROOM_ID_KEY = "roomId";
 let stableViewportHeight = 0;
 let stableViewportWidth = 0;
 let freezeViewportUntil = 0;
 let sawIosKeyboardInteraction = false;
+
+function roomStorageKey(userId: number | string) {
+  return `roomId:${userId}`;
+}
+
+function numericStorageValue(key: string): number | null {
+  const value = Number(localStorage.getItem(key) || "");
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function readInitialRoomId(): number | null {
+  const userId = numericStorageValue(SESSION_USER_ID_KEY);
+  if (userId) return numericStorageValue(roomStorageKey(userId));
+  return numericStorageValue(LEGACY_ROOM_ID_KEY);
+}
+
+function writeRoomIdForUser(roomId: number | null, userId?: number | null) {
+  localStorage.removeItem(LEGACY_ROOM_ID_KEY);
+  if (!userId) return;
+  const key = roomStorageKey(userId);
+  if (roomId) localStorage.setItem(key, String(roomId));
+  else localStorage.removeItem(key);
+}
 
 function isIosSafari() {
   const ua = navigator.userAgent;
@@ -473,9 +499,10 @@ function TrackCover({ track }: { track: Track }) {
 export function App() {
   useStableViewportHeight();
   const queryClient = useQueryClient();
-  const [token, setToken] = useState(() => localStorage.getItem("token"));
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_STORAGE_KEY));
   const [adminToken, setAdminToken] = useState<string | null>(null);
-  const [roomId, setRoomIdState] = useState<number | null>(() => Number(localStorage.getItem("roomId") || "") || null);
+  const [sessionUserId, setSessionUserId] = useState<number | null>(() => numericStorageValue(SESSION_USER_ID_KEY));
+  const [roomId, setRoomIdState] = useState<number | null>(() => readInitialRoomId());
   const [tab, setTab] = useState<Tab>("trending");
   const [queueTab, setQueueTab] = useState<QueueTab>("queue");
   const [searchOpen, setSearchOpen] = useState(false);
@@ -485,12 +512,6 @@ export function App() {
   const queueTabInPrimary = useMediaQuery("(max-width: 1100px)");
 
   const audio = useAudioController(roomId, token);
-
-  const setRoomId = useCallback((nextRoomId: number | null) => {
-    setRoomIdState(nextRoomId);
-    if (nextRoomId) localStorage.setItem("roomId", String(nextRoomId));
-    else localStorage.removeItem("roomId");
-  }, []);
 
   const configQuery = useQuery({
     queryKey: ["public-config"],
@@ -503,6 +524,13 @@ export function App() {
     queryFn: () => api<UserPublic>("/api/me", { token }),
     enabled: !!token,
   });
+
+  const activeUserId = meQuery.data?.id ?? sessionUserId;
+
+  const setRoomId = useCallback((nextRoomId: number | null) => {
+    setRoomIdState(nextRoomId);
+    writeRoomIdForUser(nextRoomId, activeUserId);
+  }, [activeUserId]);
 
   const roomsQuery = useQuery({
     queryKey: ["rooms", token],
@@ -571,6 +599,25 @@ export function App() {
     if (token) resetMobileViewport();
   }, [roomId, token]);
 
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== TOKEN_STORAGE_KEY && event.key !== SESSION_USER_ID_KEY) return;
+      setToken(localStorage.getItem(TOKEN_STORAGE_KEY));
+      setSessionUserId(numericStorageValue(SESSION_USER_ID_KEY));
+      setRoomIdState(readInitialRoomId());
+      queryClient.clear();
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [queryClient]);
+
+  useEffect(() => {
+    if (!meQuery.data) return;
+    setSessionUserId(meQuery.data.id);
+    localStorage.setItem(SESSION_USER_ID_KEY, String(meQuery.data.id));
+    if (roomId) writeRoomIdForUser(roomId, meQuery.data.id);
+  }, [meQuery.data, roomId]);
+
   const refreshRoomData = useCallback(() => {
     queryClient.invalidateQueries({ queryKey: ["queue", roomId, token] });
     queryClient.invalidateQueries({ queryKey: ["history", roomId, token] });
@@ -606,7 +653,7 @@ export function App() {
         const state = await api<PlaybackEnvelope>(`/api/rooms/${roomId}/state`, { token });
         if (!cancelled) applyPlaybackEnvelope(state);
       } catch (error) {
-        if (error instanceof ApiError && (error.status === 401 || error.status === 404)) handleRoomGone();
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403 || error.status === 404)) handleRoomGone();
       }
     }
     syncState();
@@ -638,6 +685,10 @@ export function App() {
             applyPlaybackEnvelope(msg);
             refreshRoomData();
           }
+          if (msg.type === "error") {
+            const message = String(msg.message || "");
+            if (message === "not a room member") handleRoomGone();
+          }
           if (msg.type === "queue_updated") refreshRoomData();
           if (msg.type === "room_destroyed") handleRoomGone();
           if (msg.type === "room_member_left" && meQuery.data && msg.user_id === meQuery.data.id) handleRoomGone();
@@ -668,11 +719,15 @@ export function App() {
   const logout = useCallback(() => {
     setToken(null);
     setAdminToken(null);
-    localStorage.removeItem("token");
+    localStorage.removeItem(TOKEN_STORAGE_KEY);
     setRoomId(null);
     setHint("");
     queryClient.clear();
   }, [queryClient, setRoomId]);
+
+  useEffect(() => {
+    if (meQuery.error instanceof ApiError && meQuery.error.status === 401) logout();
+  }, [logout, meQuery.error]);
 
   if (adminToken) {
     return <AdminView token={adminToken} onExit={() => setAdminToken(null)} />;
@@ -684,8 +739,15 @@ export function App() {
         hint={hint}
         onHint={setHint}
         onLogin={(out) => {
+          const previousUserId = numericStorageValue(SESSION_USER_ID_KEY);
+          const nextRoomId = previousUserId === out.user.id ? numericStorageValue(roomStorageKey(out.user.id)) : null;
           setToken(out.token);
-          localStorage.setItem("token", out.token);
+          setSessionUserId(out.user.id);
+          setRoomIdState(nextRoomId);
+          localStorage.setItem(TOKEN_STORAGE_KEY, out.token);
+          localStorage.setItem(SESSION_USER_ID_KEY, String(out.user.id));
+          writeRoomIdForUser(nextRoomId, out.user.id);
+          queryClient.removeQueries({ queryKey: ["me"] });
         }}
         onAdminLogin={(out) => setAdminToken(out.token)}
       />

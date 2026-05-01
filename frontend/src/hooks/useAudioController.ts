@@ -6,6 +6,7 @@ import type { PlaybackEnvelope, PlaybackState, Track } from "../types";
 
 const SEEK_TOLERANCE_MS = 3000;
 const NEXT_DEBOUNCE_MS = 2500;
+const STREAM_RETRY_LIMIT = 2;
 
 interface SyncAnchor {
   serverTsMs: number;
@@ -54,7 +55,11 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const anchorRef = useRef<SyncAnchor | null>(null);
   const lastNextAtRef = useRef(0);
   const playRetryTimerRef = useRef<number | null>(null);
+  const streamRetryTimerRef = useRef<number | null>(null);
+  const streamRetryCountRef = useRef(0);
+  const pendingSeekSecondsRef = useRef<number | null>(null);
   const currentQueueItemRef = useRef<number | null>(null);
+  const syncAudioToRoomRef = useRef<(force?: boolean, shouldPlay?: boolean) => void>(() => {});
   const audioGraphRef = useRef<{
     ctx: AudioContext;
     source: MediaElementAudioSourceNode;
@@ -123,6 +128,35 @@ export function useAudioController(roomId: number | null, token: string | null) 
     }
   }, []);
 
+  const clearStreamRetry = useCallback(() => {
+    if (streamRetryTimerRef.current != null) {
+      window.clearTimeout(streamRetryTimerRef.current);
+      streamRetryTimerRef.current = null;
+    }
+  }, []);
+
+  const seekAudioTo = useCallback((seconds: number) => {
+    const safeSeconds = Math.max(0, seconds);
+    pendingSeekSecondsRef.current = safeSeconds;
+    try {
+      audio.currentTime = safeSeconds;
+      pendingSeekSecondsRef.current = null;
+    } catch {
+      // Some streams reject seeks until metadata/canplay fires.
+    }
+  }, [audio]);
+
+  const applyPendingSeek = useCallback(() => {
+    const seconds = pendingSeekSecondsRef.current;
+    if (seconds == null) return;
+    try {
+      audio.currentTime = seconds;
+      pendingSeekSecondsRef.current = null;
+    } catch {
+      // Keep the pending seek for the next media readiness event.
+    }
+  }, [audio]);
+
   const requestAudioPlay = useCallback((retries = 2) => {
     if (!audio.src) return;
     clearPlayRetry();
@@ -155,12 +189,16 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const setPlayEnabled = useCallback((value: boolean) => {
     setPlayEnabledState(value);
     writeStoredBoolean("playEnabled", value);
-    if (value) unlockAudio();
-    else {
+    if (value) {
+      unlockAudio();
+      syncAudioToRoomRef.current(true, true);
+      requestAudioPlay(3);
+    } else {
       clearPlayRetry();
+      clearStreamRetry();
       audio.pause();
     }
-  }, [audio, clearPlayRetry, unlockAudio]);
+  }, [audio, clearPlayRetry, clearStreamRetry, requestAudioPlay, unlockAudio]);
 
   const setNormalizerEnabled = useCallback((value: boolean) => {
     setNormalizerEnabledState(value);
@@ -183,40 +221,47 @@ export function useAudioController(roomId: number | null, token: string | null) 
     setVolume(volume > 0 ? 0 : previousVolume || 50);
   }, [previousVolume, setVolume, volume]);
 
-  const syncAudioToRoom = useCallback((force = false) => {
+  const syncAudioToRoom = useCallback((force = false, shouldPlay = playEnabled) => {
     const audioUrl = track ? playableAudioUrl(track) : null;
     if (!playback || !audioUrl) {
       clearPlayRetry();
+      clearStreamRetry();
       audio.pause();
-      if (!audioUrl) audio.removeAttribute("src");
+      if (!audioUrl) {
+        audio.removeAttribute("src");
+        audio.load();
+      }
       currentQueueItemRef.current = null;
+      pendingSeekSecondsRef.current = null;
+      streamRetryCountRef.current = 0;
       return;
     }
     if (currentQueueItemRef.current !== playback.current_queue_item_id) {
       currentQueueItemRef.current = playback.current_queue_item_id;
+      streamRetryCountRef.current = 0;
+      pendingSeekSecondsRef.current = null;
       force = true;
     }
     const nextSrc = withBase(audioUrl);
     if (audio.src !== new URL(nextSrc, location.href).href) {
       audio.src = nextSrc;
+      audio.load();
+      streamRetryCountRef.current = 0;
+      pendingSeekSecondsRef.current = null;
       force = true;
     }
 
     const duration = getDurationMs();
     const targetMs = roomPositionFromState(playback, anchorRef.current);
-    if (playEnabled && Number.isFinite(targetMs) && targetMs >= 0) {
+    if (shouldPlay && Number.isFinite(targetMs) && targetMs >= 0) {
       const boundedMs = duration > 1000 ? clamp(targetMs, 0, duration - 500) : targetMs;
       const diffMs = Math.abs((audio.currentTime || 0) * 1000 - boundedMs);
       if (force || diffMs > SEEK_TOLERANCE_MS) {
-        try {
-          audio.currentTime = boundedMs / 1000;
-        } catch {
-          // Some streams reject early seeks until metadata is loaded.
-        }
+        seekAudioTo(boundedMs / 1000);
       }
     }
 
-    if (!playEnabled) {
+    if (!shouldPlay) {
       clearPlayRetry();
       audio.pause();
       return;
@@ -233,7 +278,9 @@ export function useAudioController(roomId: number | null, token: string | null) 
       clearPlayRetry();
       audio.pause();
     }
-  }, [applyAudioGraph, audio, clearPlayRetry, ensureAudioGraph, getDurationMs, normalizerEnabled, playEnabled, playback, requestAudioPlay, track]);
+  }, [applyAudioGraph, audio, clearPlayRetry, clearStreamRetry, ensureAudioGraph, getDurationMs, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, track]);
+
+  syncAudioToRoomRef.current = syncAudioToRoom;
 
   const applyPlaybackEnvelope = useCallback((envelope: PlaybackEnvelope) => {
     setPlayback(envelope.playback_state);
@@ -279,12 +326,13 @@ export function useAudioController(roomId: number | null, token: string | null) 
     const duration = getDurationMs();
     const desired = Math.floor(clamp(ratio, 0, 1) * duration);
     setIsSeeking(false);
+    seekAudioTo(desired / 1000);
     await api(`/api/rooms/${roomId}/controls/position`, {
       method: "PATCH",
       token,
       json: { position_ms: desired, expected_queue_item_id: playback?.current_queue_item_id ?? null },
     }).catch(() => {});
-  }, [getDurationMs, playback?.current_queue_item_id, roomId, token]);
+  }, [getDurationMs, playback?.current_queue_item_id, roomId, seekAudioTo, token]);
 
   useEffect(() => {
     audio.volume = volume / 100;
@@ -296,6 +344,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
 
   useEffect(() => {
     const onCanPlay = () => {
+      applyPendingSeek();
       if (playEnabled && playback?.is_playing) requestAudioPlay(1);
     };
     audio.addEventListener("canplay", onCanPlay);
@@ -304,7 +353,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
       audio.removeEventListener("canplay", onCanPlay);
       audio.removeEventListener("loadeddata", onCanPlay);
     };
-  }, [audio, playEnabled, playback?.is_playing, requestAudioPlay]);
+  }, [applyPendingSeek, audio, playEnabled, playback?.is_playing, requestAudioPlay]);
 
   useEffect(() => {
     const onUserActivation = () => {
@@ -320,26 +369,45 @@ export function useAudioController(roomId: number | null, token: string | null) 
     };
   }, [normalizerEnabled, playback?.is_playing, playEnabled, requestAudioPlay, unlockAudio]);
 
-  useEffect(() => () => clearPlayRetry(), [clearPlayRetry]);
+  useEffect(() => () => {
+    clearPlayRetry();
+    clearStreamRetry();
+  }, [clearPlayRetry, clearStreamRetry]);
 
   useEffect(() => {
     const onEnded = () => next();
-    const onMetadata = () => setDurationMs(getDurationMs());
+    const onMetadata = () => {
+      applyPendingSeek();
+      setDurationMs(getDurationMs());
+    };
     const onTime = () => {
       if (!isSeeking) {
         setPositionMs(playEnabled && !audio.paused ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
       }
       setDurationMs(getDurationMs());
     };
+    const onError = () => {
+      if (!playEnabled || !playback?.is_playing || !audio.src || streamRetryCountRef.current >= STREAM_RETRY_LIMIT) return;
+      streamRetryCountRef.current += 1;
+      clearStreamRetry();
+      const targetMs = getRoomPositionMs();
+      if (Number.isFinite(targetMs)) pendingSeekSecondsRef.current = Math.max(0, targetMs / 1000);
+      streamRetryTimerRef.current = window.setTimeout(() => {
+        audio.load();
+        requestAudioPlay(1);
+      }, 450);
+    };
     audio.addEventListener("ended", onEnded);
     audio.addEventListener("loadedmetadata", onMetadata);
     audio.addEventListener("timeupdate", onTime);
+    audio.addEventListener("error", onError);
     return () => {
       audio.removeEventListener("ended", onEnded);
       audio.removeEventListener("loadedmetadata", onMetadata);
       audio.removeEventListener("timeupdate", onTime);
+      audio.removeEventListener("error", onError);
     };
-  }, [audio, getDurationMs, getRoomPositionMs, isSeeking, next, playEnabled]);
+  }, [applyPendingSeek, audio, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, next, playback?.is_playing, playEnabled, requestAudioPlay]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {

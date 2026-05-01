@@ -8,13 +8,14 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import Response, StreamingResponse
-from sqlmodel import Session, func, select
+from sqlmodel import Session, select
 
 from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import (
     QueueStatus,
     Room,
+    RoomMember,
     RoomPlaybackState,
     RoomQueueItem,
     Track,
@@ -32,7 +33,7 @@ router = APIRouter(prefix="/api", tags=["queue"])
 
 
 _UNSET: Any = object()
-_NEXT_LOCKS: dict[int, asyncio.Lock] = {}
+_PLAYBACK_LOCKS: dict[int, asyncio.Lock] = {}
 _COVER_PROXY_HOST_SUFFIXES = (
     "bilibili.com",
     "biliimg.com",
@@ -40,11 +41,11 @@ _COVER_PROXY_HOST_SUFFIXES = (
 )
 
 
-def _next_lock(room_id: int) -> asyncio.Lock:
-    lock = _NEXT_LOCKS.get(room_id)
+def _playback_lock(room_id: int) -> asyncio.Lock:
+    lock = _PLAYBACK_LOCKS.get(room_id)
     if lock is None:
         lock = asyncio.Lock()
-        _NEXT_LOCKS[room_id] = lock
+        _PLAYBACK_LOCKS[room_id] = lock
     return lock
 
 
@@ -93,6 +94,18 @@ def _get_room(db: Session, room_id: int) -> Room:
     room = db.get(Room, room_id)
     if not room:
         raise HTTPException(status_code=404, detail="room not found")
+    return room
+
+
+def _require_room_member(db: Session, room_id: int, user: User) -> Room:
+    room = _get_room(db, room_id)
+    existing = db.exec(
+        select(RoomMember)
+        .where(RoomMember.room_id == room_id, RoomMember.user_id == user.id)
+        .limit(1)
+    ).first()
+    if not existing:
+        raise HTTPException(status_code=403, detail="not a room member")
     return room
 
 
@@ -277,6 +290,16 @@ async def _ensure_queue_item_metadata(db: Session, queue_item: RoomQueueItem) ->
     track = db.get(Track, queue_item.track_id)
     if track and track.source == TrackSource.bilibili and not track.cover_url:
         await _ensure_bilibili_metadata(db, track)
+
+
+async def _broadcast_or_start_after_enqueue(db: Session, room_id: int, fallback_queue_item_id: int) -> None:
+    async with _playback_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb or pb.current_queue_item_id is None:
+            next_id = _pick_next_queue_item_id(db, room_id) or fallback_queue_item_id
+            await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
+        else:
+            await hub.broadcast(room_id, {"type": "queue_updated"})
 
 
 async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) -> Optional[str]:
@@ -481,7 +504,7 @@ async def stream_track(track_id: int, request: Request, db: Session = Depends(ge
 
 @router.get("/rooms/{room_id}/queue")
 def get_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
     items = db.exec(
         select(RoomQueueItem, Track, User)
         .join(Track, Track.id == RoomQueueItem.track_id)
@@ -505,7 +528,7 @@ def get_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(
 
 @router.get("/rooms/{room_id}/history")
 def get_history(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
     items = db.exec(
         select(RoomQueueItem, Track, User)
         .join(Track, Track.id == RoomQueueItem.track_id)
@@ -530,68 +553,64 @@ def get_history(room_id: int, db: Session = Depends(get_db), user: User = Depend
 
 @router.post("/rooms/{room_id}/queue")
 async def add_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
 
-    qi, added = _enqueue_track_payload(db, room_id, payload, user.id)
+    async with _playback_lock(room_id):
+        qi, added = _enqueue_track_payload(db, room_id, payload, user.id)
     await _ensure_queue_item_metadata(db, qi)
     if not added:
         return {"ok": True, "queue_item_id": qi.id, "already_queued": True}
 
-    pb = db.get(RoomPlaybackState, room_id)
-    if pb and pb.current_queue_item_id is None:
-        next_id = _pick_next_queue_item_id(db, room_id) or qi.id
-        await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
-    else:
-        await hub.broadcast(room_id, {"type": "queue_updated"})
+    await _broadcast_or_start_after_enqueue(db, room_id, qi.id)
 
     return {"ok": True, "queue_item_id": qi.id}
 
 
 @router.post("/rooms/{room_id}/queue/batch")
 async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be list")
 
     seen: set[tuple[str, str]] = set()
     queue_item_ids: list[int] = []
+    queue_items: list[RoomQueueItem] = []
     added_count = 0
     skipped_count = 0
     now = datetime.utcnow()
 
-    for raw in items:
-        if not isinstance(raw, dict):
-            raise HTTPException(status_code=400, detail="invalid item")
-        source = raw.get("source")
-        source_track_id = raw.get("source_track_id")
-        key = (str(source), str(source_track_id))
-        if key in seen:
-            skipped_count += 1
-            continue
-        seen.add(key)
+    async with _playback_lock(room_id):
+        for raw in items:
+            if not isinstance(raw, dict):
+                raise HTTPException(status_code=400, detail="invalid item")
+            source = raw.get("source")
+            source_track_id = raw.get("source_track_id")
+            key = (str(source), str(source_track_id))
+            if key in seen:
+                skipped_count += 1
+                continue
+            seen.add(key)
 
-        qi, added = _enqueue_track_payload(
-            db,
-            room_id,
-            raw,
-            user.id,
-            created_at=now + timedelta(milliseconds=added_count),
-        )
+            qi, added = _enqueue_track_payload(
+                db,
+                room_id,
+                raw,
+                user.id,
+                created_at=now + timedelta(milliseconds=added_count),
+            )
+            if added:
+                added_count += 1
+                queue_item_ids.append(qi.id)
+                queue_items.append(qi)
+            else:
+                skipped_count += 1
+
+    for qi in queue_items:
         await _ensure_queue_item_metadata(db, qi)
-        if added:
-            added_count += 1
-            queue_item_ids.append(qi.id)
-        else:
-            skipped_count += 1
 
     if added_count:
-        pb = db.get(RoomPlaybackState, room_id)
-        if pb and pb.current_queue_item_id is None:
-            next_id = _pick_next_queue_item_id(db, room_id) or queue_item_ids[0]
-            await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
-        else:
-            await hub.broadcast(room_id, {"type": "queue_updated"})
+        await _broadcast_or_start_after_enqueue(db, room_id, queue_item_ids[0])
 
     return {
         "ok": True,
@@ -603,7 +622,7 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
 
 @router.post("/rooms/{room_id}/queue/playlist")
 async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
     playlist_id = payload.get("playlist_id")
     if not isinstance(playlist_id, int):
         raise HTTPException(status_code=400, detail="playlist_id required")
@@ -620,44 +639,44 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
     ).all()
 
     queue_item_ids: list[int] = []
+    queue_items: list[RoomQueueItem] = []
     added_count = 0
     skipped_count = 0
     now = datetime.utcnow()
 
-    for _, tr in rows:
-        existing = _get_existing_queue_item(db, room_id, tr.id)
-        if existing and existing.status in (QueueStatus.playing, QueueStatus.queued):
-            skipped_count += 1
-            continue
-        qi, added = _enqueue_track_payload(
-            db,
-            room_id,
-            {
-                "source": tr.source.value,
-                "source_track_id": tr.source_track_id,
-                "title": tr.title,
-                "artist": tr.artist,
-                "duration_ms": tr.duration_ms,
-                "cover_url": tr.cover_url,
-                "audio_url": tr.audio_url,
-            },
-            user.id,
-            created_at=now + timedelta(milliseconds=added_count),
-        )
+    async with _playback_lock(room_id):
+        for _, tr in rows:
+            existing = _get_existing_queue_item(db, room_id, tr.id)
+            if existing and existing.status in (QueueStatus.playing, QueueStatus.queued):
+                skipped_count += 1
+                continue
+            qi, added = _enqueue_track_payload(
+                db,
+                room_id,
+                {
+                    "source": tr.source.value,
+                    "source_track_id": tr.source_track_id,
+                    "title": tr.title,
+                    "artist": tr.artist,
+                    "duration_ms": tr.duration_ms,
+                    "cover_url": tr.cover_url,
+                    "audio_url": tr.audio_url,
+                },
+                user.id,
+                created_at=now + timedelta(milliseconds=added_count),
+            )
+            if added:
+                added_count += 1
+                queue_item_ids.append(qi.id)
+                queue_items.append(qi)
+            else:
+                skipped_count += 1
+
+    for qi in queue_items:
         await _ensure_queue_item_metadata(db, qi)
-        if added:
-            added_count += 1
-            queue_item_ids.append(qi.id)
-        else:
-            skipped_count += 1
 
     if added_count:
-        pb = db.get(RoomPlaybackState, room_id)
-        if pb and pb.current_queue_item_id is None:
-            next_id = _pick_next_queue_item_id(db, room_id) or queue_item_ids[0]
-            await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
-        else:
-            await hub.broadcast(room_id, {"type": "queue_updated"})
+        await _broadcast_or_start_after_enqueue(db, room_id, queue_item_ids[0])
 
     return {
         "ok": True,
@@ -669,20 +688,27 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
 
 @router.delete("/rooms/{room_id}/queue/{queue_item_id}")
 async def remove_queue_item(room_id: int, queue_item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
-    qi = db.get(RoomQueueItem, queue_item_id)
-    if not qi or qi.room_id != room_id:
-        raise HTTPException(status_code=404, detail="queue item not found")
-    qi.status = QueueStatus.removed
-    db.add(qi)
-    db.commit()
-    await hub.broadcast(room_id, {"type": "queue_updated"})
+    _require_room_member(db, room_id, user)
+    async with _playback_lock(room_id):
+        qi = db.get(RoomQueueItem, queue_item_id)
+        if not qi or qi.room_id != room_id:
+            raise HTTPException(status_code=404, detail="queue item not found")
+        pb = db.get(RoomPlaybackState, room_id)
+        removing_current = bool(pb and pb.current_queue_item_id == qi.id)
+        qi.status = QueueStatus.removed
+        db.add(qi)
+        db.commit()
+        if removing_current:
+            next_id = _pick_next_queue_item_id(db, room_id)
+            await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=next_id is not None, position_ms=0)
+        else:
+            await hub.broadcast(room_id, {"type": "queue_updated"})
     return {"ok": True}
 
 
 @router.post("/rooms/{room_id}/queue/{queue_item_id}/bump")
 async def bump_queue_item(room_id: int, queue_item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
     qi = db.get(RoomQueueItem, queue_item_id)
     if not qi or qi.room_id != room_id:
         raise HTTPException(status_code=404, detail="queue item not found")
@@ -743,6 +769,18 @@ async def _set_playback(
             db.commit()
     ordered_by = None
     if pb.current_queue_item_id:
+        playing_items = db.exec(
+            select(RoomQueueItem).where(
+                RoomQueueItem.room_id == room_id,
+                RoomQueueItem.status == QueueStatus.playing,
+                RoomQueueItem.id != pb.current_queue_item_id,
+            )
+        ).all()
+        for item in playing_items:
+            item.status = QueueStatus.played
+            db.add(item)
+        if playing_items:
+            db.commit()
         qi = db.get(RoomQueueItem, pb.current_queue_item_id)
         if qi:
             qi.status = QueueStatus.playing
@@ -757,6 +795,18 @@ async def _set_playback(
                 current_track = TrackOut.model_validate(tr).model_dump(mode="json")
                 if tr.audio_url:
                     current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
+    elif current_queue_item_id is not _UNSET:
+        playing_items = db.exec(
+            select(RoomQueueItem).where(
+                RoomQueueItem.room_id == room_id,
+                RoomQueueItem.status == QueueStatus.playing,
+            )
+        ).all()
+        for item in playing_items:
+            item.status = QueueStatus.played
+            db.add(item)
+        if playing_items:
+            db.commit()
     await hub.broadcast(
         room_id,
         {
@@ -784,43 +834,48 @@ def _pick_next_queue_item_id(db: Session, room_id: int) -> Optional[int]:
 
 @router.post("/rooms/{room_id}/controls/play")
 async def play(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pb = db.get(RoomPlaybackState, room_id)
-    if not pb:
-        raise HTTPException(status_code=404, detail="room not found")
-    if pb.current_queue_item_id is None:
-        next_id = _pick_next_queue_item_id(db, room_id)
-        if next_id is None:
-            await _set_playback(db, room_id, current_queue_item_id=None, is_playing=False, position_ms=0)
-            return {"ok": True, "empty": True}
-        await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
-    else:
-        await _set_playback(db, room_id, is_playing=True)
+    _require_room_member(db, room_id, user)
+    async with _playback_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb:
+            raise HTTPException(status_code=404, detail="room not found")
+        if pb.current_queue_item_id is None:
+            next_id = _pick_next_queue_item_id(db, room_id)
+            if next_id is None:
+                await _set_playback(db, room_id, current_queue_item_id=None, is_playing=False, position_ms=0)
+                return {"ok": True, "empty": True}
+            await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
+        else:
+            await _set_playback(db, room_id, is_playing=True)
     return {"ok": True}
 
 
 @router.post("/rooms/{room_id}/controls/pause")
 async def pause(room_id: int, payload: PlaybackControlIn | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pb = db.get(RoomPlaybackState, room_id)
-    if not pb:
-        raise HTTPException(status_code=404, detail="room not found")
-    if _is_stale_control(pb, payload):
-        return _stale_control_response(pb)
-    pos = payload.position_ms if payload else None
-    if pos is not None:
-        pos = max(0, int(pos))
-    if pos is None:
-        if pb and pb.is_playing and pb.current_queue_item_id:
-            pos = _effective_position_ms(pb)
-    if pos is not None:
-        await _set_playback(db, room_id, is_playing=False, position_ms=pos)
-    else:
-        await _set_playback(db, room_id, is_playing=False)
+    _require_room_member(db, room_id, user)
+    async with _playback_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb:
+            raise HTTPException(status_code=404, detail="room not found")
+        if _is_stale_control(pb, payload):
+            return _stale_control_response(pb)
+        pos = payload.position_ms if payload else None
+        if pos is not None:
+            pos = max(0, int(pos))
+        if pos is None:
+            if pb and pb.is_playing and pb.current_queue_item_id:
+                pos = _effective_position_ms(pb)
+        if pos is not None:
+            await _set_playback(db, room_id, is_playing=False, position_ms=pos)
+        else:
+            await _set_playback(db, room_id, is_playing=False)
     return {"ok": True}
 
 
 @router.post("/rooms/{room_id}/controls/next")
 async def next_track(room_id: int, payload: PlaybackControlIn | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    async with _next_lock(room_id):
+    _require_room_member(db, room_id, user)
+    async with _playback_lock(room_id):
         pb = db.get(RoomPlaybackState, room_id)
         if not pb:
             raise HTTPException(status_code=404, detail="room not found")
@@ -841,14 +896,16 @@ async def next_track(room_id: int, payload: PlaybackControlIn | None = None, db:
 
 @router.post("/rooms/{room_id}/controls/prev")
 async def prev_track(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_room_member(db, room_id, user)
     # Minimal behavior: restart current track
-    await _set_playback(db, room_id, position_ms=0)
+    async with _playback_lock(room_id):
+        await _set_playback(db, room_id, position_ms=0)
     return {"ok": True}
 
 
 @router.post("/rooms/{room_id}/queue/shuffle")
 async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _get_room(db, room_id)
+    _require_room_member(db, room_id, user)
     items = db.exec(
         select(RoomQueueItem)
         .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
@@ -869,22 +926,25 @@ async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User 
 
 @router.patch("/rooms/{room_id}/controls/position")
 async def set_position(room_id: int, payload: PlaybackControlIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pb = db.get(RoomPlaybackState, room_id)
-    if not pb:
-        raise HTTPException(status_code=404, detail="room not found")
-    if _is_stale_control(pb, payload):
-        return _stale_control_response(pb)
-    await _set_playback(db, room_id, position_ms=payload.position_ms or 0)
+    _require_room_member(db, room_id, user)
+    async with _playback_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb:
+            raise HTTPException(status_code=404, detail="room not found")
+        if _is_stale_control(pb, payload):
+            return _stale_control_response(pb)
+        await _set_playback(db, room_id, position_ms=payload.position_ms or 0)
     return {"ok": True}
 
 
 @router.patch("/rooms/{room_id}/controls/volume")
 async def set_volume(room_id: int, payload: VolumeControlIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pb = db.get(RoomPlaybackState, room_id)
-    if not pb:
-        raise HTTPException(status_code=404, detail="room not found")
-    if pb.mode.value != "play_enabled":
-        raise HTTPException(status_code=403, detail="volume only allowed in play_enabled mode")
-    await _set_playback(db, room_id, volume=payload.volume)
+    _require_room_member(db, room_id, user)
+    async with _playback_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb:
+            raise HTTPException(status_code=404, detail="room not found")
+        if pb.mode.value != "play_enabled":
+            raise HTTPException(status_code=403, detail="volume only allowed in play_enabled mode")
+        await _set_playback(db, room_id, volume=payload.volume)
     return {"ok": True}
-

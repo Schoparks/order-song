@@ -7,11 +7,12 @@ from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.core.config import settings
 from app.core.security import decode_token
 from app.db import engine, init_db
+from app.models import RoomMember
 from app.routers.auth import router as auth_router
 from app.routers.rooms import router as rooms_router, remove_member_from_room
 from app.routers.search import router as search_router
@@ -133,12 +134,27 @@ async def websocket_endpoint(ws: WebSocket):
                     continue
                 user_id = None
                 token = msg.get("token")
-                if token:
-                    try:
-                        payload = decode_token(token)
-                        user_id = int(payload.get("sub", 0)) or None
-                    except Exception:
-                        pass
+                if not token:
+                    await ws.send_text('{"type":"error","message":"auth required"}')
+                    continue
+                try:
+                    payload = decode_token(token)
+                    user_id = int(payload.get("sub", 0)) or None
+                except Exception:
+                    await ws.send_text('{"type":"error","message":"invalid token"}')
+                    continue
+                if user_id is None:
+                    await ws.send_text('{"type":"error","message":"invalid token"}')
+                    continue
+                with Session(engine) as db:
+                    member = db.exec(
+                        select(RoomMember)
+                        .where(RoomMember.room_id == room_id, RoomMember.user_id == user_id)
+                        .limit(1)
+                    ).first()
+                if not member:
+                    await ws.send_text('{"type":"error","message":"not a room member"}')
+                    continue
                 if joined_room_id is not None:
                     await hub.leave(joined_room_id, ws)
                 joined_room_id = room_id
@@ -151,4 +167,3 @@ async def websocket_endpoint(ws: WebSocket):
     finally:
         if joined_room_id is not None:
             await hub.leave(joined_room_id, ws)
-

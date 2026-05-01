@@ -5,9 +5,16 @@ from sqlmodel import Session, delete, func, select
 
 from app.core.config import settings
 from app.deps import get_current_user, get_db
-from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, TrackSource, User
+from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, User
 from app.schemas import CreateRoomIn, RoomOut, TrackOut
-from app.routers.queue_playback import _playback_state_payload, _resolve_audio_url
+from app.routers.queue_playback import (
+    _pick_next_queue_item_id,
+    _playback_lock,
+    _playback_state_payload,
+    _require_room_member,
+    _resolve_audio_url,
+    _set_playback,
+)
 from app.ws import hub
 
 
@@ -39,9 +46,7 @@ def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_u
 
 @router.get("/rooms/{room_id}/members")
 def get_room_members(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    room = db.get(Room, room_id)
-    if not room:
-        raise HTTPException(status_code=404, detail="room not found")
+    _require_room_member(db, room_id, user)
     members = db.exec(
         select(User.id, User.username)
         .join(RoomMember, RoomMember.user_id == User.id)
@@ -93,6 +98,7 @@ async def remove_member_from_room(db: Session, room_id: int, user_id: int) -> bo
         return False
 
     member = db.exec(select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == user_id)).first()
+    was_member = member is not None
     if member:
         db.delete(member)
     user = db.get(User, user_id)
@@ -111,9 +117,9 @@ async def remove_member_from_room(db: Session, room_id: int, user_id: int) -> bo
         db.commit()
         await hub.broadcast(room_id, {"type": "room_destroyed", "room_id": room_id})
         return True
-    else:
+    if was_member:
         await hub.broadcast(room_id, {"type": "room_member_left", "room_id": room_id, "user_id": user_id})
-        return False
+    return False
 
 
 @router.get("/rooms/{room_id}/check")
@@ -136,29 +142,44 @@ async def leave_room(room_id: int, db: Session = Depends(get_db), user: User = D
 
 @router.patch("/rooms/{room_id}/mode")
 async def set_room_mode(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pb = db.get(RoomPlaybackState, room_id)
-    if not pb:
-        raise HTTPException(status_code=404, detail="room not found")
+    _require_room_member(db, room_id, user)
     mode = payload.get("mode")
     if mode not in (RoomMode.order_only.value, RoomMode.play_enabled.value):
         raise HTTPException(status_code=400, detail="invalid mode")
-    pb.mode = RoomMode(mode)
-    pb.updated_at = datetime.utcnow()
-    db.add(pb)
-    db.commit()
-    await hub.broadcast(
-        room_id,
-        {
-            "type": "playback_updated",
-            "room_id": room_id,
-            **_playback_state_payload(pb),
-        },
-    )
+    async with _playback_lock(room_id):
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb:
+            raise HTTPException(status_code=404, detail="room not found")
+        pb.mode = RoomMode(mode)
+        pb.updated_at = datetime.utcnow()
+        db.add(pb)
+        db.commit()
+        db.refresh(pb)
+
+        if pb.mode == RoomMode.play_enabled:
+            if pb.current_queue_item_id is None:
+                next_id = _pick_next_queue_item_id(db, room_id)
+                if next_id is not None:
+                    await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
+                    return {"ok": True}
+            elif not pb.is_playing:
+                await _set_playback(db, room_id, is_playing=True)
+                return {"ok": True}
+
+        await hub.broadcast(
+            room_id,
+            {
+                "type": "playback_updated",
+                "room_id": room_id,
+                **_playback_state_payload(pb),
+            },
+        )
     return {"ok": True}
 
 
 @router.get("/rooms/{room_id}/state")
 async def room_state(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_room_member(db, room_id, user)
     pb = db.get(RoomPlaybackState, room_id)
     if not pb:
         raise HTTPException(status_code=404, detail="room not found")
@@ -182,4 +203,3 @@ async def room_state(room_id: int, db: Session = Depends(get_db), user: User = D
         "ordered_by": ordered_by,
         "queue": [],
     }
-

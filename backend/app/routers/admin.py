@@ -3,6 +3,7 @@ from sqlmodel import Session, delete, select
 
 from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomQueueItem, User, UserPlaylist, UserPlaylistItem
+from app.routers.rooms import remove_member_from_room
 from app.schemas import UserPublic
 from app.ws import hub
 
@@ -105,11 +106,5 @@ async def remove_room_member(room_id: int, user_id: int, db: Session = Depends(g
     member = db.exec(select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == user_id)).first()
     if not member:
         raise HTTPException(status_code=404, detail="member not found")
-    db.delete(member)
-    user = db.get(User, user_id)
-    if user and user.last_active_room_id == room_id:
-        user.last_active_room_id = None
-        db.add(user)
-    db.commit()
-    await hub.broadcast(room_id, {"type": "room_member_left", "room_id": room_id, "user_id": user_id})
-    return {"ok": True}
+    destroyed = await remove_member_from_room(db, room_id, user_id)
+    return {"ok": True, "destroyed": destroyed}
