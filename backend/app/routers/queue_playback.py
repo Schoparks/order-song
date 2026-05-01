@@ -11,6 +11,7 @@ from starlette.responses import Response, StreamingResponse
 from sqlmodel import Session, select
 
 from app.core.config import settings
+from app.db import engine
 from app.deps import get_current_user, get_db
 from app.models import (
     QueueStatus,
@@ -437,26 +438,41 @@ async def proxy_cover(url: str):
 
 
 @router.get("/tracks/{track_id}/stream")
-async def stream_track(track_id: int, request: Request, db: Session = Depends(get_db)):
-    tr = db.get(Track, track_id)
-    if not tr:
-        raise HTTPException(status_code=404, detail="track not found")
-
-    max_attempts = 2 if tr.source == TrackSource.bilibili else 1
+async def stream_track(track_id: int, request: Request):
     rng = request.headers.get("range")
 
+    def _clear_cached_audio_url() -> None:
+        with Session(engine) as db:
+            tr = db.get(Track, track_id)
+            if tr:
+                tr.audio_url = None
+                db.add(tr)
+                db.commit()
+
+    with Session(engine) as db:
+        tr = db.get(Track, track_id)
+        if not tr:
+            raise HTTPException(status_code=404, detail="track not found")
+        max_attempts = 2 if tr.source == TrackSource.bilibili else 1
+
     for attempt in range(max_attempts):
-        await _resolve_audio_url(db, tr, force=(attempt > 0))
-        if not tr.audio_url:
-            raise HTTPException(status_code=404, detail="audio url not available")
+        with Session(engine) as db:
+            tr = db.get(Track, track_id)
+            if not tr:
+                raise HTTPException(status_code=404, detail="track not found")
+            await _resolve_audio_url(db, tr, force=(attempt > 0))
+            if not tr.audio_url:
+                raise HTTPException(status_code=404, detail="audio url not available")
+            source = tr.source
+            audio_url = tr.audio_url
 
         headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
-        if tr.source == TrackSource.bilibili:
+        if source == TrackSource.bilibili:
             headers["Referer"] = "https://www.bilibili.com/"
             headers["Origin"] = "https://www.bilibili.com"
             headers["Accept"] = "*/*"
             headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.6"
-        if tr.source == TrackSource.netease:
+        if source == TrackSource.netease:
             headers["Referer"] = "https://music.163.com/"
 
         if rng:
@@ -464,14 +480,12 @@ async def stream_track(track_id: int, request: Request, db: Session = Depends(ge
 
         client = httpx.AsyncClient(timeout=settings.upstream.stream_timeout_s, follow_redirects=True, headers=headers)
         try:
-            req = client.build_request("GET", tr.audio_url)
+            req = client.build_request("GET", audio_url)
             r = await client.send(req, stream=True)
         except Exception:
             await client.aclose()
             if attempt < max_attempts - 1:
-                tr.audio_url = None
-                db.add(tr)
-                db.commit()
+                _clear_cached_audio_url()
                 continue
             raise HTTPException(status_code=502, detail="upstream fetch failed")
 
@@ -479,14 +493,12 @@ async def stream_track(track_id: int, request: Request, db: Session = Depends(ge
             await r.aclose()
             await client.aclose()
             if attempt < max_attempts - 1:
-                tr.audio_url = None
-                db.add(tr)
-                db.commit()
+                _clear_cached_audio_url()
                 continue
             raise HTTPException(status_code=502, detail=f"upstream error {r.status_code}")
 
         media_type = r.headers.get("content-type") or "audio/mpeg"
-        if tr.source == TrackSource.bilibili:
+        if source == TrackSource.bilibili:
             media_type = "audio/mp4"
         resp_headers: dict[str, str] = {}
         for k in ("accept-ranges", "content-range", "content-length", "etag", "last-modified"):
