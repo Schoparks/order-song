@@ -14,7 +14,9 @@ from app.routers.queue_playback import (
     _playback_state_payload,
     _require_room_member,
     _resolve_audio_url,
+    _schedule_track_normalization,
     _set_playback,
+    _track_needs_normalization,
 )
 from app.ws import hub
 
@@ -198,6 +200,8 @@ async def room_state(room_id: int, db: Session = Depends(get_db), user: User = D
                 current_track = TrackOut.model_validate(tr).model_dump(mode="json")
                 if tr.audio_url:
                     current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
+                if _track_needs_normalization(tr):
+                    _schedule_track_normalization(tr.id, room_id)
     return {
         **_playback_state_payload(pb),
         "current_track": current_track,

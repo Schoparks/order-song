@@ -9,14 +9,8 @@ const NEXT_DEBOUNCE_MS = 2500;
 const STREAM_RETRY_LIMIT = 2;
 const STALLED_AUDIO_RELOAD_MS = 8000;
 const STREAM_RELOAD_COOLDOWN_MS = 10000;
-const NORMALIZER_TARGET_RMS = 0.16;
 const NORMALIZER_MIN_GAIN = 0.25;
 const NORMALIZER_MAX_GAIN = 4;
-const NORMALIZER_MAX_ANALYSIS_BYTES = 64 * 1024 * 1024;
-const NORMALIZER_SILENCE_RMS = 0.005;
-const NORMALIZER_ROBUST_PEAK_PERCENTILE = 0.95;
-const NORMALIZER_ALLOWED_ROBUST_PEAK = 1.2;
-const NORMALIZER_ANALYSIS_SAMPLE_RATE = 8000;
 const NORMALIZER_CACHE_PREFIX = "volumeNormalizer:v2:";
 
 interface SyncAnchor {
@@ -57,6 +51,16 @@ function normalizerTrackKey(track: Track): string {
   return track.id ? `id:${track.id}` : `${track.source}:${track.source_track_id}`;
 }
 
+function trackServerGain(track: Track | null): TrackGainAnalysis | null {
+  if (!track || !Number.isFinite(track.normalization_gain)) return null;
+  return {
+    gain: clamp(Number(track.normalization_gain), NORMALIZER_MIN_GAIN, NORMALIZER_MAX_GAIN),
+    rms: Math.max(0, Number(track.normalization_rms || 0)),
+    peak: Math.max(0, Number(track.normalization_peak || 0)),
+    analyzedAt: track.normalization_analyzed_at ? Date.parse(track.normalization_analyzed_at) || 0 : 0,
+  };
+}
+
 function readCachedTrackGain(key: string): TrackGainAnalysis | null {
   try {
     const raw = localStorage.getItem(`${NORMALIZER_CACHE_PREFIX}${key}`);
@@ -80,78 +84,6 @@ function writeCachedTrackGain(key: string, analysis: TrackGainAnalysis): void {
   } catch {
     // Storage may be full or unavailable in private browsing.
   }
-}
-
-function percentile(values: number[], ratio: number): number {
-  if (!values.length) return 0;
-  const index = Math.min(values.length - 1, Math.max(0, Math.floor((values.length - 1) * ratio)));
-  return values[index];
-}
-
-function estimateTrackGain(buffer: AudioBuffer): TrackGainAnalysis | null {
-  const { length, numberOfChannels, sampleRate } = buffer;
-  if (!length || !numberOfChannels) return null;
-
-  const blockSize = Math.max(1024, Math.floor(sampleRate * 0.1));
-  const sampleStep = Math.max(1, Math.floor(sampleRate / NORMALIZER_ANALYSIS_SAMPLE_RATE));
-  const channels = Array.from({ length: numberOfChannels }, (_, index) => buffer.getChannelData(index));
-  const blockRmsValues: number[] = [];
-  const blockPeaks: number[] = [];
-  let peak = 0;
-
-  for (let start = 0; start < length; start += blockSize) {
-    const end = Math.min(length, start + blockSize);
-    let sumSquares = 0;
-    let sampleCount = 0;
-    let blockPeak = 0;
-
-    for (const data of channels) {
-      for (let index = start; index < end; index += sampleStep) {
-        const value = data[index] || 0;
-        const abs = Math.abs(value);
-        if (abs > blockPeak) blockPeak = abs;
-        sumSquares += value * value;
-        sampleCount += 1;
-      }
-    }
-
-    if (!sampleCount) continue;
-    if (blockPeak > peak) peak = blockPeak;
-    const rms = Math.sqrt(sumSquares / sampleCount);
-    if (rms >= NORMALIZER_SILENCE_RMS) {
-      blockRmsValues.push(rms);
-      blockPeaks.push(blockPeak);
-    }
-  }
-
-  if (!blockRmsValues.length) return null;
-
-  const meanSquare = blockRmsValues.reduce((sum, rms) => sum + rms * rms, 0) / blockRmsValues.length;
-  const rms = Math.sqrt(meanSquare);
-  if (!Number.isFinite(rms) || rms <= 0) return null;
-
-  blockPeaks.sort((a, b) => a - b);
-  const robustPeak = percentile(blockPeaks, NORMALIZER_ROBUST_PEAK_PERCENTILE) || peak || 1;
-  const desiredGain = NORMALIZER_TARGET_RMS / rms;
-  const peakLimitedGain = NORMALIZER_ALLOWED_ROBUST_PEAK / robustPeak;
-  const gain = clamp(Math.min(desiredGain, peakLimitedGain), NORMALIZER_MIN_GAIN, NORMALIZER_MAX_GAIN);
-
-  return { gain, rms, peak, analyzedAt: Date.now() };
-}
-
-async function analyzeTrackGain(audioUrl: string, signal: AbortSignal, ctx: AudioContext): Promise<TrackGainAnalysis | null> {
-  const response = await fetch(audioUrl, { signal, cache: "no-store" });
-  if (!response.ok) return null;
-
-  const contentLength = Number(response.headers.get("content-length") || 0);
-  if (contentLength > NORMALIZER_MAX_ANALYSIS_BYTES) return null;
-
-  const arrayBuffer = await response.arrayBuffer();
-  if (signal.aborted || arrayBuffer.byteLength > NORMALIZER_MAX_ANALYSIS_BYTES) return null;
-
-  const decoded = await ctx.decodeAudioData(arrayBuffer);
-  if (signal.aborted) return null;
-  return estimateTrackGain(decoded);
 }
 
 export function useAudioController(roomId: number | null, token: string | null) {
@@ -182,9 +114,6 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const lastAudioTimeRef = useRef(0);
   const lastStreamReloadAtRef = useRef(0);
   const currentQueueItemRef = useRef<number | null>(null);
-  const normalizerAbortRef = useRef<AbortController | null>(null);
-  const normalizerAnalysisActiveRef = useRef(false);
-  const normalizerAnalysisQuietUntilRef = useRef(0);
   const currentTrackGainRef = useRef(1);
   const currentTrackGainKeyRef = useRef<string | null>(null);
   const syncAudioToRoomRef = useRef<(force?: boolean, shouldPlay?: boolean) => void>(() => {});
@@ -215,6 +144,20 @@ export function useAudioController(roomId: number | null, token: string | null) 
     () => (track ? playableAudioUrl(track) : null),
     [track?.audio_url, track?.id, track?.source, track?.source_track_id],
   );
+  const serverTrackGain = useMemo(
+    () => trackServerGain(track),
+    [
+      track?.normalization_analyzed_at,
+      track?.normalization_gain,
+      track?.normalization_peak,
+      track?.normalization_rms,
+    ],
+  );
+
+  const effectiveOutputGain = useCallback((normalizerOn = normalizerEnabled) => {
+    const userGain = clamp(volume, 0, 100) / 100;
+    return userGain * (normalizerOn ? currentTrackGainRef.current : 1);
+  }, [normalizerEnabled, volume]);
 
   const ensureAudioGraph = useCallback(async () => {
     if (audioGraphRef.current) {
@@ -226,20 +169,21 @@ export function useAudioController(roomId: number | null, token: string | null) 
     const ctx = new AudioCtx();
     const source = ctx.createMediaElementSource(audio);
     const gain = ctx.createGain();
-    gain.gain.value = currentTrackGainRef.current;
+    audio.volume = 1;
+    gain.gain.value = effectiveOutputGain();
     source.connect(gain);
     gain.connect(ctx.destination);
     audioGraphRef.current = { ctx, source, gain };
     return audioGraphRef.current;
-  }, [audio]);
+  }, [audio, effectiveOutputGain]);
 
   const applyAudioGraph = useCallback(async (enabled: boolean) => {
     const graph = await ensureAudioGraph();
     if (!graph) return;
     const now = graph.ctx.currentTime;
     graph.gain.gain.cancelScheduledValues(now);
-    graph.gain.gain.setTargetAtTime(enabled ? currentTrackGainRef.current : 1, now, 0.08);
-  }, [ensureAudioGraph]);
+    graph.gain.gain.setTargetAtTime(effectiveOutputGain(enabled), now, 0.08);
+  }, [effectiveOutputGain, ensureAudioGraph]);
 
   const clearPlayRetry = useCallback(() => {
     if (playRetryTimerRef.current != null) {
@@ -352,8 +296,13 @@ export function useAudioController(roomId: number | null, token: string | null) 
       setPreviousVolume(safe);
       localStorage.setItem("previousVolume", String(safe));
     }
-    audio.volume = safe / 100;
-  }, [audio]);
+    if (audioGraphRef.current) {
+      audio.volume = 1;
+      applyAudioGraph(normalizerEnabled).catch(() => {});
+    } else {
+      audio.volume = safe / 100;
+    }
+  }, [applyAudioGraph, audio, normalizerEnabled]);
 
   const toggleMute = useCallback(() => {
     setVolume(volume > 0 ? 0 : previousVolume || 50);
@@ -480,63 +429,31 @@ export function useAudioController(roomId: number | null, token: string | null) 
 
   useEffect(() => {
     const key = normalizerTrackKeyValue;
-    const cached = normalizerEnabled && key ? readCachedTrackGain(key) : null;
+    const serverGain = normalizerEnabled ? serverTrackGain : null;
+    const cached = normalizerEnabled && key && !serverGain ? readCachedTrackGain(key) : null;
     if (currentTrackGainKeyRef.current !== key) {
       currentTrackGainKeyRef.current = key;
       currentTrackGainRef.current = 1;
     }
+    if (serverGain) {
+      currentTrackGainRef.current = serverGain.gain;
+      if (key) writeCachedTrackGain(key, serverGain);
+    }
     if (cached) currentTrackGainRef.current = cached.gain;
 
-    normalizerAbortRef.current?.abort();
-    normalizerAbortRef.current = null;
-    normalizerAnalysisActiveRef.current = false;
-    normalizerAnalysisQuietUntilRef.current = Date.now() + 1000;
     if ((normalizerEnabled && key) || audioGraphRef.current) applyAudioGraph(normalizerEnabled).catch(() => {});
 
-    if (!normalizerEnabled || !key) return undefined;
-    if (cached) return undefined;
-
-    const audioUrl = normalizerAudioUrl;
-    if (!audioUrl) return undefined;
-
-    const controller = new AbortController();
-    normalizerAbortRef.current = controller;
-    normalizerAnalysisActiveRef.current = true;
-    normalizerAnalysisQuietUntilRef.current = Date.now() + 3000;
-    ensureAudioGraph()
-      .then((graph) => {
-        if (!graph || controller.signal.aborted) return null;
-        return analyzeTrackGain(withBase(audioUrl), controller.signal, graph.ctx);
-      })
-      .then((analysis) => {
-        if (!analysis || controller.signal.aborted || currentTrackGainKeyRef.current !== key) return;
-        currentTrackGainRef.current = analysis.gain;
-        writeCachedTrackGain(key, analysis);
-        applyAudioGraph(true).catch(() => {});
-      })
-      .catch(() => {})
-      .finally(() => {
-        if (normalizerAbortRef.current !== controller) return;
-        normalizerAbortRef.current = null;
-        normalizerAnalysisActiveRef.current = false;
-        normalizerAnalysisQuietUntilRef.current = Date.now() + 3000;
-        lastAudioProgressAtRef.current = Date.now();
-        lastAudioTimeRef.current = audio.currentTime || lastAudioTimeRef.current;
-      });
-
-    return () => {
-      controller.abort();
-      if (normalizerAbortRef.current === controller) {
-        normalizerAbortRef.current = null;
-        normalizerAnalysisActiveRef.current = false;
-        normalizerAnalysisQuietUntilRef.current = Date.now() + 3000;
-      }
-    };
-  }, [applyAudioGraph, audio, ensureAudioGraph, normalizerAudioUrl, normalizerEnabled, normalizerTrackKeyValue]);
+    return undefined;
+  }, [applyAudioGraph, normalizerEnabled, normalizerTrackKeyValue, serverTrackGain]);
 
   useEffect(() => {
-    audio.volume = volume / 100;
-  }, [audio, volume]);
+    if (audioGraphRef.current) {
+      audio.volume = 1;
+      applyAudioGraph(normalizerEnabled).catch(() => {});
+    } else {
+      audio.volume = volume / 100;
+    }
+  }, [applyAudioGraph, audio, normalizerEnabled, volume]);
 
   useEffect(() => {
     syncAudioToRoom(false);
@@ -572,7 +489,6 @@ export function useAudioController(roomId: number | null, token: string | null) 
   useEffect(() => () => {
     clearPlayRetry();
     clearStreamRetry();
-    normalizerAbortRef.current?.abort();
   }, [clearPlayRetry, clearStreamRetry]);
 
   useEffect(() => {
@@ -626,11 +542,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
         if (moving) {
           lastAudioProgressAtRef.current = now;
           lastAudioTimeRef.current = currentSeconds;
-        } else if (
-          !normalizerAnalysisActiveRef.current
-          && now >= normalizerAnalysisQuietUntilRef.current
-          && now - lastAudioProgressAtRef.current > STALLED_AUDIO_RELOAD_MS
-        ) {
+        } else if (now - lastAudioProgressAtRef.current > STALLED_AUDIO_RELOAD_MS) {
           reloadCurrentStream(2);
         }
       }

@@ -62,6 +62,10 @@ class TrackOut(BaseModel):
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
     audio_url: Optional[str] = None
+    normalization_gain: Optional[float] = None
+    normalization_rms: Optional[float] = None
+    normalization_peak: Optional[float] = None
+    normalization_analyzed_at: Optional[datetime] = None
 
 
 class SearchTrackOut(BaseModel):
@@ -91,4 +95,3 @@ class PlaybackControlIn(BaseModel):
 
 class VolumeControlIn(BaseModel):
     volume: int = Field(default=50, ge=0, le=100)
-

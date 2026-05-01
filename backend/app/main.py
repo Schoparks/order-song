@@ -16,7 +16,7 @@ from app.models import RoomMember
 from app.routers.auth import router as auth_router
 from app.routers.rooms import router as rooms_router, remove_member_from_room
 from app.routers.search import router as search_router
-from app.routers.queue_playback import router as queue_router
+from app.routers.queue_playback import prewarm_track_normalization, router as queue_router
 from app.routers.playlists_trending import router as playlists_router
 from app.routers.admin import router as admin_router
 from app.ws import hub
@@ -42,6 +42,7 @@ def _startup() -> None:
 @app.on_event("startup")
 async def _startup_bg_tasks() -> None:
     asyncio.create_task(_cleanup_stale_members())
+    asyncio.create_task(prewarm_track_normalization())
 
 
 async def _cleanup_stale_members() -> None:

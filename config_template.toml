@@ -83,6 +83,25 @@ rooms_refresh_interval_ms = 5000
 # 本地搜索历史最多保存多少条。
 search_history_limit = 30
 
+[audio_normalization]
+# 是否启用后端歌曲级音量均衡分析；需要服务器可执行 ffmpeg。
+enabled = true
+# ffmpeg 可执行文件路径。Windows 可写绝对路径，例如 "D:\\dev\\ffmpeg\\bin\\ffmpeg.exe"。
+ffmpeg_path = "ffmpeg"
+# 单首歌响度分析超时，单位秒；超时会缓存错误并稍后重试，不阻塞播放。
+timeout_s = 45
+# 单首歌最多分析前多少秒，避免超长音频占用后台任务。
+max_duration_s = 600
+# 后端响度分析采样率。
+sample_rate = 8000
+# 目标 RMS 和增益边界；前端直接使用后端缓存的固定 gain。
+target_rms = 0.16
+min_gain = 0.25
+max_gain = 4.0
+silence_rms = 0.005
+robust_peak_percentile = 0.95
+allowed_robust_peak = 1.2
+
 [upstream]
 # yt-dlp 解析 B 站音频超时，单位秒。
 yt_dlp_timeout_s = 20

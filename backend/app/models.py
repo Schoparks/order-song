@@ -65,6 +65,11 @@ class Track(SQLModel, table=True):
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
     audio_url: Optional[str] = None
+    normalization_gain: Optional[float] = None
+    normalization_rms: Optional[float] = None
+    normalization_peak: Optional[float] = None
+    normalization_analyzed_at: Optional[datetime] = None
+    normalization_error: Optional[str] = Field(default=None, max_length=240)
 
 
 class QueueStatus(str, Enum):
@@ -122,4 +127,3 @@ class TrackOrderStats(SQLModel, table=True):
     track_id: int = Field(foreign_key="tracks.id", primary_key=True)
     order_count: int = Field(default=0, index=True)
     last_ordered_at: datetime = Field(default_factory=utcnow, index=True)
-

@@ -18,6 +18,11 @@ def _migrate_columns():
     """Add any missing columns to existing tables (lightweight migration)."""
     migrations = [
         ("users", "is_admin", "BOOLEAN DEFAULT 0"),
+        ("tracks", "normalization_gain", "REAL"),
+        ("tracks", "normalization_rms", "REAL"),
+        ("tracks", "normalization_peak", "REAL"),
+        ("tracks", "normalization_analyzed_at", "DATETIME"),
+        ("tracks", "normalization_error", "VARCHAR(240)"),
     ]
     conn = sqlite3.connect(settings.sqlite_path)
     cur = conn.cursor()
@@ -62,4 +67,3 @@ def _bootstrap_default_admin() -> None:
 def get_session():
     with Session(engine) as session:
         yield session
-

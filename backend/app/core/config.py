@@ -153,6 +153,40 @@ class ClientSettings(BaseModel):
     _valid_search_history_limit = field_validator("search_history_limit")(_positive_int)
 
 
+class AudioNormalizationSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    ffmpeg_path: str = "ffmpeg"
+    timeout_s: float = 45.0
+    max_duration_s: int = 600
+    sample_rate: int = 8000
+    target_rms: float = 0.16
+    min_gain: float = 0.25
+    max_gain: float = 4.0
+    silence_rms: float = 0.005
+    robust_peak_percentile: float = 0.95
+    allowed_robust_peak: float = 1.2
+
+    _valid_max_duration = field_validator("max_duration_s")(_positive_int)
+    _valid_sample_rate = field_validator("sample_rate")(_positive_int)
+
+    @field_validator("timeout_s")
+    @classmethod
+    def _valid_timeout(cls, value: float) -> float:
+        return max(0.1, float(value))
+
+    @field_validator("target_rms", "min_gain", "max_gain", "silence_rms", "allowed_robust_peak")
+    @classmethod
+    def _valid_positive_float(cls, value: float) -> float:
+        return max(0.0001, float(value))
+
+    @field_validator("robust_peak_percentile")
+    @classmethod
+    def _valid_percentile(cls, value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+
 class UpstreamSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -190,6 +224,7 @@ class Settings(BaseModel):
     trending: TrendingSettings = Field(default_factory=TrendingSettings)
     rooms: RoomsSettings = Field(default_factory=RoomsSettings)
     client: ClientSettings = Field(default_factory=ClientSettings)
+    audio_normalization: AudioNormalizationSettings = Field(default_factory=AudioNormalizationSettings)
     upstream: UpstreamSettings = Field(default_factory=UpstreamSettings)
 
     @property
