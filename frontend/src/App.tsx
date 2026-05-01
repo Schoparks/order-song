@@ -1543,7 +1543,7 @@ function PlaylistsView({
               onChanged();
             }}
           >
-            一键点歌
+            乱序点歌
           </button>
         </div>
         <TrackList
@@ -1602,7 +1602,7 @@ function PlaylistsView({
                 onChanged();
               }}
             >
-              一键点歌
+              乱序点歌
             </button>
             <button
               className="iconButton danger playlistDeleteButton"

@@ -7,6 +7,16 @@ import type { PlaybackEnvelope, PlaybackState, Track } from "../types";
 const SEEK_TOLERANCE_MS = 3000;
 const NEXT_DEBOUNCE_MS = 2500;
 const STREAM_RETRY_LIMIT = 2;
+const STALLED_AUDIO_RELOAD_MS = 8000;
+const STREAM_RELOAD_COOLDOWN_MS = 10000;
+const NORMALIZER_TARGET_RMS = 0.16;
+const NORMALIZER_MIN_GAIN = 0.25;
+const NORMALIZER_MAX_GAIN = 4;
+const NORMALIZER_MAX_ANALYSIS_BYTES = 64 * 1024 * 1024;
+const NORMALIZER_SILENCE_RMS = 0.005;
+const NORMALIZER_ROBUST_PEAK_PERCENTILE = 0.95;
+const NORMALIZER_ALLOWED_ROBUST_PEAK = 1.2;
+const NORMALIZER_CACHE_PREFIX = "volumeNormalizer:v2:";
 
 interface SyncAnchor {
   serverTsMs: number;
@@ -35,6 +45,113 @@ function playableAudioUrl(track: Track): string | null {
   return track.audio_url || null;
 }
 
+interface TrackGainAnalysis {
+  gain: number;
+  rms: number;
+  peak: number;
+  analyzedAt: number;
+}
+
+function normalizerTrackKey(track: Track): string {
+  return track.id ? `id:${track.id}` : `${track.source}:${track.source_track_id}`;
+}
+
+function readCachedTrackGain(key: string): TrackGainAnalysis | null {
+  try {
+    const raw = localStorage.getItem(`${NORMALIZER_CACHE_PREFIX}${key}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<TrackGainAnalysis>;
+    if (!Number.isFinite(parsed.gain) || !Number.isFinite(parsed.rms) || !Number.isFinite(parsed.peak)) return null;
+    return {
+      gain: clamp(Number(parsed.gain), NORMALIZER_MIN_GAIN, NORMALIZER_MAX_GAIN),
+      rms: Math.max(0, Number(parsed.rms)),
+      peak: Math.max(0, Number(parsed.peak)),
+      analyzedAt: Number(parsed.analyzedAt) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedTrackGain(key: string, analysis: TrackGainAnalysis): void {
+  try {
+    localStorage.setItem(`${NORMALIZER_CACHE_PREFIX}${key}`, JSON.stringify(analysis));
+  } catch {
+    // Storage may be full or unavailable in private browsing.
+  }
+}
+
+function percentile(values: number[], ratio: number): number {
+  if (!values.length) return 0;
+  const index = Math.min(values.length - 1, Math.max(0, Math.floor((values.length - 1) * ratio)));
+  return values[index];
+}
+
+function estimateTrackGain(buffer: AudioBuffer): TrackGainAnalysis | null {
+  const { length, numberOfChannels, sampleRate } = buffer;
+  if (!length || !numberOfChannels) return null;
+
+  const blockSize = Math.max(1024, Math.floor(sampleRate * 0.1));
+  const channels = Array.from({ length: numberOfChannels }, (_, index) => buffer.getChannelData(index));
+  const blockRmsValues: number[] = [];
+  const blockPeaks: number[] = [];
+  let peak = 0;
+
+  for (let start = 0; start < length; start += blockSize) {
+    const end = Math.min(length, start + blockSize);
+    let sumSquares = 0;
+    let sampleCount = 0;
+    let blockPeak = 0;
+
+    for (const data of channels) {
+      for (let index = start; index < end; index += 1) {
+        const value = data[index] || 0;
+        const abs = Math.abs(value);
+        if (abs > blockPeak) blockPeak = abs;
+        sumSquares += value * value;
+        sampleCount += 1;
+      }
+    }
+
+    if (!sampleCount) continue;
+    if (blockPeak > peak) peak = blockPeak;
+    const rms = Math.sqrt(sumSquares / sampleCount);
+    if (rms >= NORMALIZER_SILENCE_RMS) {
+      blockRmsValues.push(rms);
+      blockPeaks.push(blockPeak);
+    }
+  }
+
+  if (!blockRmsValues.length) return null;
+
+  const meanSquare = blockRmsValues.reduce((sum, rms) => sum + rms * rms, 0) / blockRmsValues.length;
+  const rms = Math.sqrt(meanSquare);
+  if (!Number.isFinite(rms) || rms <= 0) return null;
+
+  blockPeaks.sort((a, b) => a - b);
+  const robustPeak = percentile(blockPeaks, NORMALIZER_ROBUST_PEAK_PERCENTILE) || peak || 1;
+  const desiredGain = NORMALIZER_TARGET_RMS / rms;
+  const peakLimitedGain = NORMALIZER_ALLOWED_ROBUST_PEAK / robustPeak;
+  const gain = clamp(Math.min(desiredGain, peakLimitedGain), NORMALIZER_MIN_GAIN, NORMALIZER_MAX_GAIN);
+
+  return { gain, rms, peak, analyzedAt: Date.now() };
+}
+
+async function analyzeTrackGain(audioUrl: string, signal: AbortSignal, ctx: AudioContext): Promise<TrackGainAnalysis | null> {
+  const response = await fetch(audioUrl, { signal, cache: "no-store" });
+  if (!response.ok) return null;
+
+  const contentLength = Number(response.headers.get("content-length") || 0);
+  if (contentLength > NORMALIZER_MAX_ANALYSIS_BYTES) return null;
+
+  const arrayBuffer = await response.arrayBuffer();
+  if (signal.aborted || arrayBuffer.byteLength > NORMALIZER_MAX_ANALYSIS_BYTES) return null;
+
+  const decoded = await ctx.decodeAudioData(arrayBuffer);
+  if (signal.aborted) return null;
+  return estimateTrackGain(decoded);
+}
+
 export function useAudioController(roomId: number | null, token: string | null) {
   const audio = useMemo(() => {
     const element = new Audio();
@@ -51,6 +168,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const [positionMs, setPositionMs] = useState(0);
   const [durationMs, setDurationMs] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
+  const hasTrack = track != null;
 
   const anchorRef = useRef<SyncAnchor | null>(null);
   const lastNextAtRef = useRef(0);
@@ -58,13 +176,18 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const streamRetryTimerRef = useRef<number | null>(null);
   const streamRetryCountRef = useRef(0);
   const pendingSeekSecondsRef = useRef<number | null>(null);
+  const lastAudioProgressAtRef = useRef(Date.now());
+  const lastAudioTimeRef = useRef(0);
+  const lastStreamReloadAtRef = useRef(0);
   const currentQueueItemRef = useRef<number | null>(null);
+  const normalizerAbortRef = useRef<AbortController | null>(null);
+  const currentTrackGainRef = useRef(1);
+  const currentTrackGainKeyRef = useRef<string | null>(null);
   const syncAudioToRoomRef = useRef<(force?: boolean, shouldPlay?: boolean) => void>(() => {});
   const audioGraphRef = useRef<{
     ctx: AudioContext;
     source: MediaElementAudioSourceNode;
     gain: GainNode;
-    compressor: DynamicsCompressorNode;
   } | null>(null);
 
   const getDurationMs = useCallback(() => {
@@ -80,6 +203,15 @@ export function useAudioController(roomId: number | null, token: string | null) 
     return duration > 0 ? clamp(raw, 0, duration) : raw;
   }, [getDurationMs, playback]);
 
+  const normalizerTrackKeyValue = useMemo(
+    () => (track ? normalizerTrackKey(track) : null),
+    [track?.id, track?.source, track?.source_track_id],
+  );
+  const normalizerAudioUrl = useMemo(
+    () => (track ? playableAudioUrl(track) : null),
+    [track?.audio_url, track?.id, track?.source, track?.source_track_id],
+  );
+
   const ensureAudioGraph = useCallback(async () => {
     if (audioGraphRef.current) {
       if (audioGraphRef.current.ctx.state === "suspended") await audioGraphRef.current.ctx.resume().catch(() => {});
@@ -90,34 +222,27 @@ export function useAudioController(roomId: number | null, token: string | null) 
     const ctx = new AudioCtx();
     const source = ctx.createMediaElementSource(audio);
     const gain = ctx.createGain();
-    const compressor = ctx.createDynamicsCompressor();
-    compressor.threshold.value = -26;
-    compressor.knee.value = 24;
-    compressor.ratio.value = 7;
-    compressor.attack.value = 0.004;
-    compressor.release.value = 0.22;
+    gain.gain.value = currentTrackGainRef.current;
     source.connect(gain);
     gain.connect(ctx.destination);
-    audioGraphRef.current = { ctx, source, gain, compressor };
+    audioGraphRef.current = { ctx, source, gain };
     return audioGraphRef.current;
   }, [audio]);
 
   const applyAudioGraph = useCallback(async (enabled: boolean) => {
     const graph = await ensureAudioGraph();
     if (!graph) return;
-    for (const node of [graph.source, graph.gain, graph.compressor]) {
+    for (const node of [graph.source, graph.gain]) {
       try {
         node.disconnect();
       } catch {
         // Disconnect is not idempotent for all AudioNode implementations.
       }
     }
-    if (enabled) {
-      graph.source.connect(graph.compressor);
-      graph.compressor.connect(graph.gain);
-    } else {
-      graph.source.connect(graph.gain);
-    }
+    const now = graph.ctx.currentTime;
+    graph.gain.gain.cancelScheduledValues(now);
+    graph.gain.gain.setTargetAtTime(enabled ? currentTrackGainRef.current : 1, now, 0.08);
+    graph.source.connect(graph.gain);
     graph.gain.connect(graph.ctx.destination);
   }, [ensureAudioGraph]);
 
@@ -180,7 +305,25 @@ export function useAudioController(roomId: number | null, token: string | null) 
     attempt(retries);
   }, [audio, clearPlayRetry]);
 
+  const reloadCurrentStream = useCallback((retries = 1) => {
+    if (!audio.src) return;
+    const now = Date.now();
+    if (now - lastStreamReloadAtRef.current < STREAM_RELOAD_COOLDOWN_MS) return;
+    lastStreamReloadAtRef.current = now;
+    lastAudioProgressAtRef.current = now;
+    const targetMs = getRoomPositionMs();
+    if (Number.isFinite(targetMs)) pendingSeekSecondsRef.current = Math.max(0, targetMs / 1000);
+    clearStreamRetry();
+    try {
+      audio.load();
+    } catch {
+      // Reload is best-effort; play retries below will handle the recoverable cases.
+    }
+    requestAudioPlay(retries);
+  }, [audio, clearStreamRetry, getRoomPositionMs, requestAudioPlay]);
+
   const unlockAudio = useCallback(() => {
+    if (!normalizerEnabled && !audioGraphRef.current) return;
     ensureAudioGraph()
       .then(() => applyAudioGraph(normalizerEnabled))
       .catch(() => {});
@@ -203,7 +346,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
   const setNormalizerEnabled = useCallback((value: boolean) => {
     setNormalizerEnabledState(value);
     writeStoredBoolean("volumeNormalizer", value);
-    applyAudioGraph(value).catch(() => {});
+    if (value || audioGraphRef.current) applyAudioGraph(value).catch(() => {});
   }, [applyAudioGraph]);
 
   const setVolume = useCallback((value: number) => {
@@ -222,7 +365,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
   }, [previousVolume, setVolume, volume]);
 
   const syncAudioToRoom = useCallback((force = false, shouldPlay = playEnabled) => {
-    const audioUrl = track ? playableAudioUrl(track) : null;
+    const audioUrl = normalizerAudioUrl;
     if (!playback || !audioUrl) {
       clearPlayRetry();
       clearStreamRetry();
@@ -234,12 +377,16 @@ export function useAudioController(roomId: number | null, token: string | null) 
       currentQueueItemRef.current = null;
       pendingSeekSecondsRef.current = null;
       streamRetryCountRef.current = 0;
+      lastAudioProgressAtRef.current = Date.now();
+      lastAudioTimeRef.current = 0;
       return;
     }
     if (currentQueueItemRef.current !== playback.current_queue_item_id) {
       currentQueueItemRef.current = playback.current_queue_item_id;
       streamRetryCountRef.current = 0;
       pendingSeekSecondsRef.current = null;
+      lastAudioProgressAtRef.current = Date.now();
+      lastAudioTimeRef.current = 0;
       force = true;
     }
     const nextSrc = withBase(audioUrl);
@@ -248,6 +395,8 @@ export function useAudioController(roomId: number | null, token: string | null) 
       audio.load();
       streamRetryCountRef.current = 0;
       pendingSeekSecondsRef.current = null;
+      lastAudioProgressAtRef.current = Date.now();
+      lastAudioTimeRef.current = 0;
       force = true;
     }
 
@@ -278,7 +427,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
       clearPlayRetry();
       audio.pause();
     }
-  }, [applyAudioGraph, audio, clearPlayRetry, clearStreamRetry, ensureAudioGraph, getDurationMs, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, track]);
+  }, [applyAudioGraph, audio, clearPlayRetry, clearStreamRetry, ensureAudioGraph, getDurationMs, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo]);
 
   syncAudioToRoomRef.current = syncAudioToRoom;
 
@@ -335,6 +484,45 @@ export function useAudioController(roomId: number | null, token: string | null) 
   }, [getDurationMs, playback?.current_queue_item_id, roomId, seekAudioTo, token]);
 
   useEffect(() => {
+    const key = normalizerTrackKeyValue;
+    const cached = normalizerEnabled && key ? readCachedTrackGain(key) : null;
+    if (currentTrackGainKeyRef.current !== key) {
+      currentTrackGainKeyRef.current = key;
+      currentTrackGainRef.current = 1;
+    }
+    if (cached) currentTrackGainRef.current = cached.gain;
+
+    normalizerAbortRef.current?.abort();
+    normalizerAbortRef.current = null;
+    if ((normalizerEnabled && key) || audioGraphRef.current) applyAudioGraph(normalizerEnabled).catch(() => {});
+
+    if (!normalizerEnabled || !key) return undefined;
+    if (cached) return undefined;
+
+    const audioUrl = normalizerAudioUrl;
+    if (!audioUrl) return undefined;
+
+    const controller = new AbortController();
+    normalizerAbortRef.current = controller;
+    ensureAudioGraph()
+      .then((graph) => {
+        if (!graph || controller.signal.aborted) return null;
+        return analyzeTrackGain(withBase(audioUrl), controller.signal, graph.ctx);
+      })
+      .then((analysis) => {
+        if (!analysis || controller.signal.aborted || currentTrackGainKeyRef.current !== key) return;
+        currentTrackGainRef.current = analysis.gain;
+        writeCachedTrackGain(key, analysis);
+        applyAudioGraph(true).catch(() => {});
+      })
+      .catch(() => {});
+
+    return () => {
+      controller.abort();
+    };
+  }, [applyAudioGraph, ensureAudioGraph, normalizerAudioUrl, normalizerEnabled, normalizerTrackKeyValue]);
+
+  useEffect(() => {
     audio.volume = volume / 100;
   }, [audio, volume]);
 
@@ -372,6 +560,7 @@ export function useAudioController(roomId: number | null, token: string | null) 
   useEffect(() => () => {
     clearPlayRetry();
     clearStreamRetry();
+    normalizerAbortRef.current?.abort();
   }, [clearPlayRetry, clearStreamRetry]);
 
   useEffect(() => {
@@ -381,41 +570,59 @@ export function useAudioController(roomId: number | null, token: string | null) 
       setDurationMs(getDurationMs());
     };
     const onTime = () => {
+      const currentSeconds = audio.currentTime || 0;
+      if (Math.abs(currentSeconds - lastAudioTimeRef.current) > 0.05) {
+        lastAudioProgressAtRef.current = Date.now();
+        lastAudioTimeRef.current = currentSeconds;
+        streamRetryCountRef.current = 0;
+      }
       if (!isSeeking) {
-        setPositionMs(playEnabled && !audio.paused ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
+        setPositionMs(playEnabled && !audio.paused ? currentSeconds * 1000 : getRoomPositionMs());
       }
       setDurationMs(getDurationMs());
+    };
+    const onPlaying = () => {
+      lastAudioProgressAtRef.current = Date.now();
+      lastAudioTimeRef.current = audio.currentTime || 0;
     };
     const onError = () => {
       if (!playEnabled || !playback?.is_playing || !audio.src || streamRetryCountRef.current >= STREAM_RETRY_LIMIT) return;
       streamRetryCountRef.current += 1;
       clearStreamRetry();
-      const targetMs = getRoomPositionMs();
-      if (Number.isFinite(targetMs)) pendingSeekSecondsRef.current = Math.max(0, targetMs / 1000);
-      streamRetryTimerRef.current = window.setTimeout(() => {
-        audio.load();
-        requestAudioPlay(1);
-      }, 450);
+      streamRetryTimerRef.current = window.setTimeout(() => reloadCurrentStream(1), 450);
     };
     audio.addEventListener("ended", onEnded);
     audio.addEventListener("loadedmetadata", onMetadata);
+    audio.addEventListener("playing", onPlaying);
     audio.addEventListener("timeupdate", onTime);
     audio.addEventListener("error", onError);
     return () => {
       audio.removeEventListener("ended", onEnded);
       audio.removeEventListener("loadedmetadata", onMetadata);
+      audio.removeEventListener("playing", onPlaying);
       audio.removeEventListener("timeupdate", onTime);
       audio.removeEventListener("error", onError);
     };
-  }, [applyPendingSeek, audio, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, next, playback?.is_playing, playEnabled, requestAudioPlay]);
+  }, [applyPendingSeek, audio, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, next, playback?.is_playing, playEnabled, reloadCurrentStream]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
+      if (playEnabled && playback?.is_playing && hasTrack && audio.src) {
+        const now = Date.now();
+        const currentSeconds = audio.currentTime || 0;
+        const moving = !audio.paused && !audio.ended && Math.abs(currentSeconds - lastAudioTimeRef.current) > 0.05;
+        if (moving) {
+          lastAudioProgressAtRef.current = now;
+          lastAudioTimeRef.current = currentSeconds;
+        } else if (now - lastAudioProgressAtRef.current > STALLED_AUDIO_RELOAD_MS) {
+          reloadCurrentStream(2);
+        }
+      }
       if (!isSeeking) setPositionMs(playEnabled && !audio.paused ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
       setDurationMs(getDurationMs());
     }, 250);
     return () => window.clearInterval(timer);
-  }, [audio, getDurationMs, getRoomPositionMs, isSeeking, playEnabled]);
+  }, [audio, getDurationMs, getRoomPositionMs, hasTrack, isSeeking, playEnabled, playback?.is_playing, reloadCurrentStream]);
 
   return {
     audio,

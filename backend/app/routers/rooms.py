@@ -8,6 +8,7 @@ from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, User
 from app.schemas import CreateRoomIn, RoomOut, TrackOut
 from app.routers.queue_playback import (
+    _require_active_room_member,
     _pick_next_queue_item_id,
     _playback_lock,
     _playback_state_payload,
@@ -142,7 +143,7 @@ async def leave_room(room_id: int, db: Session = Depends(get_db), user: User = D
 
 @router.patch("/rooms/{room_id}/mode")
 async def set_room_mode(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     mode = payload.get("mode")
     if mode not in (RoomMode.order_only.value, RoomMode.play_enabled.value):
         raise HTTPException(status_code=400, detail="invalid mode")
@@ -179,7 +180,7 @@ async def set_room_mode(room_id: int, payload: dict, db: Session = Depends(get_d
 
 @router.get("/rooms/{room_id}/state")
 async def room_state(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     pb = db.get(RoomPlaybackState, room_id)
     if not pb:
         raise HTTPException(status_code=404, detail="room not found")

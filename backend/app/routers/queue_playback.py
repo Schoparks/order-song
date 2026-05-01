@@ -109,6 +109,12 @@ def _require_room_member(db: Session, room_id: int, user: User) -> Room:
     return room
 
 
+async def _require_active_room_member(db: Session, room_id: int, user: User) -> Room:
+    room = _require_room_member(db, room_id, user)
+    await hub.note_activity(room_id, user.id)
+    return room
+
+
 def _get_or_create_track(db: Session, *, source: TrackSource, source_track_id: str, title: str, artist: Optional[str] = None, duration_ms: Optional[int] = None, cover_url: Optional[str] = None, audio_url: Optional[str] = None) -> Track:
     track = db.exec(select(Track).where(Track.source == source, Track.source_track_id == source_track_id)).first()
     if track:
@@ -488,6 +494,7 @@ async def stream_track(track_id: int, request: Request, db: Session = Depends(ge
             if v:
                 resp_headers[k] = v
         resp_headers.setdefault("accept-ranges", "bytes")
+        resp_headers["cache-control"] = "no-store"
 
         async def _iter():
             try:
@@ -553,7 +560,7 @@ def get_history(room_id: int, db: Session = Depends(get_db), user: User = Depend
 
 @router.post("/rooms/{room_id}/queue")
 async def add_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
 
     async with _playback_lock(room_id):
         qi, added = _enqueue_track_payload(db, room_id, payload, user.id)
@@ -568,7 +575,7 @@ async def add_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db
 
 @router.post("/rooms/{room_id}/queue/batch")
 async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be list")
@@ -622,7 +629,7 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
 
 @router.post("/rooms/{room_id}/queue/playlist")
 async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     playlist_id = payload.get("playlist_id")
     if not isinstance(playlist_id, int):
         raise HTTPException(status_code=400, detail="playlist_id required")
@@ -637,6 +644,8 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
         .where(UserPlaylistItem.playlist_id == playlist_id)
         .order_by(UserPlaylistItem.created_at.desc())
     ).all()
+    rows = list(rows)
+    random.shuffle(rows)
 
     queue_item_ids: list[int] = []
     queue_items: list[RoomQueueItem] = []
@@ -688,7 +697,7 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
 
 @router.delete("/rooms/{room_id}/queue/{queue_item_id}")
 async def remove_queue_item(room_id: int, queue_item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     async with _playback_lock(room_id):
         qi = db.get(RoomQueueItem, queue_item_id)
         if not qi or qi.room_id != room_id:
@@ -708,7 +717,7 @@ async def remove_queue_item(room_id: int, queue_item_id: int, db: Session = Depe
 
 @router.post("/rooms/{room_id}/queue/{queue_item_id}/bump")
 async def bump_queue_item(room_id: int, queue_item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     qi = db.get(RoomQueueItem, queue_item_id)
     if not qi or qi.room_id != room_id:
         raise HTTPException(status_code=404, detail="queue item not found")
@@ -834,7 +843,7 @@ def _pick_next_queue_item_id(db: Session, room_id: int) -> Optional[int]:
 
 @router.post("/rooms/{room_id}/controls/play")
 async def play(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     async with _playback_lock(room_id):
         pb = db.get(RoomPlaybackState, room_id)
         if not pb:
@@ -852,7 +861,7 @@ async def play(room_id: int, db: Session = Depends(get_db), user: User = Depends
 
 @router.post("/rooms/{room_id}/controls/pause")
 async def pause(room_id: int, payload: PlaybackControlIn | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     async with _playback_lock(room_id):
         pb = db.get(RoomPlaybackState, room_id)
         if not pb:
@@ -874,7 +883,7 @@ async def pause(room_id: int, payload: PlaybackControlIn | None = None, db: Sess
 
 @router.post("/rooms/{room_id}/controls/next")
 async def next_track(room_id: int, payload: PlaybackControlIn | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     async with _playback_lock(room_id):
         pb = db.get(RoomPlaybackState, room_id)
         if not pb:
@@ -896,7 +905,7 @@ async def next_track(room_id: int, payload: PlaybackControlIn | None = None, db:
 
 @router.post("/rooms/{room_id}/controls/prev")
 async def prev_track(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     # Minimal behavior: restart current track
     async with _playback_lock(room_id):
         await _set_playback(db, room_id, position_ms=0)
@@ -905,7 +914,7 @@ async def prev_track(room_id: int, db: Session = Depends(get_db), user: User = D
 
 @router.post("/rooms/{room_id}/queue/shuffle")
 async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     items = db.exec(
         select(RoomQueueItem)
         .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
@@ -926,7 +935,7 @@ async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User 
 
 @router.patch("/rooms/{room_id}/controls/position")
 async def set_position(room_id: int, payload: PlaybackControlIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     async with _playback_lock(room_id):
         pb = db.get(RoomPlaybackState, room_id)
         if not pb:
@@ -939,7 +948,7 @@ async def set_position(room_id: int, payload: PlaybackControlIn, db: Session = D
 
 @router.patch("/rooms/{room_id}/controls/volume")
 async def set_volume(room_id: int, payload: VolumeControlIn, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+    await _require_active_room_member(db, room_id, user)
     async with _playback_lock(room_id):
         pb = db.get(RoomPlaybackState, room_id)
         if not pb:

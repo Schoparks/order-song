@@ -14,13 +14,19 @@ class RoomHub:
         self._room_sockets: dict[int, set[WebSocket]] = defaultdict(set)
         self._ws_user: dict[WebSocket, int] = {}
         self._disconnected: dict[int, dict[int, datetime]] = defaultdict(dict)
+        self._last_activity: dict[int, dict[int, datetime]] = defaultdict(dict)
 
     async def join(self, room_id: int, ws: WebSocket, user_id: Optional[int] = None) -> None:
         async with self._lock:
             self._room_sockets[room_id].add(ws)
             if user_id is not None:
                 self._ws_user[ws] = user_id
+                self._last_activity[room_id][user_id] = datetime.utcnow()
                 self._disconnected.get(room_id, {}).pop(user_id, None)
+
+    async def note_activity(self, room_id: int, user_id: int) -> None:
+        async with self._lock:
+            self._last_activity[room_id][user_id] = datetime.utcnow()
 
     async def leave(self, room_id: int, ws: WebSocket) -> None:
         async with self._lock:
@@ -52,7 +58,9 @@ class RoomHub:
         async with self._lock:
             for room_id, users in list(self._disconnected.items()):
                 for user_id, disc_time in list(users.items()):
-                    if (now - disc_time).total_seconds() > timeout_seconds:
+                    last_activity = self._last_activity.get(room_id, {}).get(user_id)
+                    last_seen = max(disc_time, last_activity) if last_activity else disc_time
+                    if (now - last_seen).total_seconds() > timeout_seconds:
                         stale.append((room_id, user_id))
         return stale
 
@@ -63,7 +71,11 @@ class RoomHub:
                 d.pop(user_id, None)
                 if not d:
                     self._disconnected.pop(room_id, None)
+            activity = self._last_activity.get(room_id)
+            if activity:
+                activity.pop(user_id, None)
+                if not activity:
+                    self._last_activity.pop(room_id, None)
 
 
 hub = RoomHub()
-
