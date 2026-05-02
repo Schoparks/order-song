@@ -160,6 +160,7 @@ class AudioNormalizationSettings(BaseModel):
     ffmpeg_path: str = "ffmpeg"
     timeout_s: float = 45.0
     max_duration_s: int = 600
+    max_download_mb: int = 96
     sample_rate: int = 8000
     target_rms: float = 0.16
     min_gain: float = 0.25
@@ -169,6 +170,7 @@ class AudioNormalizationSettings(BaseModel):
     allowed_robust_peak: float = 1.2
 
     _valid_max_duration = field_validator("max_duration_s")(_positive_int)
+    _valid_max_download = field_validator("max_download_mb")(_positive_int)
     _valid_sample_rate = field_validator("sample_rate")(_positive_int)
 
     @field_validator("timeout_s")

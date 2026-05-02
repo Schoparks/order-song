@@ -4,6 +4,7 @@ import logging
 import math
 import random
 import shutil
+import tempfile
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -432,10 +433,6 @@ def _track_stream_headers(source: TrackSource) -> dict[str, str]:
     return headers
 
 
-def _ffmpeg_header_string(headers: dict[str, str]) -> str:
-    return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
-
-
 def _configured_ffmpeg_path() -> str:
     return settings.audio_normalization.ffmpeg_path.strip().strip("\"'")
 
@@ -535,45 +532,85 @@ def _estimate_normalization_from_pcm(raw: bytes, *, channels: int, sample_rate: 
     return {"gain": gain, "rms": rms, "peak": peak}
 
 
-def _compute_track_normalization(source: TrackSource, audio_url: str) -> dict[str, float]:
+def _download_audio_for_normalization(source: TrackSource, audio_url: str) -> bytes:
+    limit = settings.audio_normalization.max_download_mb * 1024 * 1024
+    headers = _track_stream_headers(source)
+    headers["Accept-Encoding"] = "identity"
+    data = bytearray()
+    with httpx.Client(
+        timeout=settings.upstream.stream_timeout_s,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        with client.stream("GET", audio_url) as response:
+            response.raise_for_status()
+            content_length = int(response.headers.get("content-length") or 0)
+            if content_length > limit:
+                raise RuntimeError(f"audio too large for normalization: {content_length} bytes")
+            for chunk in response.iter_bytes():
+                data.extend(chunk)
+                if len(data) > limit:
+                    raise RuntimeError(f"audio too large for normalization: >{limit} bytes")
+    if not data:
+        raise RuntimeError("audio download returned no bytes")
+    return bytes(data)
+
+
+def _run_ffmpeg_pcm(audio_bytes: bytes) -> bytes:
     normalization = settings.audio_normalization
     channels = 2
     ffmpeg = _resolve_ffmpeg_executable()
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-headers",
-        _ffmpeg_header_string(_track_stream_headers(source)),
-        "-i",
-        audio_url,
-        "-vn",
-        "-map",
-        "0:a:0",
-        "-ac",
-        str(channels),
-        "-ar",
-        str(normalization.sample_rate),
-        "-t",
-        str(normalization.max_duration_s),
-        "-f",
-        "f32le",
-        "pipe:1",
-    ]
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        timeout=normalization.timeout_s,
-        check=False,
-    )
-    if result.returncode != 0:
-        message = (result.stderr or b"").decode("utf-8", errors="ignore").strip()
-        raise RuntimeError(message or f"ffmpeg exited with {result.returncode}")
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="order-song-normalize-", suffix=".audio", delete=False) as temp:
+            temp.write(audio_bytes)
+            temp_path = temp.name
+        command = [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            temp_path,
+            "-vn",
+            "-map",
+            "0:a:0",
+            "-ac",
+            str(channels),
+            "-ar",
+            str(normalization.sample_rate),
+            "-t",
+            str(normalization.max_duration_s),
+            "-f",
+            "f32le",
+            "pipe:1",
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=normalization.timeout_s,
+            check=False,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or b"").decode("utf-8", errors="ignore").strip()
+            raise RuntimeError(message or f"ffmpeg exited with {result.returncode}")
+        return result.stdout
+    finally:
+        if temp_path:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
+def _compute_track_normalization(source: TrackSource, audio_url: str) -> dict[str, float]:
+    normalization = settings.audio_normalization
+    audio_bytes = _download_audio_for_normalization(source, audio_url)
+    pcm = _run_ffmpeg_pcm(audio_bytes)
     analysis = _estimate_normalization_from_pcm(
-        result.stdout,
-        channels=channels,
+        pcm,
+        channels=2,
         sample_rate=normalization.sample_rate,
     )
     if not analysis:

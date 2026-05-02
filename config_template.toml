@@ -93,6 +93,8 @@ ffmpeg_path = "ffmpeg"
 timeout_s = 45
 # 单首歌最多分析前多少秒，避免超长音频占用后台任务。
 max_duration_s = 600
+# 后端分析时最多下载多少 MB 音频字节；超过则跳过并记录错误。
+max_download_mb = 96
 # 后端响度分析采样率。
 sample_rate = 8000
 # 目标 RMS 和增益边界；前端直接使用后端缓存的固定 gain。
