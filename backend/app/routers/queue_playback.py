@@ -1,9 +1,12 @@
 import asyncio
 import array
+import logging
 import math
 import random
+import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -33,6 +36,7 @@ from app.ws import hub
 
 
 router = APIRouter(prefix="/api", tags=["queue"])
+logger = logging.getLogger(__name__)
 
 
 _UNSET: Any = object()
@@ -432,6 +436,35 @@ def _ffmpeg_header_string(headers: dict[str, str]) -> str:
     return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
 
 
+def _configured_ffmpeg_path() -> str:
+    return settings.audio_normalization.ffmpeg_path.strip().strip("\"'")
+
+
+def _resolve_ffmpeg_executable() -> str:
+    configured = _configured_ffmpeg_path() or "ffmpeg"
+    candidate = Path(configured).expanduser()
+    if candidate.is_dir():
+        for name in ("ffmpeg.exe", "ffmpeg"):
+            nested = candidate / name
+            if nested.exists():
+                return str(nested)
+    if candidate.exists():
+        return str(candidate)
+    found = shutil.which(configured)
+    return found or configured
+
+
+def _ffmpeg_diagnostics() -> dict[str, Any]:
+    configured = _configured_ffmpeg_path() or "ffmpeg"
+    resolved = _resolve_ffmpeg_executable()
+    resolved_path = Path(resolved).expanduser()
+    return {
+        "configured": configured,
+        "resolved": resolved,
+        "available": bool(resolved_path.exists() or shutil.which(resolved)),
+    }
+
+
 def _normalization_recent_error(track: Track) -> bool:
     if not track.normalization_error or not track.normalization_analyzed_at:
         return False
@@ -505,8 +538,9 @@ def _estimate_normalization_from_pcm(raw: bytes, *, channels: int, sample_rate: 
 def _compute_track_normalization(source: TrackSource, audio_url: str) -> dict[str, float]:
     normalization = settings.audio_normalization
     channels = 2
+    ffmpeg = _resolve_ffmpeg_executable()
     command = [
-        normalization.ffmpeg_path,
+        ffmpeg,
         "-hide_banner",
         "-loglevel",
         "error",
@@ -592,6 +626,12 @@ async def _analyze_and_store_track_normalization(track_id: int, *, room_id: int 
                 source = track.source
                 audio_url = track.audio_url
 
+            logger.info(
+                "Starting audio normalization for track_id=%s source=%s ffmpeg=%s",
+                track_id,
+                source.value,
+                _resolve_ffmpeg_executable(),
+            )
             analysis = await asyncio.to_thread(_compute_track_normalization, source, audio_url)
 
             with Session(engine) as db:
@@ -605,6 +645,13 @@ async def _analyze_and_store_track_normalization(track_id: int, *, room_id: int 
                 track.normalization_error = None
                 db.add(track)
                 db.commit()
+            logger.info(
+                "Finished audio normalization for track_id=%s gain=%.3f rms=%.5f peak=%.5f",
+                track_id,
+                analysis["gain"],
+                analysis["rms"],
+                analysis["peak"],
+            )
         except Exception as exc:
             with Session(engine) as db:
                 track = db.get(Track, track_id)
@@ -613,6 +660,7 @@ async def _analyze_and_store_track_normalization(track_id: int, *, room_id: int 
                     track.normalization_error = str(exc)[:240]
                     db.add(track)
                     db.commit()
+            logger.warning("Audio normalization failed for track_id=%s: %s", track_id, exc)
             return
 
     if room_id is not None:
@@ -721,6 +769,48 @@ async def stream_track(track_id: int, request: Request):
         return StreamingResponse(_iter(), media_type=media_type, headers=resp_headers, status_code=r.status_code)
 
     raise HTTPException(status_code=502, detail="all stream attempts failed")
+
+
+@router.get("/tracks/{track_id}/normalization")
+def get_track_normalization(track_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    tr = db.get(Track, track_id)
+    if not tr:
+        raise HTTPException(status_code=404, detail="track not found")
+    task = _NORMALIZATION_TASKS.get(track_id)
+    return {
+        "track_id": track_id,
+        "enabled": settings.audio_normalization.enabled,
+        "running": bool(task and not task.done()),
+        "needs_normalization": _track_needs_normalization(tr),
+        "gain": tr.normalization_gain,
+        "rms": tr.normalization_rms,
+        "peak": tr.normalization_peak,
+        "analyzed_at": tr.normalization_analyzed_at.isoformat() + "Z" if tr.normalization_analyzed_at else None,
+        "error": tr.normalization_error,
+        "ffmpeg": _ffmpeg_diagnostics(),
+    }
+
+
+@router.post("/tracks/{track_id}/normalization/retry")
+async def retry_track_normalization(track_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    tr = db.get(Track, track_id)
+    if not tr:
+        raise HTTPException(status_code=404, detail="track not found")
+    tr.normalization_gain = None
+    tr.normalization_rms = None
+    tr.normalization_peak = None
+    tr.normalization_analyzed_at = None
+    tr.normalization_error = None
+    db.add(tr)
+    db.commit()
+    _schedule_track_normalization(track_id)
+    task = _NORMALIZATION_TASKS.get(track_id)
+    return {
+        "ok": True,
+        "track_id": track_id,
+        "running": bool(task and not task.done()),
+        "ffmpeg": _ffmpeg_diagnostics(),
+    }
 
 
 @router.get("/rooms/{room_id}/queue")

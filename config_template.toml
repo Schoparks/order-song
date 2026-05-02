@@ -86,7 +86,8 @@ search_history_limit = 30
 [audio_normalization]
 # 是否启用后端歌曲级音量均衡分析；需要服务器可执行 ffmpeg。
 enabled = true
-# ffmpeg 可执行文件路径。Windows 可写绝对路径，例如 "D:\\dev\\ffmpeg\\bin\\ffmpeg.exe"。
+# ffmpeg 可执行文件路径。Windows 可写绝对路径，例如 'D:\dev\ffmpeg\bin\ffmpeg.exe'；
+# 也可以写 ffmpeg 所在目录，例如 'D:\dev\ffmpeg\bin'，后端会自动补 ffmpeg.exe。
 ffmpeg_path = "ffmpeg"
 # 单首歌响度分析超时，单位秒；超时会缓存错误并稍后重试，不阻塞播放。
 timeout_s = 45
