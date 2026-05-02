@@ -536,6 +536,7 @@ def _download_audio_for_normalization(source: TrackSource, audio_url: str) -> by
     limit = settings.audio_normalization.max_download_mb * 1024 * 1024
     headers = _track_stream_headers(source)
     headers["Accept-Encoding"] = "identity"
+    headers["Range"] = "bytes=0-"
     data = bytearray()
     with httpx.Client(
         timeout=settings.upstream.stream_timeout_s,
@@ -653,23 +654,53 @@ async def prewarm_track_normalization() -> None:
 async def _analyze_and_store_track_normalization(track_id: int, *, room_id: int | None = None) -> None:
     async with _NORMALIZATION_SEMAPHORE:
         try:
-            with Session(engine) as db:
-                track = db.get(Track, track_id)
-                if not track or not _track_needs_normalization(track):
-                    return
-                await _resolve_audio_url(db, track)
-                if not track.audio_url:
-                    raise RuntimeError("audio url not available")
-                source = track.source
-                audio_url = track.audio_url
+            analysis: dict[str, float] | None = None
+            source: TrackSource | None = None
+            max_attempts = 1
+            for attempt in range(2):
+                with Session(engine) as db:
+                    track = db.get(Track, track_id)
+                    if not track or not _track_needs_normalization(track):
+                        return
+                    source = track.source
+                    if attempt == 0:
+                        max_attempts = 2 if source == TrackSource.bilibili else 1
+                    if attempt >= max_attempts:
+                        break
+                    await _resolve_audio_url(db, track, force=(attempt > 0))
+                    if not track.audio_url:
+                        raise RuntimeError("audio url not available")
+                    audio_url = track.audio_url
 
-            logger.info(
-                "Starting audio normalization for track_id=%s source=%s ffmpeg=%s",
-                track_id,
-                source.value,
-                _resolve_ffmpeg_executable(),
-            )
-            analysis = await asyncio.to_thread(_compute_track_normalization, source, audio_url)
+                logger.info(
+                    "Starting audio normalization for track_id=%s source=%s attempt=%s ffmpeg=%s",
+                    track_id,
+                    source.value,
+                    attempt + 1,
+                    _resolve_ffmpeg_executable(),
+                )
+                try:
+                    analysis = await asyncio.to_thread(_compute_track_normalization, source, audio_url)
+                    break
+                except httpx.HTTPStatusError as exc:
+                    if source == TrackSource.bilibili and attempt + 1 < max_attempts:
+                        logger.warning(
+                            "Audio normalization upstream status for track_id=%s attempt=%s: %s; refreshing Bilibili URL",
+                            track_id,
+                            attempt + 1,
+                            exc.response.status_code,
+                        )
+                        with Session(engine) as db:
+                            track = db.get(Track, track_id)
+                            if track:
+                                track.audio_url = None
+                                db.add(track)
+                                db.commit()
+                        continue
+                    raise
+
+            if analysis is None:
+                raise RuntimeError("normalization analysis did not run")
 
             with Session(engine) as db:
                 track = db.get(Track, track_id)
