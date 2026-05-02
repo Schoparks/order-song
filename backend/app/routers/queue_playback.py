@@ -536,7 +536,7 @@ def _download_audio_for_normalization(source: TrackSource, audio_url: str) -> by
     limit = settings.audio_normalization.max_download_mb * 1024 * 1024
     headers = _track_stream_headers(source)
     headers["Accept-Encoding"] = "identity"
-    headers["Range"] = "bytes=0-"
+    headers["Range"] = f"bytes=0-{limit - 1}"
     data = bytearray()
     with httpx.Client(
         timeout=settings.upstream.stream_timeout_s,
@@ -545,6 +545,9 @@ def _download_audio_for_normalization(source: TrackSource, audio_url: str) -> by
     ) as client:
         with client.stream("GET", audio_url) as response:
             response.raise_for_status()
+            content_type = (response.headers.get("content-type") or "").lower()
+            if content_type.startswith("text/") or "html" in content_type or "json" in content_type:
+                raise RuntimeError(f"unexpected normalization content-type: {content_type}")
             content_length = int(response.headers.get("content-length") or 0)
             if content_length > limit:
                 raise RuntimeError(f"audio too large for normalization: {content_length} bytes")
@@ -554,6 +557,8 @@ def _download_audio_for_normalization(source: TrackSource, audio_url: str) -> by
                     raise RuntimeError(f"audio too large for normalization: >{limit} bytes")
     if not data:
         raise RuntimeError("audio download returned no bytes")
+    if data[:1] == b"<":
+        raise RuntimeError("normalization download returned text/html instead of audio")
     return bytes(data)
 
 

@@ -157,6 +157,7 @@ class AudioNormalizationSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
+    prewarm_on_startup: bool = False
     ffmpeg_path: str = "ffmpeg"
     timeout_s: float = 45.0
     max_duration_s: int = 600

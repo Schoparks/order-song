@@ -42,7 +42,8 @@ def _startup() -> None:
 @app.on_event("startup")
 async def _startup_bg_tasks() -> None:
     asyncio.create_task(_cleanup_stale_members())
-    asyncio.create_task(prewarm_track_normalization())
+    if settings.audio_normalization.prewarm_on_startup:
+        asyncio.create_task(prewarm_track_normalization())
 
 
 async def _cleanup_stale_members() -> None:
