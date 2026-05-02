@@ -1,11 +1,15 @@
 import asyncio
 import json
 from collections import defaultdict
+from contextlib import suppress
 from datetime import datetime
 from typing import Any, Optional
 
 from fastapi.encoders import jsonable_encoder
 from fastapi import WebSocket
+
+
+_BROADCAST_SEND_TIMEOUT_S = 3.0
 
 
 class RoomHub:
@@ -30,11 +34,13 @@ class RoomHub:
 
     async def leave(self, room_id: int, ws: WebSocket) -> None:
         async with self._lock:
+            user_id = self._ws_user.pop(ws, None)
             socks = self._room_sockets.get(room_id)
             if not socks:
+                if user_id is not None:
+                    self._disconnected[room_id][user_id] = datetime.utcnow()
                 return
             socks.discard(ws)
-            user_id = self._ws_user.pop(ws, None)
             if user_id is not None:
                 has_other = any(self._ws_user.get(s) == user_id for s in socks)
                 if not has_other:
@@ -46,11 +52,21 @@ class RoomHub:
         payload = json.dumps(jsonable_encoder(event), ensure_ascii=False)
         async with self._lock:
             sockets = list(self._room_sockets.get(room_id, set()))
-        for ws in sockets:
+        if not sockets:
+            return
+
+        async def _send(ws: WebSocket) -> WebSocket | None:
             try:
-                await ws.send_text(payload)
+                await asyncio.wait_for(ws.send_text(payload), timeout=_BROADCAST_SEND_TIMEOUT_S)
+                return None
             except Exception:
-                pass
+                return ws
+
+        failed = [ws for ws in await asyncio.gather(*(_send(ws) for ws in sockets)) if ws is not None]
+        for ws in failed:
+            await self.leave(room_id, ws)
+            with suppress(Exception):
+                await ws.close()
 
     async def get_stale_users(self, timeout_seconds: int = 1800) -> list[tuple[int, int]]:
         now = datetime.utcnow()

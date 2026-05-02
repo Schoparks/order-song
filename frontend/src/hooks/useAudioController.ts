@@ -244,10 +244,10 @@ export function useAudioController(roomId: number | null, token: string | null) 
     attempt(retries);
   }, [audio, clearPlayRetry]);
 
-  const reloadCurrentStream = useCallback((retries = 1) => {
+  const reloadCurrentStream = useCallback((retries = 1, ignoreCooldown = false) => {
     if (!audio.src) return;
     const now = Date.now();
-    if (now - lastStreamReloadAtRef.current < STREAM_RELOAD_COOLDOWN_MS) return;
+    if (!ignoreCooldown && now - lastStreamReloadAtRef.current < STREAM_RELOAD_COOLDOWN_MS) return;
     lastStreamReloadAtRef.current = now;
     lastAudioProgressAtRef.current = now;
     const targetMs = getRoomPositionMs();
@@ -485,6 +485,23 @@ export function useAudioController(roomId: number | null, token: string | null) 
       window.removeEventListener("keydown", onUserActivation);
     };
   }, [normalizerEnabled, playback?.is_playing, playEnabled, requestAudioPlay, unlockAudio]);
+
+  useEffect(() => {
+    const recoverPlayback = () => {
+      if (!playEnabled || !playback?.is_playing || !hasTrack) return;
+      syncAudioToRoomRef.current(true, true);
+      reloadCurrentStream(2, true);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") recoverPlayback();
+    };
+    window.addEventListener("online", recoverPlayback);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("online", recoverPlayback);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [hasTrack, playback?.is_playing, playEnabled, reloadCurrentStream]);
 
   useEffect(() => () => {
     clearPlayRetry();

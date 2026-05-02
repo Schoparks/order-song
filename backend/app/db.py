@@ -1,9 +1,14 @@
 import sqlite3
 from pathlib import Path
 
+from sqlalchemy import event
+from sqlalchemy.pool import NullPool
 from sqlmodel import Session, SQLModel, create_engine, func, select
 
 from app.core.config import settings
+
+
+_SQLITE_BUSY_TIMEOUT_MS = 30_000
 
 
 def _db_url() -> str:
@@ -11,7 +16,36 @@ def _db_url() -> str:
 
 
 Path(settings.sqlite_path).parent.mkdir(parents=True, exist_ok=True)
-engine = create_engine(_db_url(), connect_args={"check_same_thread": False})
+engine = create_engine(
+    _db_url(),
+    connect_args={
+        "check_same_thread": False,
+        "timeout": _SQLITE_BUSY_TIMEOUT_MS / 1000,
+    },
+    poolclass=NullPool,
+)
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+    finally:
+        cursor.close()
+
+
+def _configure_sqlite_database() -> None:
+    conn = sqlite3.connect(settings.sqlite_path, timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.DatabaseError:
+            pass
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _migrate_columns():
@@ -41,6 +75,7 @@ def _migrate_columns():
 def init_db() -> None:
     from app import models  # noqa: F401
 
+    _configure_sqlite_database()
     SQLModel.metadata.create_all(engine)
     _migrate_columns()
     _bootstrap_default_admin()

@@ -182,6 +182,16 @@ def _get_existing_queue_item(db: Session, room_id: int, track_id: int) -> RoomQu
     ).first()
 
 
+def _playback_track_payload(track: Track) -> dict[str, Any]:
+    payload = TrackOut.model_validate(track).model_dump(mode="json")
+    if track.id and (
+        track.source in (TrackSource.netease, TrackSource.bilibili)
+        or (track.audio_url and track.audio_url.startswith(("http://", "https://")))
+    ):
+        payload["audio_url"] = f"/api/tracks/{track.id}/stream"
+    return payload
+
+
 def _record_track_order(db: Session, track_id: int, ordered_at: datetime) -> None:
     stats = db.get(TrackOrderStats, track_id)
     if not stats:
@@ -887,8 +897,8 @@ async def retry_track_normalization(track_id: int, db: Session = Depends(get_db)
 
 
 @router.get("/rooms/{room_id}/queue")
-def get_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+async def get_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    await _require_active_room_member(db, room_id, user)
     items = db.exec(
         select(RoomQueueItem, Track, User)
         .join(Track, Track.id == RoomQueueItem.track_id)
@@ -911,8 +921,8 @@ def get_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(
 
 
 @router.get("/rooms/{room_id}/history")
-def get_history(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+async def get_history(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    await _require_active_room_member(db, room_id, user)
     items = db.exec(
         select(RoomQueueItem, Track, User)
         .join(Track, Track.id == RoomQueueItem.track_id)
@@ -1135,10 +1145,7 @@ async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
                 ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
             if tr:
-                await _resolve_audio_url(db, tr)
-                current_track = TrackOut.model_validate(tr).model_dump(mode="json")
-                if tr.audio_url:
-                    current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
+                current_track = _playback_track_payload(tr)
                 if _track_needs_normalization(tr):
                     _schedule_track_normalization(tr.id, room_id)
 
@@ -1205,10 +1212,8 @@ async def _set_playback(
             db.add(qi)
             db.commit()
             tr = db.get(Track, qi.track_id)
-            if tr:
-                await _resolve_audio_url(db, tr)
-                if _track_needs_normalization(tr):
-                    _schedule_track_normalization(tr.id, room_id)
+            if tr and _track_needs_normalization(tr):
+                _schedule_track_normalization(tr.id, room_id)
     elif current_queue_item_id is not _UNSET:
         playing_items = db.exec(
             select(RoomQueueItem).where(

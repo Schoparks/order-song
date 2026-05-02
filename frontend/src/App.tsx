@@ -64,6 +64,9 @@ const IOS_VIEWPORT_TOP_OFFSET_LIMIT = 80;
 const TOKEN_STORAGE_KEY = "token";
 const SESSION_USER_ID_KEY = "sessionUserId";
 const LEGACY_ROOM_ID_KEY = "roomId";
+const WS_HEARTBEAT_INTERVAL_MS = 25000;
+const WS_HEARTBEAT_TIMEOUT_MS = 55000;
+const WS_BUFFERED_CLOSE_THRESHOLD = 512 * 1024;
 let stableViewportHeight = 0;
 let stableViewportWidth = 0;
 let freezeViewportUntil = 0;
@@ -668,19 +671,55 @@ export function App() {
     if (!token || !roomId) return;
     let closed = false;
     let reconnectTimer = 0;
+    let heartbeatTimer = 0;
     let attempt = 0;
+    let lastWsMessageAt = Date.now();
     let ws: WebSocket | null = null;
+
+    function stopHeartbeat() {
+      window.clearInterval(heartbeatTimer);
+      heartbeatTimer = 0;
+    }
+
+    function closeStaleSocket() {
+      if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) return;
+      try {
+        ws.close();
+      } catch {
+        // The close event will reconnect when possible.
+      }
+    }
+
+    function startHeartbeat() {
+      stopHeartbeat();
+      heartbeatTimer = window.setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (Date.now() - lastWsMessageAt > WS_HEARTBEAT_TIMEOUT_MS || ws.bufferedAmount > WS_BUFFERED_CLOSE_THRESHOLD) {
+          closeStaleSocket();
+          return;
+        }
+        try {
+          ws.send(JSON.stringify({ type: "ping" }));
+        } catch {
+          closeStaleSocket();
+        }
+      }, WS_HEARTBEAT_INTERVAL_MS);
+    }
 
     function connect() {
       const protocol = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${protocol}://${location.host}${withBase("/ws")}`);
       ws.addEventListener("open", () => {
         attempt = 0;
+        lastWsMessageAt = Date.now();
         ws?.send(JSON.stringify({ type: "join_room", room_id: roomId, token }));
+        startHeartbeat();
       });
       ws.addEventListener("message", async (event) => {
+        lastWsMessageAt = Date.now();
         try {
           const msg = JSON.parse(event.data) as WsMessage;
+          if (msg.type === "joined" || msg.type === "pong") return;
           if (isPlaybackMessage(msg)) {
             applyPlaybackEnvelope(msg);
             refreshRoomData();
@@ -700,7 +739,9 @@ export function App() {
           // Ignore malformed messages.
         }
       });
+      ws.addEventListener("error", closeStaleSocket);
       ws.addEventListener("close", () => {
+        stopHeartbeat();
         if (closed || !roomId) return;
         const delay = Math.min(30000, 1000 * 2 ** attempt);
         attempt += 1;
@@ -712,6 +753,7 @@ export function App() {
     return () => {
       closed = true;
       window.clearTimeout(reconnectTimer);
+      stopHeartbeat();
       ws?.close();
     };
   }, [applyPlaybackEnvelope, handleRoomGone, meQuery.data, queryClient, refreshRoomData, roomId, token]);

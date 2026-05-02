@@ -6,14 +6,14 @@ from sqlmodel import Session, delete, func, select
 from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, User
-from app.schemas import CreateRoomIn, RoomOut, TrackOut
+from app.schemas import CreateRoomIn, RoomOut
 from app.routers.queue_playback import (
     _require_active_room_member,
     _pick_next_queue_item_id,
+    _playback_track_payload,
     _playback_lock,
     _playback_state_payload,
     _require_room_member,
-    _resolve_audio_url,
     _schedule_track_normalization,
     _set_playback,
     _track_needs_normalization,
@@ -48,8 +48,8 @@ def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_u
 
 
 @router.get("/rooms/{room_id}/members")
-def get_room_members(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    _require_room_member(db, room_id, user)
+async def get_room_members(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    await _require_active_room_member(db, room_id, user)
     members = db.exec(
         select(User.id, User.username)
         .join(RoomMember, RoomMember.user_id == User.id)
@@ -90,6 +90,7 @@ async def join_room(room_id: int, db: Session = Depends(get_db), user: User = De
     user.last_active_room_id = room_id
     db.add(user)
     db.commit()
+    await hub.note_activity(room_id, user.id)
     await hub.broadcast(room_id, {"type": "room_member_joined", "room_id": room_id, "user_id": user.id})
     return {"ok": True}
 
@@ -126,11 +127,13 @@ async def remove_member_from_room(db: Session, room_id: int, user_id: int) -> bo
 
 
 @router.get("/rooms/{room_id}/check")
-def check_room(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+async def check_room(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     room = db.get(Room, room_id)
     if not room:
         return {"exists": False, "is_member": False}
     member = db.exec(select(RoomMember).where(RoomMember.room_id == room_id, RoomMember.user_id == user.id)).first()
+    if member:
+        await hub.note_activity(room_id, user.id)
     return {"exists": True, "is_member": bool(member)}
 
 
@@ -196,10 +199,7 @@ async def room_state(room_id: int, db: Session = Depends(get_db), user: User = D
                 ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
             if tr:
-                await _resolve_audio_url(db, tr)
-                current_track = TrackOut.model_validate(tr).model_dump(mode="json")
-                if tr.audio_url:
-                    current_track["audio_url"] = f"/api/tracks/{tr.id}/stream"
+                current_track = _playback_track_payload(tr)
                 if _track_needs_normalization(tr):
                     _schedule_track_normalization(tr.id, room_id)
     return {

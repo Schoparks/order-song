@@ -120,6 +120,7 @@ def index():
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     joined_room_id: int | None = None
+    joined_user_id: int | None = None
     try:
         while True:
             raw = await ws.receive_text()
@@ -160,8 +161,13 @@ async def websocket_endpoint(ws: WebSocket):
                 if joined_room_id is not None:
                     await hub.leave(joined_room_id, ws)
                 joined_room_id = room_id
+                joined_user_id = user_id
                 await hub.join(room_id, ws, user_id=user_id)
                 await ws.send_text('{"type":"joined","ok":true}')
+            elif mtype == "ping":
+                if joined_room_id is not None and joined_user_id is not None:
+                    await hub.note_activity(joined_room_id, joined_user_id)
+                await ws.send_text('{"type":"pong"}')
             else:
                 await ws.send_text('{"type":"error","message":"unknown message type"}')
     except WebSocketDisconnect:
