@@ -16,6 +16,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 from sqlmodel import Session, select
 
+from app.bilibili import (
+    bilibili_page_url,
+    find_bilibili_page,
+    normalize_bilibili_pic,
+    parse_bilibili_source_track_id,
+)
 from app.core.config import settings
 from app.db import engine
 from app.deps import get_current_user, get_db
@@ -201,16 +207,8 @@ def _record_track_order(db: Session, track_id: int, ordered_at: datetime) -> Non
     db.add(stats)
 
 
-def _normalize_bilibili_pic(value: Any) -> Optional[str]:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    pic = value.strip()
-    if pic.startswith("//"):
-        return f"https:{pic}"
-    return pic
-
-
-async def _fetch_bilibili_video_metadata(bv: str) -> dict[str, Any] | None:
+async def _fetch_bilibili_video_metadata(source_track_id: str) -> dict[str, Any] | None:
+    ref = parse_bilibili_source_track_id(source_track_id)
     try:
         async with httpx.AsyncClient(
             timeout=settings.upstream.bilibili_audio_timeout_s,
@@ -221,7 +219,7 @@ async def _fetch_bilibili_video_metadata(bv: str) -> dict[str, Any] | None:
         ) as client:
             r = await client.get(
                 "https://api.bilibili.com/x/web-interface/view",
-                params={"bvid": bv},
+                params={"bvid": ref.bvid},
             )
             r.raise_for_status()
             data = r.json()
@@ -239,10 +237,17 @@ async def _ensure_bilibili_metadata(db: Session, track: Track) -> dict[str, Any]
     if not video:
         return None
 
+    ref = parse_bilibili_source_track_id(track.source_track_id)
+    page = find_bilibili_page(video, ref)
     changed = False
-    cover_url = _normalize_bilibili_pic(video.get("pic"))
+    cover_url = normalize_bilibili_pic(video.get("pic"))
     owner = video.get("owner") or {}
-    duration = video.get("duration")
+    video_duration = video.get("duration")
+    page_duration = page.get("duration") if page else None
+    target_duration = page_duration if ref.is_part and page_duration is not None else video_duration
+    video_duration_ms = int(video_duration) * 1000 if isinstance(video_duration, (int, float)) else None
+    target_duration_ms = int(target_duration) * 1000 if isinstance(target_duration, (int, float)) else None
+    part_title = str(page.get("part") or "").strip() if page else ""
 
     if cover_url and not track.cover_url:
         track.cover_url = cover_url
@@ -250,10 +255,17 @@ async def _ensure_bilibili_metadata(db: Session, track: Track) -> dict[str, Any]
     if isinstance(owner, dict) and owner.get("name") and not track.artist:
         track.artist = owner["name"]
         changed = True
-    if duration is not None and not track.duration_ms:
-        track.duration_ms = int(duration) * 1000
+    if target_duration_ms and (not track.duration_ms or (ref.is_part and track.duration_ms == video_duration_ms)):
+        track.duration_ms = target_duration_ms
         changed = True
-    if video.get("title") and (not track.title or track.title == track.source_track_id):
+    if ref.is_part and part_title and (
+        not track.title
+        or track.title == track.source_track_id
+        or track.title == video.get("title")
+    ):
+        track.title = part_title
+        changed = True
+    elif video.get("title") and (not track.title or track.title == track.source_track_id):
         track.title = video["title"]
         changed = True
 
@@ -352,7 +364,7 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         audio_url = await _resolve_bilibili_audio(track.source_track_id, video_data=video)
 
         if not audio_url:
-            page_url = f"https://www.bilibili.com/video/{track.source_track_id}"
+            page_url = bilibili_page_url(track.source_track_id)
 
             def _run() -> Optional[str]:
                 try:
@@ -382,8 +394,9 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     return None
 
 
-async def _resolve_bilibili_audio(bv: str, *, video_data: dict[str, Any] | None = None) -> Optional[str]:
+async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str, Any] | None = None) -> Optional[str]:
     """Resolve audio stream URL via bilibili's playurl API (no yt-dlp needed)."""
+    ref = parse_bilibili_source_track_id(source_track_id)
     try:
         async with httpx.AsyncClient(timeout=settings.upstream.bilibili_audio_timeout_s, headers={
             "User-Agent": "Mozilla/5.0",
@@ -393,7 +406,7 @@ async def _resolve_bilibili_audio(bv: str, *, video_data: dict[str, Any] | None 
             if not vid:
                 r = await client.get(
                     "https://api.bilibili.com/x/web-interface/view",
-                    params={"bvid": bv},
+                    params={"bvid": ref.bvid},
                 )
                 r.raise_for_status()
                 data = r.json()
@@ -402,15 +415,14 @@ async def _resolve_bilibili_audio(bv: str, *, video_data: dict[str, Any] | None 
                 vid = data["data"]
             if not vid:
                 return None
-            cid = vid.get("cid")
-            if not cid and vid.get("pages"):
-                cid = vid["pages"][0].get("cid")
+            page = find_bilibili_page(vid, ref)
+            cid = ref.cid or (page.get("cid") if page else None) or vid.get("cid")
             if not cid:
                 return None
 
             r = await client.get(
                 "https://api.bilibili.com/x/player/playurl",
-                params={"bvid": bv, "cid": cid, "fnval": 16, "fnver": 0, "fourk": 1},
+                params={"bvid": ref.bvid, "cid": cid, "fnval": 16, "fnver": 0, "fourk": 1},
             )
             r.raise_for_status()
             data = r.json()

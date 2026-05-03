@@ -5,10 +5,11 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.bilibili import make_bilibili_source_track_id, normalize_bilibili_pic
 from app.core.config import settings
 from app.deps import get_current_user
 from app.models import TrackSource, User
-from app.schemas import SearchTrackOut
+from app.schemas import SearchTrackOut, SearchTrackPartOut
 
 
 router = APIRouter(prefix="/api", tags=["search"])
@@ -94,6 +95,58 @@ async def _bili_search(keyword: str, page: int = 1) -> list[dict[str, Any]]:
     raise HTTPException(status_code=400, detail="bilibili search api error")
 
 
+def _clean_bili_title(value: Any) -> str:
+    return str(value or "").replace("<em class=\"keyword\">", "").replace("</em>", "").strip()
+
+
+def _bili_video_to_search_track(
+    video: dict[str, Any],
+    *,
+    bvid: str,
+    fallback_title: str | None = None,
+    fallback_artist: str | None = None,
+    fallback_duration_ms: int | None = None,
+    fallback_cover_url: str | None = None,
+) -> SearchTrackOut:
+    owner = video.get("owner") or {}
+    artist = owner.get("name") if isinstance(owner, dict) else None
+    cover_url = normalize_bilibili_pic(video.get("pic")) or normalize_bilibili_pic(fallback_cover_url)
+    title = video.get("title") or fallback_title or bvid
+    duration = video.get("duration")
+    duration_ms = int(duration * 1000) if isinstance(duration, (int, float)) else fallback_duration_ms
+
+    parts: list[SearchTrackPartOut] = []
+    pages = video.get("pages")
+    if isinstance(pages, list) and len(pages) > 1:
+        for index, page in enumerate(pages):
+            if not isinstance(page, dict):
+                continue
+            page_no = page.get("page") if isinstance(page.get("page"), int) else index + 1
+            cid = page.get("cid") if isinstance(page.get("cid"), int) else None
+            part_title = str(page.get("part") or "").strip() or f"{title} P{page_no}"
+            part_duration = page.get("duration")
+            parts.append(
+                SearchTrackPartOut(
+                    source=TrackSource.bilibili,
+                    source_track_id=make_bilibili_source_track_id(bvid, page=page_no, cid=cid),
+                    title=part_title,
+                    artist=artist or fallback_artist,
+                    duration_ms=int(part_duration * 1000) if isinstance(part_duration, (int, float)) else None,
+                    cover_url=cover_url,
+                )
+            )
+
+    return SearchTrackOut(
+        source=TrackSource.bilibili,
+        source_track_id=bvid,
+        title=title,
+        artist=artist or fallback_artist,
+        duration_ms=duration_ms,
+        cover_url=cover_url,
+        parts=parts,
+    )
+
+
 @router.get("/search", response_model=list[SearchTrackOut])
 async def search(q: str, user: User = Depends(get_current_user)):
     q = q.strip()
@@ -122,35 +175,43 @@ async def search(q: str, user: User = Depends(get_current_user)):
             bv = m.group(1)
             try:
                 v = await _bili_video_by_bv(bv)
-                return [
-                    SearchTrackOut(
-                        source=TrackSource.bilibili,
-                        source_track_id=bv,
-                        title=v.get("title") or bv,
-                        artist=(v.get("owner") or {}).get("name"),
-                        duration_ms=int((v.get("duration") or 0) * 1000) if v.get("duration") is not None else None,
-                        cover_url=v.get("pic"),
-                    )
-                ]
+                return [_bili_video_to_search_track(v, bvid=bv)]
             except Exception:
                 # BV 号检索不到对应视频：不返回结果
                 return []
 
         try:
             results = await _bili_search(q, page=1)
-            out2: list[SearchTrackOut] = []
+            raw_items: list[SearchTrackOut] = []
             for item in results[: settings.search.bilibili.result_limit]:
                 bvid = item.get("bvid")
                 if not bvid:
                     continue
-                out2.append(
+                raw_items.append(
                     SearchTrackOut(
                         source=TrackSource.bilibili,
                         source_track_id=bvid,
-                        title=(item.get("title") or "").replace("<em class=\"keyword\">", "").replace("</em>", ""),
+                        title=_clean_bili_title(item.get("title")),
                         artist=item.get("author"),
                         duration_ms=_parse_bili_duration_ms(item.get("duration")),
-                        cover_url=("https:" + item["pic"]) if isinstance(item.get("pic"), str) and item["pic"].startswith("//") else item.get("pic"),
+                        cover_url=normalize_bilibili_pic(item.get("pic")),
+                    )
+                )
+            detail_tasks = [_bili_video_by_bv(item.source_track_id) for item in raw_items]
+            details = await asyncio.gather(*detail_tasks, return_exceptions=True)
+            out2: list[SearchTrackOut] = []
+            for item, detail in zip(raw_items, details):
+                if isinstance(detail, Exception):
+                    out2.append(item)
+                    continue
+                out2.append(
+                    _bili_video_to_search_track(
+                        detail,
+                        bvid=item.source_track_id,
+                        fallback_title=item.title,
+                        fallback_artist=item.artist,
+                        fallback_duration_ms=item.duration_ms,
+                        fallback_cover_url=item.cover_url,
                     )
                 )
             return out2
@@ -209,4 +270,3 @@ async def search(q: str, user: User = Depends(get_current_user)):
         out.extend(r)
 
     return _dedupe(out)[: settings.search.aggregate_limit]
-

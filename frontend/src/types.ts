@@ -36,6 +36,7 @@ export interface Track {
   normalization_rms?: number | null;
   normalization_peak?: number | null;
   normalization_analyzed_at?: string | null;
+  parts?: Track[];
 }
 
 export interface QueueItem {

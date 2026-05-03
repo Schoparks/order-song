@@ -1130,6 +1130,7 @@ function TrackList({
   queuedKeys,
   playlistMap,
   onChanged,
+  expandBilibiliParts = false,
 }: {
   items: Array<{ track: Track; meta?: string }>;
   token: string;
@@ -1138,6 +1139,7 @@ function TrackList({
   queuedKeys: Set<string>;
   playlistMap: Record<string, PlaylistMembership[]>;
   onChanged: () => void;
+  expandBilibiliParts?: boolean;
 }) {
   if (!items.length) return <EmptyState title="暂无内容" />;
   return (
@@ -1151,8 +1153,11 @@ function TrackList({
           roomId={roomId}
           playlists={playlists}
           queued={queuedKeys.has(trackKey(track))}
+          queuedKeys={queuedKeys}
+          playlistMap={playlistMap}
           playlistMemberships={playlistMap[trackKey(track)] || []}
           onChanged={onChanged}
+          expandBilibiliParts={expandBilibiliParts}
         />
       ))}
     </div>
@@ -1166,8 +1171,11 @@ function TrackRow({
   roomId,
   playlists,
   queued,
+  queuedKeys,
+  playlistMap,
   playlistMemberships,
   onChanged,
+  expandBilibiliParts,
 }: {
   track: Track;
   meta?: string;
@@ -1175,42 +1183,78 @@ function TrackRow({
   roomId: number;
   playlists: Playlist[];
   queued: boolean;
+  queuedKeys: Set<string>;
+  playlistMap: Record<string, PlaylistMembership[]>;
   playlistMemberships: PlaylistMembership[];
   onChanged: () => void;
+  expandBilibiliParts: boolean;
 }) {
   const [busy, setBusy] = useState<"queue" | "playlist" | null>(null);
+  const [expanded, setExpanded] = useState(false);
   const playlisted = playlistMemberships.length > 0;
+  const parts = track.source === "bilibili" && Array.isArray(track.parts) ? track.parts : [];
+  const expandable = expandBilibiliParts && parts.length > 0;
   return (
-    <article className="songRow">
-      <TrackCover track={track} />
-      <div className="songInfo">
-        <strong>{track.title}</strong>
-        <span>{meta || `${track.source} · ${track.artist || "-"}`}</span>
-      </div>
-      <div className="rowActions">
-        <button
-          className={`smallButton ${queued ? "active" : ""}`}
-          disabled={busy === "queue"}
-          onClick={async () => {
-            setBusy("queue");
-            await api(`/api/rooms/${roomId}/queue`, { method: "POST", token, json: trackPayload(track) }).finally(() => setBusy(null));
-            onChanged();
-          }}
-        >
-          <BadgePlus />{queued ? "已点" : "点歌"}
-        </button>
-        <PlaylistQuickButton
-          track={track}
-          token={token}
-          playlists={playlists}
-          memberships={playlistMemberships}
-          playlisted={playlisted}
-          busy={busy === "playlist"}
-          setBusy={(value) => setBusy(value ? "playlist" : null)}
-          onChanged={onChanged}
-        />
-      </div>
-    </article>
+    <>
+      <article className={`songRow ${expandable ? "songRowExpandable" : ""}`}>
+        <TrackCover track={track} />
+        <div className="songInfo">
+          <strong>{track.title}</strong>
+          <span>{meta || `${track.source} · ${track.artist || "-"}`}</span>
+        </div>
+        <div className="rowActions">
+          {expandable ? (
+            <button
+              className={`smallButton ${expanded ? "active" : ""}`}
+              aria-expanded={expanded}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              <ListMusic />{expanded ? "收起" : "展开"}
+            </button>
+          ) : (
+            <>
+              <button
+                className={`smallButton ${queued ? "active" : ""}`}
+                disabled={busy === "queue"}
+                onClick={async () => {
+                  setBusy("queue");
+                  await api(`/api/rooms/${roomId}/queue`, { method: "POST", token, json: trackPayload(track) }).finally(() => setBusy(null));
+                  onChanged();
+                }}
+              >
+                <BadgePlus />{queued ? "已点" : "点歌"}
+              </button>
+              <PlaylistQuickButton
+                track={track}
+                token={token}
+                playlists={playlists}
+                memberships={playlistMemberships}
+                playlisted={playlisted}
+                busy={busy === "playlist"}
+                setBusy={(value) => setBusy(value ? "playlist" : null)}
+                onChanged={onChanged}
+              />
+            </>
+          )}
+        </div>
+      </article>
+      {expandable && expanded && (
+        <div className="songPartsCard" role="region" aria-label={`${track.title} 分P`}>
+          <TrackList
+            items={parts.map((part, index) => ({
+              track: part,
+              meta: `P${index + 1} · ${part.source} · ${part.artist || "-"}`,
+            }))}
+            token={token}
+            roomId={roomId}
+            playlists={playlists}
+            queuedKeys={queuedKeys}
+            playlistMap={playlistMap}
+            onChanged={onChanged}
+          />
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1458,13 +1502,19 @@ function SearchOverlay({
         </div>
         <ScrollArea className="searchResults">
           <TrackList
-            items={results.map((track) => ({ track }))}
+            items={results.map((track) => ({
+              track,
+              meta: track.source === "bilibili" && track.parts?.length
+                ? `bilibili · ${track.artist || "-"} · ${track.parts.length}P`
+                : undefined,
+            }))}
             token={token}
             roomId={roomId}
             playlists={playlists}
             queuedKeys={queuedKeys}
             playlistMap={playlistMap}
             onChanged={onChanged}
+            expandBilibiliParts
           />
         </ScrollArea>
       </section>

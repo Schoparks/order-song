@@ -68,13 +68,17 @@ class TrackOut(BaseModel):
     normalization_analyzed_at: Optional[datetime] = None
 
 
-class SearchTrackOut(BaseModel):
+class SearchTrackPartOut(BaseModel):
     source: TrackSource
     source_track_id: str
     title: str
     artist: Optional[str] = None
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
+
+
+class SearchTrackOut(SearchTrackPartOut):
+    parts: list[SearchTrackPartOut] = Field(default_factory=list)
 
 
 class PlaybackStateOut(BaseModel):
