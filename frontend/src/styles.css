@@ -814,6 +814,30 @@ input[type="range"] {
   font-size: 13px;
 }
 
+.normalizerBadge {
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  color: rgba(18, 34, 45, 0.72);
+  background: rgba(255, 255, 255, 0.48);
+}
+
+.normalizerBadge.active {
+  color: rgba(20, 95, 66, 0.94);
+  background: rgba(89, 210, 145, 0.22);
+}
+
+.normalizerBadge.metadata {
+  color: rgba(31, 93, 130, 0.94);
+  background: rgba(95, 175, 230, 0.22);
+}
+
+.normalizerBadge.bypassed {
+  color: rgba(112, 78, 24, 0.94);
+  background: rgba(242, 185, 84, 0.24);
+}
+
 .overlay {
   position: fixed;
   inset: 0;

@@ -62,10 +62,10 @@ class TrackOut(BaseModel):
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
     audio_url: Optional[str] = None
-    normalization_gain: Optional[float] = None
-    normalization_rms: Optional[float] = None
-    normalization_peak: Optional[float] = None
-    normalization_analyzed_at: Optional[datetime] = None
+    loudness_gain_db: Optional[float] = None
+    loudness_peak: Optional[float] = None
+    loudness_source: Optional[str] = None
+    loudness_error: Optional[str] = None
 
 
 class SearchTrackPartOut(BaseModel):

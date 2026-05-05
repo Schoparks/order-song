@@ -514,8 +514,6 @@ export function App() {
   const [hint, setHint] = useState("");
   const queueTabInPrimary = useMediaQuery("(max-width: 1100px)");
 
-  const audio = useAudioController(roomId, token);
-
   const configQuery = useQuery({
     queryKey: ["public-config"],
     queryFn: () => api<PublicConfig>("/api/config"),
@@ -547,6 +545,8 @@ export function App() {
     queryFn: () => api<QueueItem[]>(`/api/rooms/${roomId}/queue`, { token }),
     enabled: !!token && !!roomId,
   });
+
+  const audio = useAudioController(roomId, token, queueQuery.data || []);
 
   const historyQuery = useQuery({
     queryKey: ["history", roomId, token],
@@ -1815,6 +1815,15 @@ function QueueTabs(props: {
 function PlayerBar({ audio }: { audio: ReturnType<typeof useAudioController> }) {
   const title = audio.track?.title || "未播放";
   const meta = audio.track ? `${audio.track.artist || "-"} · ${audio.track.source}${audio.orderedBy?.username ? ` · ${audio.orderedBy.username} 点播` : ""}` : "-";
+  const normalizerTitle = audio.normalizerEnabled
+    ? audio.normalizerState === "active"
+      ? "音量均衡已应用"
+      : audio.normalizerState === "metadata"
+        ? "已使用上游响度元数据做隐藏音量修正"
+      : audio.playEnabled
+        ? "当前直链音频无法被浏览器读取实际响度，已跳过"
+        : "切到可播放后尝试音量均衡"
+    : "音量均衡";
   return (
     <footer className="playerBar glassPanel">
       <div className="nowPlaying">
@@ -1843,9 +1852,10 @@ function PlayerBar({ audio }: { audio: ReturnType<typeof useAudioController> }) 
         <div className="volumeCluster">
           <button className="iconButton" onClick={audio.toggleMute}>{audio.volume > 0 ? <Volume2 /> : <VolumeX />}</button>
           <input type="range" min={0} max={100} value={audio.volume} disabled={!audio.playEnabled} onChange={(e) => audio.setVolume(Number(e.target.value))} />
-          <label className="checkPill">
+          <label className="checkPill" title={normalizerTitle}>
             <input type="checkbox" checked={audio.normalizerEnabled} onChange={(e) => audio.setNormalizerEnabled(e.target.checked)} />
             <Gauge />音量均衡
+            {audio.normalizerStatusLabel ? <span className={`normalizerBadge ${audio.normalizerState}`}>{audio.normalizerStatusLabel}</span> : null}
           </label>
         </div>
       </div>

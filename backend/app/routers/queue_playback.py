@@ -1,21 +1,18 @@
 import asyncio
-import array
-import logging
-import math
 import random
-import shutil
-import tempfile
 import subprocess
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
-from starlette.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException
+from starlette.responses import Response
 from sqlmodel import Session, select
 
+from app.audio_loudness import analyze_remote_audio_loudness
 from app.bilibili import (
     bilibili_page_url,
     find_bilibili_page,
@@ -29,6 +26,7 @@ from app.models import (
     QueueStatus,
     Room,
     RoomMember,
+    RoomMode,
     RoomPlaybackState,
     RoomQueueItem,
     Track,
@@ -43,20 +41,29 @@ from app.ws import hub
 
 
 router = APIRouter(prefix="/api", tags=["queue"])
-logger = logging.getLogger(__name__)
 
 
 _UNSET: Any = object()
 _PLAYBACK_LOCKS: dict[int, asyncio.Lock] = {}
-_NORMALIZATION_TASKS: dict[int, asyncio.Task] = {}
-_NORMALIZATION_SEMAPHORE = asyncio.Semaphore(1)
-_NORMALIZATION_ERROR_RETRY_SECONDS = 3600
-_NORMALIZATION_PREWARM_LIMIT = 200
+_AUDIO_URL_RESOLVE_ERRORS: dict[int, float] = {}
+_AUDIO_URL_ERROR_RETRY_SECONDS = 30
+_LOUDNESS_ANALYSIS_TASKS: dict[int, asyncio.Task] = {}
+_LOUDNESS_ERROR_RETRY_SECONDS = 3600
+_LOUDNESS_ANALYSIS_SEMAPHORE = asyncio.Semaphore(1)
 _COVER_PROXY_HOST_SUFFIXES = (
     "bilibili.com",
     "biliimg.com",
     "hdslb.com",
 )
+
+
+@dataclass
+class AudioResolveResult:
+    audio_url: str | None = None
+    analysis_audio_url: str | None = None
+    loudness_gain_db: float | None = None
+    loudness_peak: float | None = None
+    loudness_source: str | None = None
 
 
 def _playback_lock(room_id: int) -> asyncio.Lock:
@@ -188,13 +195,154 @@ def _get_existing_queue_item(db: Session, room_id: int, track_id: int) -> RoomQu
     ).first()
 
 
+def _direct_playback_audio_url(track: Track) -> str | None:
+    if track.audio_url:
+        return track.audio_url
+    if track.source == TrackSource.netease:
+        return f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
+    return None
+
+
+def _is_bilibili_browser_direct_url(audio_url: str | None) -> bool:
+    if not audio_url:
+        return False
+    path = urlparse(audio_url).path.lower()
+    return path.endswith(".mp4")
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (number == number and number not in (float("inf"), float("-inf"))):
+        return None
+    return number
+
+
+def _clamp_loudness_gain_db(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return max(-12.0, min(12.0, value))
+
+
+def _store_loudness_metadata(track: Track, result: AudioResolveResult) -> None:
+    if result.loudness_gain_db is None and result.loudness_peak is None:
+        return
+    track.loudness_gain_db = _clamp_loudness_gain_db(result.loudness_gain_db)
+    track.loudness_peak = result.loudness_peak
+    track.loudness_source = result.loudness_source
+    track.loudness_fetched_at = datetime.utcnow()
+    track.loudness_error = None
+
+
+def _store_loudness_error(track: Track, error: str) -> None:
+    track.loudness_error = error[:240]
+    track.loudness_fetched_at = datetime.utcnow()
+
+
+def _result_has_loudness(result: AudioResolveResult) -> bool:
+    return result.loudness_gain_db is not None or result.loudness_peak is not None
+
+
+def _recent_loudness_error(track: Track) -> bool:
+    if not track.loudness_error or not track.loudness_fetched_at:
+        return False
+    age_s = (datetime.utcnow() - track.loudness_fetched_at).total_seconds()
+    return age_s < _LOUDNESS_ERROR_RETRY_SECONDS
+
+
+def _schedule_bilibili_loudness_analysis(track_id: int | None, analysis_audio_url: str | None, *, force: bool = False) -> None:
+    if not track_id or not analysis_audio_url:
+        return
+    existing = _LOUDNESS_ANALYSIS_TASKS.get(track_id)
+    if existing and not existing.done():
+        return
+
+    async def _run() -> None:
+        try:
+            async with _LOUDNESS_ANALYSIS_SEMAPHORE:
+                result = await analyze_remote_audio_loudness(
+                    analysis_audio_url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0",
+                        "Referer": "https://www.bilibili.com/",
+                    },
+                )
+            with Session(engine) as db:
+                track = db.get(Track, track_id)
+                if not track:
+                    return
+                if result.analysis:
+                    track.loudness_gain_db = _clamp_loudness_gain_db(result.analysis.gain_db)
+                    track.loudness_peak = result.analysis.peak
+                    track.loudness_source = result.analysis.source
+                    track.loudness_error = None
+                    track.loudness_fetched_at = datetime.utcnow()
+                elif result.error and (force or not _recent_loudness_error(track)):
+                    _store_loudness_error(track, result.error)
+                db.add(track)
+                db.commit()
+        finally:
+            _LOUDNESS_ANALYSIS_TASKS.pop(track_id, None)
+
+    _LOUDNESS_ANALYSIS_TASKS[track_id] = asyncio.create_task(_run())
+
+
+def _bilibili_loudness_from_playurl(data: dict[str, Any] | None) -> AudioResolveResult:
+    volume = (data or {}).get("volume")
+    if not isinstance(volume, dict):
+        return AudioResolveResult()
+    measured_i = _finite_float(volume.get("measured_i"))
+    target_i = _finite_float(volume.get("target_i"))
+    target_offset = _finite_float(volume.get("target_offset"))
+    measured_tp = _finite_float(volume.get("measured_tp"))
+    gain_db = None
+    if measured_i is not None and target_i is not None:
+        gain_db = target_i - measured_i
+    elif target_offset is not None:
+        gain_db = target_offset
+    peak = None
+    if measured_tp is not None:
+        # true peak is normally reported in dBTP.
+        peak = 10 ** (measured_tp / 20)
+    return AudioResolveResult(
+        loudness_gain_db=_clamp_loudness_gain_db(gain_db),
+        loudness_peak=peak,
+        loudness_source="bilibili:playurl-volume",
+    )
+
+
+async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
+    if track.audio_url:
+        if track.source == TrackSource.bilibili and not _is_bilibili_browser_direct_url(track.audio_url):
+            await _resolve_audio_url(db, track, force=True)
+            return
+        if track.source == TrackSource.bilibili and track.loudness_source is None and not _recent_loudness_error(track):
+            await _resolve_audio_url(db, track, force=True)
+            return
+        if track.source == TrackSource.netease and track.loudness_source is None:
+            await _resolve_audio_url(db, track, force=True)
+            return
+        if track.id:
+            _AUDIO_URL_RESOLVE_ERRORS.pop(track.id, None)
+        return
+    if track.source in (TrackSource.netease, TrackSource.bilibili):
+        if track.source == TrackSource.bilibili and track.id:
+            last_error_at = _AUDIO_URL_RESOLVE_ERRORS.get(track.id)
+            if last_error_at and time.monotonic() - last_error_at < _AUDIO_URL_ERROR_RETRY_SECONDS:
+                return
+        await _resolve_audio_url(db, track)
+        if track.source == TrackSource.bilibili and track.id:
+            if track.audio_url:
+                _AUDIO_URL_RESOLVE_ERRORS.pop(track.id, None)
+            else:
+                _AUDIO_URL_RESOLVE_ERRORS[track.id] = time.monotonic()
+
+
 def _playback_track_payload(track: Track) -> dict[str, Any]:
     payload = TrackOut.model_validate(track).model_dump(mode="json")
-    if track.id and (
-        track.source in (TrackSource.netease, TrackSource.bilibili)
-        or (track.audio_url and track.audio_url.startswith(("http://", "https://")))
-    ):
-        payload["audio_url"] = f"/api/tracks/{track.id}/stream"
+    payload["audio_url"] = _direct_playback_audio_url(track)
     return payload
 
 
@@ -351,8 +499,9 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         return track.audio_url
 
     if track.source == TrackSource.netease:
-        # Best-effort: often redirects to playable audio
-        track.audio_url = f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
+        result = await _resolve_netease_audio(track.source_track_id)
+        track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
+        _store_loudness_metadata(track, result)
         db.add(track)
         db.commit()
         db.refresh(track)
@@ -361,7 +510,8 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     if track.source == TrackSource.bilibili:
         if video is None:
             video = await _ensure_bilibili_metadata(db, track)
-        audio_url = await _resolve_bilibili_audio(track.source_track_id, video_data=video)
+        result = await _resolve_bilibili_audio(track.source_track_id, video_data=video)
+        audio_url = result.audio_url
 
         if not audio_url:
             page_url = bilibili_page_url(track.source_track_id)
@@ -386,16 +536,46 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
 
         if audio_url:
             track.audio_url = audio_url
+            _store_loudness_metadata(track, result)
             db.add(track)
             db.commit()
             db.refresh(track)
+            if not _result_has_loudness(result) and (force or not _recent_loudness_error(track)):
+                _schedule_bilibili_loudness_analysis(track.id, result.analysis_audio_url, force=force)
         return track.audio_url
 
     return None
 
 
-async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str, Any] | None = None) -> Optional[str]:
-    """Resolve audio stream URL via bilibili's playurl API (no yt-dlp needed)."""
+async def _resolve_netease_audio(source_track_id: str) -> AudioResolveResult:
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.upstream.netease_playlist_timeout_s,
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://music.163.com/"},
+            follow_redirects=True,
+        ) as client:
+            r = await client.get(
+                "https://music.163.com/api/song/enhance/player/url/v1",
+                params={"ids": f"[{source_track_id}]", "level": "standard", "encodeType": "aac"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("data") if isinstance(data, dict) else None
+            item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
+            gain_db = _finite_float(item.get("gain"))
+            peak = _finite_float(item.get("peak"))
+            return AudioResolveResult(
+                audio_url=item.get("url") if isinstance(item.get("url"), str) else None,
+                loudness_gain_db=_clamp_loudness_gain_db(gain_db),
+                loudness_peak=peak,
+                loudness_source="netease:player-url" if gain_db is not None or peak is not None else None,
+            )
+    except Exception:
+        return AudioResolveResult()
+
+
+async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str, Any] | None = None) -> AudioResolveResult:
+    """Resolve a browser-direct Bilibili media URL, preferring no-referrer-friendly html5 durl mp4."""
     ref = parse_bilibili_source_track_id(source_track_id)
     try:
         async with httpx.AsyncClient(timeout=settings.upstream.bilibili_audio_timeout_s, headers={
@@ -411,356 +591,69 @@ async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str,
                 r.raise_for_status()
                 data = r.json()
                 if data.get("code") != 0:
-                    return None
+                    return AudioResolveResult()
                 vid = data["data"]
             if not vid:
-                return None
+                return AudioResolveResult()
             page = find_bilibili_page(vid, ref)
             cid = ref.cid or (page.get("cid") if page else None) or vid.get("cid")
             if not cid:
-                return None
+                return AudioResolveResult()
 
-            r = await client.get(
-                "https://api.bilibili.com/x/player/playurl",
-                params={"bvid": ref.bvid, "cid": cid, "fnval": 16, "fnver": 0, "fourk": 1},
+            async def _playurl(params: dict[str, Any]) -> dict[str, Any] | None:
+                r = await client.get("https://api.bilibili.com/x/player/playurl", params=params)
+                r.raise_for_status()
+                data = r.json()
+                if data.get("code") != 0:
+                    return None
+                return data.get("data") or None
+
+            html5 = await _playurl(
+                {
+                    "bvid": ref.bvid,
+                    "cid": cid,
+                    "qn": 16,
+                    "fnval": 16,
+                    "fnver": 0,
+                    "platform": "html5",
+                    "high_quality": 1,
+                }
             )
-            r.raise_for_status()
-            data = r.json()
-            if data.get("code") != 0:
-                return None
+            loudness = _bilibili_loudness_from_playurl(html5)
+            playback_url = None
+            durl = (html5 or {}).get("durl") or []
+            for item in durl:
+                direct_url = item.get("url") if isinstance(item, dict) else None
+                if direct_url:
+                    playback_url = direct_url
+                    break
+            if playback_url and _result_has_loudness(loudness):
+                loudness.audio_url = playback_url
+                return loudness
 
-            dash = (data.get("data") or {}).get("dash")
+            dash_data = await _playurl({"bvid": ref.bvid, "cid": cid, "fnval": 16, "fnver": 0, "fourk": 1})
+            if not _result_has_loudness(loudness):
+                loudness = _bilibili_loudness_from_playurl(dash_data)
+            dash = (dash_data or {}).get("dash")
             if not dash:
-                return None
+                if playback_url:
+                    loudness.audio_url = playback_url
+                    return loudness
+                return AudioResolveResult()
             audio_list = dash.get("audio") or []
             if not audio_list:
-                return None
+                if playback_url:
+                    loudness.audio_url = playback_url
+                    return loudness
+                return AudioResolveResult()
             aac = [a for a in audio_list if "mp4a" in (a.get("codecs") or "")]
             candidates = aac if aac else audio_list
             candidates.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
-            return candidates[0].get("baseUrl") or candidates[0].get("base_url")
+            loudness.analysis_audio_url = candidates[0].get("baseUrl") or candidates[0].get("base_url")
+            loudness.audio_url = playback_url or loudness.analysis_audio_url
+            return loudness
     except Exception:
-        return None
-
-
-def _track_stream_headers(source: TrackSource) -> dict[str, str]:
-    headers: dict[str, str] = {"User-Agent": "Mozilla/5.0"}
-    if source == TrackSource.bilibili:
-        headers["Referer"] = "https://www.bilibili.com/"
-        headers["Origin"] = "https://www.bilibili.com"
-        headers["Accept"] = "*/*"
-        headers["Accept-Language"] = "zh-CN,zh;q=0.9,en;q=0.6"
-    if source == TrackSource.netease:
-        headers["Referer"] = "https://music.163.com/"
-    return headers
-
-
-def _configured_ffmpeg_path() -> str:
-    return settings.audio_normalization.ffmpeg_path.strip().strip("\"'")
-
-
-def _resolve_ffmpeg_executable() -> str:
-    configured = _configured_ffmpeg_path() or "ffmpeg"
-    candidate = Path(configured).expanduser()
-    if candidate.is_dir():
-        for name in ("ffmpeg.exe", "ffmpeg"):
-            nested = candidate / name
-            if nested.exists():
-                return str(nested)
-    if candidate.exists():
-        return str(candidate)
-    found = shutil.which(configured)
-    return found or configured
-
-
-def _ffmpeg_diagnostics() -> dict[str, Any]:
-    configured = _configured_ffmpeg_path() or "ffmpeg"
-    resolved = _resolve_ffmpeg_executable()
-    resolved_path = Path(resolved).expanduser()
-    return {
-        "configured": configured,
-        "resolved": resolved,
-        "available": bool(resolved_path.exists() or shutil.which(resolved)),
-    }
-
-
-def _normalization_recent_error(track: Track) -> bool:
-    if not track.normalization_error or not track.normalization_analyzed_at:
-        return False
-    elapsed = (datetime.utcnow() - track.normalization_analyzed_at).total_seconds()
-    return elapsed < _NORMALIZATION_ERROR_RETRY_SECONDS
-
-
-def _track_needs_normalization(track: Track) -> bool:
-    if not settings.audio_normalization.enabled:
-        return False
-    if track.normalization_gain is not None:
-        return False
-    return not _normalization_recent_error(track)
-
-
-def _estimate_normalization_from_pcm(raw: bytes, *, channels: int, sample_rate: int) -> dict[str, float] | None:
-    samples = array.array("f")
-    try:
-        samples.frombytes(raw)
-    except ValueError:
-        return None
-    if not samples:
-        return None
-
-    block_size = max(channels * 1024, int(sample_rate * channels * 0.1))
-    block_rms_values: list[float] = []
-    block_peaks: list[float] = []
-    peak = 0.0
-
-    for start in range(0, len(samples), block_size):
-        block = samples[start : start + block_size]
-        if not block:
-            continue
-        sum_squares = 0.0
-        block_peak = 0.0
-        for value in block:
-            abs_value = abs(float(value))
-            if abs_value > block_peak:
-                block_peak = abs_value
-            sum_squares += float(value) * float(value)
-        if block_peak > peak:
-            peak = block_peak
-        rms = math.sqrt(sum_squares / len(block))
-        if rms >= settings.audio_normalization.silence_rms:
-            block_rms_values.append(rms)
-            block_peaks.append(block_peak)
-
-    if not block_rms_values:
-        return None
-
-    mean_square = sum(rms * rms for rms in block_rms_values) / len(block_rms_values)
-    rms = math.sqrt(mean_square)
-    if not math.isfinite(rms) or rms <= 0:
-        return None
-
-    block_peaks.sort()
-    percentile_index = min(
-        len(block_peaks) - 1,
-        max(0, int((len(block_peaks) - 1) * settings.audio_normalization.robust_peak_percentile)),
-    )
-    robust_peak = block_peaks[percentile_index] or peak or 1.0
-    desired_gain = settings.audio_normalization.target_rms / rms
-    peak_limited_gain = settings.audio_normalization.allowed_robust_peak / robust_peak
-    gain = max(
-        settings.audio_normalization.min_gain,
-        min(settings.audio_normalization.max_gain, desired_gain, peak_limited_gain),
-    )
-    return {"gain": gain, "rms": rms, "peak": peak}
-
-
-def _download_audio_for_normalization(source: TrackSource, audio_url: str) -> bytes:
-    limit = settings.audio_normalization.max_download_mb * 1024 * 1024
-    headers = _track_stream_headers(source)
-    headers["Accept-Encoding"] = "identity"
-    headers["Range"] = f"bytes=0-{limit - 1}"
-    data = bytearray()
-    with httpx.Client(
-        timeout=settings.upstream.stream_timeout_s,
-        follow_redirects=True,
-        headers=headers,
-    ) as client:
-        with client.stream("GET", audio_url) as response:
-            response.raise_for_status()
-            content_type = (response.headers.get("content-type") or "").lower()
-            if content_type.startswith("text/") or "html" in content_type or "json" in content_type:
-                raise RuntimeError(f"unexpected normalization content-type: {content_type}")
-            content_length = int(response.headers.get("content-length") or 0)
-            if content_length > limit:
-                raise RuntimeError(f"audio too large for normalization: {content_length} bytes")
-            for chunk in response.iter_bytes():
-                data.extend(chunk)
-                if len(data) > limit:
-                    raise RuntimeError(f"audio too large for normalization: >{limit} bytes")
-    if not data:
-        raise RuntimeError("audio download returned no bytes")
-    if data[:1] == b"<":
-        raise RuntimeError("normalization download returned text/html instead of audio")
-    return bytes(data)
-
-
-def _run_ffmpeg_pcm(audio_bytes: bytes) -> bytes:
-    normalization = settings.audio_normalization
-    channels = 2
-    ffmpeg = _resolve_ffmpeg_executable()
-    temp_path = ""
-    try:
-        with tempfile.NamedTemporaryFile(prefix="order-song-normalize-", suffix=".audio", delete=False) as temp:
-            temp.write(audio_bytes)
-            temp_path = temp.name
-        command = [
-            ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            temp_path,
-            "-vn",
-            "-map",
-            "0:a:0",
-            "-ac",
-            str(channels),
-            "-ar",
-            str(normalization.sample_rate),
-            "-t",
-            str(normalization.max_duration_s),
-            "-f",
-            "f32le",
-            "pipe:1",
-        ]
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            timeout=normalization.timeout_s,
-            check=False,
-        )
-        if result.returncode != 0:
-            message = (result.stderr or b"").decode("utf-8", errors="ignore").strip()
-            raise RuntimeError(message or f"ffmpeg exited with {result.returncode}")
-        return result.stdout
-    finally:
-        if temp_path:
-            try:
-                Path(temp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-
-
-def _compute_track_normalization(source: TrackSource, audio_url: str) -> dict[str, float]:
-    normalization = settings.audio_normalization
-    audio_bytes = _download_audio_for_normalization(source, audio_url)
-    pcm = _run_ffmpeg_pcm(audio_bytes)
-    analysis = _estimate_normalization_from_pcm(
-        pcm,
-        channels=2,
-        sample_rate=normalization.sample_rate,
-    )
-    if not analysis:
-        raise RuntimeError("no decodable audio samples")
-    return analysis
-
-
-def _schedule_track_normalization(track_id: int | None, room_id: int | None = None) -> None:
-    if not track_id or not settings.audio_normalization.enabled:
-        return
-    existing = _NORMALIZATION_TASKS.get(track_id)
-    if existing and not existing.done():
-        return
-
-    async def _runner() -> None:
-        try:
-            await _analyze_and_store_track_normalization(track_id, room_id=room_id)
-        finally:
-            current = _NORMALIZATION_TASKS.get(track_id)
-            if current is asyncio.current_task():
-                _NORMALIZATION_TASKS.pop(track_id, None)
-
-    _NORMALIZATION_TASKS[track_id] = asyncio.create_task(_runner())
-
-
-async def prewarm_track_normalization() -> None:
-    if not settings.audio_normalization.enabled:
-        return
-    with Session(engine) as db:
-        track_ids = db.exec(
-            select(Track.id)
-            .where(Track.normalization_gain.is_(None))
-            .order_by(Track.id.desc())
-            .limit(_NORMALIZATION_PREWARM_LIMIT)
-        ).all()
-    for track_id in track_ids:
-        _schedule_track_normalization(track_id)
-
-
-async def _analyze_and_store_track_normalization(track_id: int, *, room_id: int | None = None) -> None:
-    async with _NORMALIZATION_SEMAPHORE:
-        try:
-            analysis: dict[str, float] | None = None
-            source: TrackSource | None = None
-            max_attempts = 1
-            for attempt in range(2):
-                with Session(engine) as db:
-                    track = db.get(Track, track_id)
-                    if not track or not _track_needs_normalization(track):
-                        return
-                    source = track.source
-                    if attempt == 0:
-                        max_attempts = 2 if source == TrackSource.bilibili else 1
-                    if attempt >= max_attempts:
-                        break
-                    await _resolve_audio_url(db, track, force=(attempt > 0))
-                    if not track.audio_url:
-                        raise RuntimeError("audio url not available")
-                    audio_url = track.audio_url
-
-                logger.info(
-                    "Starting audio normalization for track_id=%s source=%s attempt=%s ffmpeg=%s",
-                    track_id,
-                    source.value,
-                    attempt + 1,
-                    _resolve_ffmpeg_executable(),
-                )
-                try:
-                    analysis = await asyncio.to_thread(_compute_track_normalization, source, audio_url)
-                    break
-                except httpx.HTTPStatusError as exc:
-                    if source == TrackSource.bilibili and attempt + 1 < max_attempts:
-                        logger.warning(
-                            "Audio normalization upstream status for track_id=%s attempt=%s: %s; refreshing Bilibili URL",
-                            track_id,
-                            attempt + 1,
-                            exc.response.status_code,
-                        )
-                        with Session(engine) as db:
-                            track = db.get(Track, track_id)
-                            if track:
-                                track.audio_url = None
-                                db.add(track)
-                                db.commit()
-                        continue
-                    raise
-
-            if analysis is None:
-                raise RuntimeError("normalization analysis did not run")
-
-            with Session(engine) as db:
-                track = db.get(Track, track_id)
-                if not track:
-                    return
-                track.normalization_gain = float(analysis["gain"])
-                track.normalization_rms = float(analysis["rms"])
-                track.normalization_peak = float(analysis["peak"])
-                track.normalization_analyzed_at = datetime.utcnow()
-                track.normalization_error = None
-                db.add(track)
-                db.commit()
-            logger.info(
-                "Finished audio normalization for track_id=%s gain=%.3f rms=%.5f peak=%.5f",
-                track_id,
-                analysis["gain"],
-                analysis["rms"],
-                analysis["peak"],
-            )
-        except Exception as exc:
-            with Session(engine) as db:
-                track = db.get(Track, track_id)
-                if track:
-                    track.normalization_analyzed_at = datetime.utcnow()
-                    track.normalization_error = str(exc)[:240]
-                    db.add(track)
-                    db.commit()
-            logger.warning("Audio normalization failed for track_id=%s: %s", track_id, exc)
-            return
-
-    if room_id is not None:
-        with Session(engine) as db:
-            await _broadcast_playback_snapshot(db, room_id)
+        return AudioResolveResult()
 
 
 @router.get("/media/cover")
@@ -790,121 +683,24 @@ async def proxy_cover(url: str):
     )
 
 
-@router.get("/tracks/{track_id}/stream")
-async def stream_track(track_id: int, request: Request):
-    rng = request.headers.get("range")
-
-    def _clear_cached_audio_url() -> None:
-        with Session(engine) as db:
-            tr = db.get(Track, track_id)
-            if tr:
-                tr.audio_url = None
-                db.add(tr)
-                db.commit()
-
-    with Session(engine) as db:
-        tr = db.get(Track, track_id)
-        if not tr:
-            raise HTTPException(status_code=404, detail="track not found")
-        max_attempts = 2 if tr.source == TrackSource.bilibili else 1
-
-    for attempt in range(max_attempts):
-        with Session(engine) as db:
-            tr = db.get(Track, track_id)
-            if not tr:
-                raise HTTPException(status_code=404, detail="track not found")
-            await _resolve_audio_url(db, tr, force=(attempt > 0))
-            if not tr.audio_url:
-                raise HTTPException(status_code=404, detail="audio url not available")
-            source = tr.source
-            audio_url = tr.audio_url
-
-        headers = _track_stream_headers(source)
-        if rng:
-            headers["Range"] = rng
-
-        client = httpx.AsyncClient(timeout=settings.upstream.stream_timeout_s, follow_redirects=True, headers=headers)
-        try:
-            req = client.build_request("GET", audio_url)
-            r = await client.send(req, stream=True)
-        except Exception:
-            await client.aclose()
-            if attempt < max_attempts - 1:
-                _clear_cached_audio_url()
-                continue
-            raise HTTPException(status_code=502, detail="upstream fetch failed")
-
-        if r.status_code >= 400:
-            await r.aclose()
-            await client.aclose()
-            if attempt < max_attempts - 1:
-                _clear_cached_audio_url()
-                continue
-            raise HTTPException(status_code=502, detail=f"upstream error {r.status_code}")
-
-        media_type = r.headers.get("content-type") or "audio/mpeg"
-        if source == TrackSource.bilibili:
-            media_type = "audio/mp4"
-        resp_headers: dict[str, str] = {}
-        for k in ("accept-ranges", "content-range", "content-length", "etag", "last-modified"):
-            v = r.headers.get(k)
-            if v:
-                resp_headers[k] = v
-        resp_headers.setdefault("accept-ranges", "bytes")
-        resp_headers["cache-control"] = "no-store"
-
-        async def _iter():
-            try:
-                async for chunk in r.aiter_bytes():
-                    yield chunk
-            finally:
-                await r.aclose()
-                await client.aclose()
-
-        return StreamingResponse(_iter(), media_type=media_type, headers=resp_headers, status_code=r.status_code)
-
-    raise HTTPException(status_code=502, detail="all stream attempts failed")
-
-
-@router.get("/tracks/{track_id}/normalization")
-def get_track_normalization(track_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+@router.get("/tracks/{track_id}/audio-url")
+async def get_track_audio_url(
+    track_id: int,
+    force: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     tr = db.get(Track, track_id)
     if not tr:
         raise HTTPException(status_code=404, detail="track not found")
-    task = _NORMALIZATION_TASKS.get(track_id)
+    await _resolve_audio_url(db, tr, force=force)
     return {
         "track_id": track_id,
-        "enabled": settings.audio_normalization.enabled,
-        "running": bool(task and not task.done()),
-        "needs_normalization": _track_needs_normalization(tr),
-        "gain": tr.normalization_gain,
-        "rms": tr.normalization_rms,
-        "peak": tr.normalization_peak,
-        "analyzed_at": tr.normalization_analyzed_at.isoformat() + "Z" if tr.normalization_analyzed_at else None,
-        "error": tr.normalization_error,
-        "ffmpeg": _ffmpeg_diagnostics(),
-    }
-
-
-@router.post("/tracks/{track_id}/normalization/retry")
-async def retry_track_normalization(track_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    tr = db.get(Track, track_id)
-    if not tr:
-        raise HTTPException(status_code=404, detail="track not found")
-    tr.normalization_gain = None
-    tr.normalization_rms = None
-    tr.normalization_peak = None
-    tr.normalization_analyzed_at = None
-    tr.normalization_error = None
-    db.add(tr)
-    db.commit()
-    _schedule_track_normalization(track_id)
-    task = _NORMALIZATION_TASKS.get(track_id)
-    return {
-        "ok": True,
-        "track_id": track_id,
-        "running": bool(task and not task.done()),
-        "ffmpeg": _ffmpeg_diagnostics(),
+        "audio_url": _direct_playback_audio_url(tr),
+        "loudness_gain_db": tr.loudness_gain_db,
+        "loudness_peak": tr.loudness_peak,
+        "loudness_source": tr.loudness_source,
+        "loudness_error": tr.loudness_error,
     }
 
 
@@ -926,7 +722,7 @@ async def get_queue(room_id: int, db: Session = Depends(get_db), user: User = De
                 "status": qi.status,
                 "created_at": qi.created_at,
                 "ordered_by": {"id": u.id, "username": u.username},
-                "track": TrackOut.model_validate(tr).model_dump(mode="json"),
+                "track": _playback_track_payload(tr),
             }
         )
     return out
@@ -951,7 +747,7 @@ async def get_history(room_id: int, db: Session = Depends(get_db), user: User = 
                 "status": qi.status,
                 "created_at": qi.created_at,
                 "ordered_by": {"id": u.id, "username": u.username},
-                "track": TrackOut.model_validate(tr).model_dump(mode="json"),
+                "track": _playback_track_payload(tr),
             }
         )
     return out
@@ -1156,10 +952,10 @@ async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
             if u:
                 ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
+            if tr and pb.mode == RoomMode.play_enabled:
+                await _ensure_playback_audio_url(db, tr)
             if tr:
                 current_track = _playback_track_payload(tr)
-                if _track_needs_normalization(tr):
-                    _schedule_track_normalization(tr.id, room_id)
 
     await hub.broadcast(
         room_id,
@@ -1223,9 +1019,6 @@ async def _set_playback(
             qi.status = QueueStatus.playing
             db.add(qi)
             db.commit()
-            tr = db.get(Track, qi.track_id)
-            if tr and _track_needs_normalization(tr):
-                _schedule_track_normalization(tr.id, room_id)
     elif current_queue_item_id is not _UNSET:
         playing_items = db.exec(
             select(RoomQueueItem).where(

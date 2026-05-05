@@ -32,10 +32,10 @@ export interface Track {
   duration_ms?: number | null;
   cover_url?: string | null;
   audio_url?: string | null;
-  normalization_gain?: number | null;
-  normalization_rms?: number | null;
-  normalization_peak?: number | null;
-  normalization_analyzed_at?: string | null;
+  loudness_gain_db?: number | null;
+  loudness_peak?: number | null;
+  loudness_source?: string | null;
+  loudness_error?: string | null;
   parts?: Track[];
 }
 

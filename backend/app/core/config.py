@@ -153,41 +153,29 @@ class ClientSettings(BaseModel):
     _valid_search_history_limit = field_validator("search_history_limit")(_positive_int)
 
 
-class AudioNormalizationSettings(BaseModel):
+class AudioLoudnessSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = True
-    prewarm_on_startup: bool = False
     ffmpeg_path: str = "ffmpeg"
     timeout_s: float = 45.0
-    max_duration_s: int = 600
-    max_download_mb: int = 96
-    sample_rate: int = 8000
-    target_rms: float = 0.16
-    min_gain: float = 0.25
-    max_gain: float = 4.0
-    silence_rms: float = 0.005
-    robust_peak_percentile: float = 0.95
-    allowed_robust_peak: float = 1.2
+    max_duration_s: int = 0
+    target_lufs: float = -16.0
+    true_peak_headroom_db: float = -1.0
+    min_gain_db: float = -12.0
+    max_gain_db: float = 12.0
 
-    _valid_max_duration = field_validator("max_duration_s")(_positive_int)
-    _valid_max_download = field_validator("max_download_mb")(_positive_int)
-    _valid_sample_rate = field_validator("sample_rate")(_positive_int)
+    _valid_max_duration = field_validator("max_duration_s")(_non_negative_int)
 
     @field_validator("timeout_s")
     @classmethod
     def _valid_timeout(cls, value: float) -> float:
         return max(0.1, float(value))
 
-    @field_validator("target_rms", "min_gain", "max_gain", "silence_rms", "allowed_robust_peak")
+    @field_validator("min_gain_db", "max_gain_db")
     @classmethod
-    def _valid_positive_float(cls, value: float) -> float:
-        return max(0.0001, float(value))
-
-    @field_validator("robust_peak_percentile")
-    @classmethod
-    def _valid_percentile(cls, value: float) -> float:
-        return max(0.0, min(1.0, float(value)))
+    def _valid_gain(cls, value: float) -> float:
+        return max(-36.0, min(36.0, float(value)))
 
 
 class UpstreamSettings(BaseModel):
@@ -195,7 +183,6 @@ class UpstreamSettings(BaseModel):
 
     yt_dlp_timeout_s: int = 20
     bilibili_audio_timeout_s: float = 10.0
-    stream_timeout_s: float = 60.0
     netease_playlist_timeout_s: float = 15.0
     netease_playlist_detail_timeout_s: float = 30.0
     netease_playlist_detail_batch_size: int = 500
@@ -205,7 +192,6 @@ class UpstreamSettings(BaseModel):
 
     @field_validator(
         "bilibili_audio_timeout_s",
-        "stream_timeout_s",
         "netease_playlist_timeout_s",
         "netease_playlist_detail_timeout_s",
     )
@@ -227,7 +213,7 @@ class Settings(BaseModel):
     trending: TrendingSettings = Field(default_factory=TrendingSettings)
     rooms: RoomsSettings = Field(default_factory=RoomsSettings)
     client: ClientSettings = Field(default_factory=ClientSettings)
-    audio_normalization: AudioNormalizationSettings = Field(default_factory=AudioNormalizationSettings)
+    audio_loudness: AudioLoudnessSettings = Field(default_factory=AudioLoudnessSettings)
     upstream: UpstreamSettings = Field(default_factory=UpstreamSettings)
 
     @property
