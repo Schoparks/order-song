@@ -546,7 +546,7 @@ export function App() {
     enabled: !!token && !!roomId,
   });
 
-  const audio = useAudioController(roomId, token, queueQuery.data || []);
+  const audio = useAudioController(roomId, token, queueQuery.data || [], config.audio_loudness.ffmpeg_available);
 
   const historyQuery = useQuery({
     queryKey: ["history", roomId, token],
@@ -1820,6 +1820,8 @@ function PlayerBar({ audio }: { audio: ReturnType<typeof useAudioController> }) 
       ? "音量均衡已应用"
       : audio.normalizerState === "metadata"
         ? "已使用上游响度元数据做隐藏音量修正"
+      : audio.normalizerState === "pending"
+        ? "正在等待后端响度分析完成，完成后会从同一房间时间开始播放"
       : audio.playEnabled
         ? "当前直链音频无法被浏览器读取实际响度，已跳过"
         : "切到可播放后尝试音量均衡"

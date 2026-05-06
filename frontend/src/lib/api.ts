@@ -11,6 +11,10 @@ export interface AppConfig {
     rooms_refresh_interval_ms: number;
     search_history_limit: number;
   };
+  audio_loudness: {
+    enabled: boolean;
+    ffmpeg_available: boolean;
+  };
 }
 
 export const BASE_PATH = (() => {
@@ -73,6 +77,10 @@ export const defaultConfig: AppConfig = {
     rooms_refresh_interval_ms: 5000,
     search_history_limit: 30,
   },
+  audio_loudness: {
+    enabled: false,
+    ffmpeg_available: false,
+  },
 };
 
 export function mergeConfig(config?: PublicConfig): AppConfig {
@@ -83,6 +91,10 @@ export function mergeConfig(config?: PublicConfig): AppConfig {
     client: {
       ...defaultConfig.client,
       ...(config?.client || {}),
+    },
+    audio_loudness: {
+      ...defaultConfig.audio_loudness,
+      ...(config?.audio_loudness || {}),
     },
   };
 }

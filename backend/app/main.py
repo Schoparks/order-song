@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
+from app.audio_loudness import is_loudness_analysis_available
 from app.core.config import settings
 from app.core.security import decode_token
 from app.db import engine, init_db
@@ -68,7 +69,12 @@ def health():
 
 @app.get("/api/config")
 def public_config():
-    return settings.public_config()
+    config = settings.public_config()
+    config["audio_loudness"] = {
+        "enabled": settings.audio_loudness.enabled,
+        "ffmpeg_available": is_loudness_analysis_available(),
+    }
+    return config
 
 
 app.include_router(auth_router)

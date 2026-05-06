@@ -65,6 +65,7 @@ export interface PlaybackEnvelope {
   server_time?: string;
   server_ts_ms?: number;
   effective_position_ms?: number;
+  loudness_waiting?: boolean;
 }
 
 export interface Playlist {
@@ -96,6 +97,10 @@ export interface PublicConfig {
     room_check_interval_ms?: number;
     rooms_refresh_interval_ms?: number;
     search_history_limit?: number;
+  };
+  audio_loudness?: {
+    enabled?: boolean;
+    ffmpeg_available?: boolean;
   };
 }
 

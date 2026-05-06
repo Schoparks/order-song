@@ -92,6 +92,8 @@ ffmpeg_path = "ffmpeg"
 timeout_s = 45
 # 最多分析多少秒；0 表示分析整首歌。
 max_duration_s = 0
+# 播放列表下一首响度预取的最短间隔，单位秒；避免频繁请求 B 站播放接口。
+prefetch_min_interval_s = 45
 # 目标响度，单位 LUFS。-16 LUFS 接近常见流媒体响度目标。
 target_lufs = -16
 # True peak 余量，避免增益导致明显削波。

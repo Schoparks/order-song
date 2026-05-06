@@ -13,13 +13,14 @@ const STALLED_AUDIO_RELOAD_MS = 8000;
 const STREAM_RELOAD_COOLDOWN_MS = 10000;
 const LOCAL_NEXT_GRACE_MS = 1800;
 const LOCAL_NEXT_SYNC_WAIT_MS = 120000;
+const LOCAL_ENDED_ROOM_GRACE_MS = 3500;
 const METADATA_MIN_GAIN = 0.35;
 const METADATA_MAX_GAIN = 2.5;
 
-type NormalizerState = "off" | "active" | "metadata" | "bypassed";
+type NormalizerState = "off" | "active" | "metadata" | "bypassed" | "pending";
 
 interface SyncAnchor {
-  serverTsMs: number;
+  clientTsMs: number;
   effectivePositionMs: number;
 }
 
@@ -27,7 +28,7 @@ function roomPositionFromState(pb: PlaybackState | null, anchor: SyncAnchor | nu
   if (!pb) return 0;
   if (anchor) {
     return pb.is_playing
-      ? Math.max(0, anchor.effectivePositionMs + Date.now() - anchor.serverTsMs)
+      ? Math.max(0, anchor.effectivePositionMs + Date.now() - anchor.clientTsMs)
       : Math.max(0, anchor.effectivePositionMs);
   }
   let position = Number(pb.position_ms || 0);
@@ -45,7 +46,7 @@ function metadataGainFromTrack(track: Track | null): number | null {
   return clamp(10 ** (gainDb / 20), METADATA_MIN_GAIN, METADATA_MAX_GAIN);
 }
 
-export function useAudioController(roomId: number | null, token: string | null, fallbackQueue: QueueItem[] = []) {
+export function useAudioController(roomId: number | null, token: string | null, fallbackQueue: QueueItem[] = [], backendLoudnessAvailable = false) {
   const audio = useMemo(() => {
     const element = new Audio();
     element.preload = "none";
@@ -62,6 +63,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const [durationMs, setDurationMs] = useState(0);
   const [isSeeking, setIsSeeking] = useState(false);
   const [normalizerState, setNormalizerState] = useState<NormalizerState>("off");
+  const [loudnessWaiting, setLoudnessWaiting] = useState(false);
   const hasTrack = track != null;
 
   const volumeRef = useRef(volume);
@@ -277,6 +279,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
 
   const syncAudioToRoom = useCallback((force = false, shouldPlay = playEnabled) => {
     const audioUrl = normalizerAudioUrl;
+    const allowLocalPlay = shouldPlay && !loudnessWaiting;
     if (!playEnabled) {
       stopLocalAudio();
       return;
@@ -306,7 +309,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
 
     const duration = getDurationMs();
     const targetMs = roomPositionFromState(playback, anchorRef.current);
-    if (shouldPlay && Number.isFinite(targetMs) && targetMs >= 0) {
+    if (allowLocalPlay && Number.isFinite(targetMs) && targetMs >= 0) {
       const boundedMs = duration > 1000 ? clamp(targetMs, 0, duration - 500) : targetMs;
       const diffMs = Math.abs((audio.currentTime || 0) * 1000 - boundedMs);
       if (force || diffMs > SEEK_TOLERANCE_MS) {
@@ -314,7 +317,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       }
     }
 
-    if (!shouldPlay) {
+    if (!allowLocalPlay) {
       clearPlayRetry();
       audio.pause();
       return;
@@ -326,7 +329,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       clearPlayRetry();
       audio.pause();
     }
-  }, [applyOutputVolume, audio, clearPlayRetry, clearStreamRetry, getDurationMs, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, stopLocalAudio, track]);
+  }, [applyOutputVolume, audio, clearPlayRetry, clearStreamRetry, getDurationMs, loudnessWaiting, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, stopLocalAudio, track]);
 
   syncAudioToRoomRef.current = syncAudioToRoom;
 
@@ -337,6 +340,33 @@ export function useAudioController(roomId: number | null, token: string | null, 
   useEffect(() => {
     fallbackQueueRef.current = fallbackQueue;
   }, [fallbackQueue]);
+
+  useEffect(() => {
+    if (!roomId || !token) return;
+    let stopped = false;
+    const active = playEnabled && normalizerEnabled && backendLoudnessAvailable;
+    const syncPreference = () => {
+      if (stopped) return;
+      api(`/api/rooms/${roomId}/normalizer-preference`, {
+        method: "PATCH",
+        token,
+        json: { enabled: active },
+      }).catch(() => {});
+    };
+    syncPreference();
+    const timer = active ? window.setInterval(syncPreference, 60_000) : null;
+    return () => {
+      stopped = true;
+      if (timer != null) window.clearInterval(timer);
+      if (active) {
+        api(`/api/rooms/${roomId}/normalizer-preference`, {
+          method: "PATCH",
+          token,
+          json: { enabled: false },
+        }).catch(() => {});
+      }
+    };
+  }, [backendLoudnessAvailable, normalizerEnabled, playEnabled, roomId, token]);
 
   const refreshDirectAudioUrl = useCallback(async (force = false) => {
     if (!playEnabled || !token || !track?.id) return null;
@@ -377,7 +407,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
 
   const applyLocalQueueItem = useCallback((item: QueueItem) => {
     const now = Date.now();
-    anchorRef.current = { serverTsMs: now, effectivePositionMs: 0 };
+    anchorRef.current = { clientTsMs: now, effectivePositionMs: 0 };
     setPlayback((previous) => ({
       room_id: previous?.room_id ?? roomId ?? 0,
       mode: previous?.mode ?? "play_enabled",
@@ -421,8 +451,9 @@ export function useAudioController(roomId: number | null, token: string | null, 
     setPlayback(envelope.playback_state);
     setTrack((previous) => envelope.current_track || (envelope.playback_state.current_queue_item_id ? previous : null));
     setOrderedBy((previous) => envelope.ordered_by ?? (envelope.playback_state.current_queue_item_id ? previous : null));
+    setLoudnessWaiting(Boolean(envelope.loudness_waiting));
     anchorRef.current = {
-      serverTsMs: envelope.server_ts_ms || Date.now(),
+      clientTsMs: Date.now(),
       effectivePositionMs:
         envelope.effective_position_ms ??
         roomPositionFromState(envelope.playback_state, null),
@@ -506,7 +537,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   useEffect(() => {
     const onCanPlay = () => {
       applyPendingSeek();
-      if (playEnabled && playback?.is_playing) requestAudioPlay(1);
+      if (playEnabled && playback?.is_playing && !loudnessWaiting) requestAudioPlay(1);
     };
     audio.addEventListener("canplay", onCanPlay);
     audio.addEventListener("loadeddata", onCanPlay);
@@ -514,12 +545,12 @@ export function useAudioController(roomId: number | null, token: string | null, 
       audio.removeEventListener("canplay", onCanPlay);
       audio.removeEventListener("loadeddata", onCanPlay);
     };
-  }, [applyPendingSeek, audio, playEnabled, playback?.is_playing, requestAudioPlay]);
+  }, [applyPendingSeek, audio, loudnessWaiting, playEnabled, playback?.is_playing, requestAudioPlay]);
 
   useEffect(() => {
     const onUserActivation = () => {
       if (playEnabled) unlockAudio();
-      if (playEnabled && playback?.is_playing) requestAudioPlay(1);
+      if (playEnabled && playback?.is_playing && !loudnessWaiting) requestAudioPlay(1);
     };
     window.addEventListener("pointerdown", onUserActivation, { passive: true });
     window.addEventListener("keydown", onUserActivation);
@@ -527,11 +558,11 @@ export function useAudioController(roomId: number | null, token: string | null, 
       window.removeEventListener("pointerdown", onUserActivation);
       window.removeEventListener("keydown", onUserActivation);
     };
-  }, [playback?.is_playing, playEnabled, requestAudioPlay, unlockAudio]);
+  }, [loudnessWaiting, playback?.is_playing, playEnabled, requestAudioPlay, unlockAudio]);
 
   useEffect(() => {
     const recoverPlayback = () => {
-      if (!playEnabled || !playback?.is_playing || !hasTrack) return;
+      if (!playEnabled || !playback?.is_playing || !hasTrack || loudnessWaiting) return;
       syncAudioToRoomRef.current(true, true);
       reloadCurrentStream(2, true);
     };
@@ -544,7 +575,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       window.removeEventListener("online", recoverPlayback);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [hasTrack, playback?.is_playing, playEnabled, reloadCurrentStream]);
+  }, [hasTrack, loudnessWaiting, playback?.is_playing, playEnabled, reloadCurrentStream]);
 
   useEffect(() => () => {
     stopLocalAudio();
@@ -552,7 +583,21 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, [clearOptimisticNext, stopLocalAudio]);
 
   useEffect(() => {
-    const onEnded = () => next();
+    const onEnded = () => {
+      if (!playback?.is_playing) return;
+      const duration = getDurationMs();
+      const roomPosition = getRoomPositionMs();
+      if (
+        playEnabled &&
+        playback?.is_playing &&
+        duration > 0 &&
+        roomPosition < duration - LOCAL_ENDED_ROOM_GRACE_MS
+      ) {
+        reloadCurrentStream(2, true);
+        return;
+      }
+      next();
+    };
     const onMetadata = () => {
       applyPendingSeek();
       setDurationMs(getDurationMs());
@@ -565,7 +610,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
         streamRetryCountRef.current = 0;
       }
       if (!isSeeking) {
-        setPositionMs(playEnabled && !audio.paused ? currentSeconds * 1000 : getRoomPositionMs());
+        setPositionMs(playEnabled && !audio.paused && !loudnessWaiting ? currentSeconds * 1000 : getRoomPositionMs());
       }
       setDurationMs(getDurationMs());
     };
@@ -601,11 +646,11 @@ export function useAudioController(roomId: number | null, token: string | null, 
       audio.removeEventListener("timeupdate", onTime);
       audio.removeEventListener("error", onError);
     };
-  }, [applyPendingSeek, audio, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, next, playback?.is_playing, playEnabled, refreshDirectAudioUrl, reloadCurrentStream, track]);
+  }, [applyPendingSeek, audio, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, loudnessWaiting, next, playback?.is_playing, playEnabled, refreshDirectAudioUrl, reloadCurrentStream, track]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (playEnabled && playback?.is_playing && hasTrack && audio.src) {
+      if (playEnabled && playback?.is_playing && hasTrack && audio.src && !loudnessWaiting) {
         const now = Date.now();
         const currentSeconds = audio.currentTime || 0;
         const moving = !audio.paused && !audio.ended && Math.abs(currentSeconds - lastAudioTimeRef.current) > 0.05;
@@ -616,11 +661,13 @@ export function useAudioController(roomId: number | null, token: string | null, 
           reloadCurrentStream(2);
         }
       }
-      if (!isSeeking) setPositionMs(playEnabled && !audio.paused ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
+      if (!isSeeking) setPositionMs(playEnabled && !audio.paused && !loudnessWaiting ? (audio.currentTime || 0) * 1000 : getRoomPositionMs());
       setDurationMs(getDurationMs());
     }, 250);
     return () => window.clearInterval(timer);
-  }, [audio, getDurationMs, getRoomPositionMs, hasTrack, isSeeking, playEnabled, playback?.is_playing, reloadCurrentStream]);
+  }, [audio, getDurationMs, getRoomPositionMs, hasTrack, isSeeking, loudnessWaiting, playEnabled, playback?.is_playing, reloadCurrentStream]);
+
+  const effectiveNormalizerState: NormalizerState = loudnessWaiting && normalizerEnabled ? "pending" : normalizerState;
 
   return {
     audio,
@@ -629,12 +676,15 @@ export function useAudioController(roomId: number | null, token: string | null, 
     orderedBy,
     playEnabled,
     normalizerEnabled,
-    normalizerState,
+    loudnessWaiting,
+    normalizerState: effectiveNormalizerState,
     normalizerStatusLabel: normalizerEnabled
-      ? normalizerState === "active"
+      ? effectiveNormalizerState === "active"
         ? "生效"
-        : normalizerState === "metadata"
+        : effectiveNormalizerState === "metadata"
           ? "元数据"
+        : effectiveNormalizerState === "pending"
+          ? "等待"
         : playEnabled
           ? "不可测"
           : "待播放"

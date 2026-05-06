@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from starlette.responses import Response
 from sqlmodel import Session, select
 
-from app.audio_loudness import analyze_remote_audio_loudness
+from app.audio_loudness import analyze_remote_audio_loudness, is_loudness_analysis_available
 from app.bilibili import (
     bilibili_page_url,
     find_bilibili_page,
@@ -50,6 +50,12 @@ _AUDIO_URL_ERROR_RETRY_SECONDS = 30
 _LOUDNESS_ANALYSIS_TASKS: dict[int, asyncio.Task] = {}
 _LOUDNESS_ERROR_RETRY_SECONDS = 3600
 _LOUDNESS_ANALYSIS_SEMAPHORE = asyncio.Semaphore(1)
+_LOUDNESS_PREFETCH_TASKS: dict[int, asyncio.Task] = {}
+_LOUDNESS_PREFETCH_SEMAPHORE = asyncio.Semaphore(1)
+_LOUDNESS_PREFETCH_LAST_AT = 0.0
+_ROOM_NORMALIZER_PREFS: dict[tuple[int, int], float] = {}
+_ROOM_NORMALIZER_PREF_TTL_SECONDS = 600
+_ROOM_LOUDNESS_WAITING: dict[int, int] = {}
 _COVER_PROXY_HOST_SUFFIXES = (
     "bilibili.com",
     "biliimg.com",
@@ -252,8 +258,43 @@ def _recent_loudness_error(track: Track) -> bool:
     return age_s < _LOUDNESS_ERROR_RETRY_SECONDS
 
 
+def _track_has_loudness(track: Track) -> bool:
+    return track.loudness_gain_db is not None or track.loudness_peak is not None or bool(track.loudness_source)
+
+
+def _track_needs_backend_loudness(track: Track) -> bool:
+    return track.source == TrackSource.bilibili and not _track_has_loudness(track) and not _recent_loudness_error(track)
+
+
+def _prune_room_normalizer_prefs(now: float | None = None) -> None:
+    current = now or time.monotonic()
+    stale = [
+        key
+        for key, updated_at in _ROOM_NORMALIZER_PREFS.items()
+        if current - updated_at > _ROOM_NORMALIZER_PREF_TTL_SECONDS
+    ]
+    for key in stale:
+        _ROOM_NORMALIZER_PREFS.pop(key, None)
+
+
+def _room_prefers_loudness_wait(room_id: int) -> bool:
+    _prune_room_normalizer_prefs()
+    return any(stored_room_id == room_id for stored_room_id, _ in _ROOM_NORMALIZER_PREFS)
+
+
+def _is_loudness_waiting(room_id: int, queue_item_id: int | None) -> bool:
+    return bool(queue_item_id and _ROOM_LOUDNESS_WAITING.get(room_id) == queue_item_id)
+
+
+def _clear_loudness_wait_if_changed(room_id: int, queue_item_id: int | None) -> None:
+    if _ROOM_LOUDNESS_WAITING.get(room_id) and _ROOM_LOUDNESS_WAITING.get(room_id) != queue_item_id:
+        _ROOM_LOUDNESS_WAITING.pop(room_id, None)
+
+
 def _schedule_bilibili_loudness_analysis(track_id: int | None, analysis_audio_url: str | None, *, force: bool = False) -> None:
     if not track_id or not analysis_audio_url:
+        return
+    if not is_loudness_analysis_available():
         return
     existing = _LOUDNESS_ANALYSIS_TASKS.get(track_id)
     if existing and not existing.done():
@@ -283,6 +324,7 @@ def _schedule_bilibili_loudness_analysis(track_id: int | None, analysis_audio_ur
                     _store_loudness_error(track, result.error)
                 db.add(track)
                 db.commit()
+            await _handle_loudness_analysis_finished(track_id)
         finally:
             _LOUDNESS_ANALYSIS_TASKS.pop(track_id, None)
 
@@ -487,6 +529,7 @@ async def _broadcast_or_start_after_enqueue(db: Session, room_id: int, fallback_
             next_id = _pick_next_queue_item_id(db, room_id) or fallback_queue_item_id
             await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=True, position_ms=0)
         else:
+            _schedule_next_loudness_prefetch(db, room_id)
             await hub.broadcast(room_id, {"type": "queue_updated"})
 
 
@@ -701,6 +744,29 @@ async def get_track_audio_url(
         "loudness_peak": tr.loudness_peak,
         "loudness_source": tr.loudness_source,
         "loudness_error": tr.loudness_error,
+    }
+
+
+@router.patch("/rooms/{room_id}/normalizer-preference")
+async def set_normalizer_preference(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    await _require_active_room_member(db, room_id, user)
+    enabled = payload.get("enabled") is True and is_loudness_analysis_available()
+    key = (room_id, user.id)
+    if enabled:
+        _ROOM_NORMALIZER_PREFS[key] = time.monotonic()
+        _schedule_next_loudness_prefetch(db, room_id)
+    else:
+        _ROOM_NORMALIZER_PREFS.pop(key, None)
+        if not _room_prefers_loudness_wait(room_id) and _ROOM_LOUDNESS_WAITING.get(room_id):
+            async with _playback_lock(room_id):
+                pb = db.get(RoomPlaybackState, room_id)
+                if pb and _is_loudness_waiting(room_id, pb.current_queue_item_id):
+                    _ROOM_LOUDNESS_WAITING.pop(room_id, None)
+                    await _set_playback(db, room_id, is_playing=True, position_ms=0)
+    return {
+        "ok": True,
+        "enabled": enabled,
+        "backend_loudness_available": is_loudness_analysis_available(),
     }
 
 
@@ -938,6 +1004,98 @@ async def bump_queue_item(room_id: int, queue_item_id: int, db: Session = Depend
     return {"ok": True}
 
 
+def _schedule_track_loudness_prefetch(track_id: int | None) -> None:
+    if not track_id or not is_loudness_analysis_available():
+        return
+    existing = _LOUDNESS_PREFETCH_TASKS.get(track_id)
+    if existing and not existing.done():
+        return
+
+    async def _run() -> None:
+        global _LOUDNESS_PREFETCH_LAST_AT
+        try:
+            async with _LOUDNESS_PREFETCH_SEMAPHORE:
+                elapsed = time.monotonic() - _LOUDNESS_PREFETCH_LAST_AT
+                wait_s = settings.audio_loudness.prefetch_min_interval_s - elapsed
+                if wait_s > 0:
+                    await asyncio.sleep(wait_s)
+                _LOUDNESS_PREFETCH_LAST_AT = time.monotonic()
+
+                with Session(engine) as prefetch_db:
+                    track = prefetch_db.get(Track, track_id)
+                    if track and _track_needs_backend_loudness(track):
+                        await _resolve_audio_url(prefetch_db, track, force=True)
+        finally:
+            _LOUDNESS_PREFETCH_TASKS.pop(track_id, None)
+
+    _LOUDNESS_PREFETCH_TASKS[track_id] = asyncio.create_task(_run())
+
+
+def _schedule_next_loudness_prefetch(db: Session, room_id: int) -> None:
+    if not is_loudness_analysis_available() or not _room_prefers_loudness_wait(room_id):
+        return
+    qi = db.exec(
+        select(RoomQueueItem)
+        .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
+        .order_by(RoomQueueItem.created_at.asc())
+        .limit(1)
+    ).first()
+    if not qi:
+        return
+    track = db.get(Track, qi.track_id)
+    if track and _track_needs_backend_loudness(track):
+        _schedule_track_loudness_prefetch(track.id)
+
+
+async def _prepare_current_track_for_playback(db: Session, room_id: int, pb: RoomPlaybackState, qi: RoomQueueItem | None, tr: Track | None) -> None:
+    room_prefers_loudness_wait = _room_prefers_loudness_wait(room_id)
+    if tr and (pb.mode == RoomMode.play_enabled or room_prefers_loudness_wait):
+        await _ensure_playback_audio_url(db, tr)
+        db.refresh(tr)
+    if not qi or not tr or not tr.id:
+        return
+    if not (
+        pb.is_playing
+        and room_prefers_loudness_wait
+        and is_loudness_analysis_available()
+        and _track_needs_backend_loudness(tr)
+    ):
+        return
+    if _effective_position_ms(pb) > 1500:
+        return
+    if tr.id not in _LOUDNESS_ANALYSIS_TASKS:
+        return
+
+    pb.is_playing = False
+    pb.position_ms = 0
+    pb.updated_at = datetime.utcnow()
+    db.add(pb)
+    db.commit()
+    db.refresh(pb)
+    _ROOM_LOUDNESS_WAITING[room_id] = qi.id
+
+
+async def _handle_loudness_analysis_finished(track_id: int) -> None:
+    with Session(engine) as db:
+        rows = db.exec(
+            select(RoomPlaybackState.room_id, RoomPlaybackState.current_queue_item_id)
+            .join(RoomQueueItem, RoomQueueItem.id == RoomPlaybackState.current_queue_item_id)
+            .where(RoomQueueItem.track_id == track_id)
+        ).all()
+    for room_id, queue_item_id in rows:
+        async with _playback_lock(room_id):
+            with Session(engine) as db:
+                pb = db.get(RoomPlaybackState, room_id)
+                if not pb or pb.current_queue_item_id != queue_item_id:
+                    _clear_loudness_wait_if_changed(room_id, pb.current_queue_item_id if pb else None)
+                    continue
+                if _is_loudness_waiting(room_id, queue_item_id):
+                    _ROOM_LOUDNESS_WAITING.pop(room_id, None)
+                    await _set_playback(db, room_id, is_playing=True, position_ms=0)
+                else:
+                    await _broadcast_playback_snapshot(db, room_id)
+
+
 async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
     pb = db.get(RoomPlaybackState, room_id)
     if not pb:
@@ -945,6 +1103,7 @@ async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
 
     current_track = None
     ordered_by = None
+    current_queue_item_id = pb.current_queue_item_id
     if pb.current_queue_item_id:
         qi = db.get(RoomQueueItem, pb.current_queue_item_id)
         if qi:
@@ -952,8 +1111,7 @@ async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
             if u:
                 ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
-            if tr and pb.mode == RoomMode.play_enabled:
-                await _ensure_playback_audio_url(db, tr)
+            await _prepare_current_track_for_playback(db, room_id, pb, qi, tr)
             if tr:
                 current_track = _playback_track_payload(tr)
 
@@ -965,6 +1123,7 @@ async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
             **_playback_state_payload(pb),
             "current_track": current_track,
             "ordered_by": ordered_by,
+            "loudness_waiting": _is_loudness_waiting(room_id, current_queue_item_id),
         },
     )
 
@@ -990,6 +1149,7 @@ async def _set_playback(
         pb.volume = max(0, min(100, int(volume)))
     if current_queue_item_id is not _UNSET:
         pb.current_queue_item_id = current_queue_item_id
+        _clear_loudness_wait_if_changed(room_id, current_queue_item_id)
     pb.updated_at = datetime.utcnow()
     db.add(pb)
     db.commit()
@@ -1034,6 +1194,7 @@ async def _set_playback(
     await _broadcast_playback_snapshot(db, room_id)
     if current_queue_item_id is not _UNSET:
         await hub.broadcast(room_id, {"type": "queue_updated"})
+        _schedule_next_loudness_prefetch(db, room_id)
     return pb
 
 

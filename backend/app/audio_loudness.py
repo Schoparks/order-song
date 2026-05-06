@@ -50,6 +50,10 @@ def _resolve_ffmpeg() -> str | None:
     return shutil.which(configured)
 
 
+def is_loudness_analysis_available() -> bool:
+    return settings.audio_loudness.enabled and _resolve_ffmpeg() is not None
+
+
 def _clamp_gain_db(value: float) -> float:
     low = min(settings.audio_loudness.min_gain_db, settings.audio_loudness.max_gain_db)
     high = max(settings.audio_loudness.min_gain_db, settings.audio_loudness.max_gain_db)

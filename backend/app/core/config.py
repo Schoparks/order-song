@@ -160,12 +160,14 @@ class AudioLoudnessSettings(BaseModel):
     ffmpeg_path: str = "ffmpeg"
     timeout_s: float = 45.0
     max_duration_s: int = 0
+    prefetch_min_interval_s: int = 45
     target_lufs: float = -16.0
     true_peak_headroom_db: float = -1.0
     min_gain_db: float = -12.0
     max_gain_db: float = 12.0
 
     _valid_max_duration = field_validator("max_duration_s")(_non_negative_int)
+    _valid_prefetch_min_interval = field_validator("prefetch_min_interval_s")(_positive_int)
 
     @field_validator("timeout_s")
     @classmethod

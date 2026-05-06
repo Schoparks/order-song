@@ -8,13 +8,13 @@ from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, User
 from app.schemas import CreateRoomIn, RoomOut
 from app.routers.queue_playback import (
-    _ensure_playback_audio_url,
+    _is_loudness_waiting,
+    _prepare_current_track_for_playback,
     _require_active_room_member,
     _pick_next_queue_item_id,
     _playback_track_payload,
     _playback_lock,
     _playback_state_payload,
-    _require_room_member,
     _set_playback,
 )
 from app.ws import hub
@@ -198,12 +198,12 @@ async def room_state(room_id: int, db: Session = Depends(get_db), user: User = D
                 ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
             if tr:
-                if pb.mode == RoomMode.play_enabled:
-                    await _ensure_playback_audio_url(db, tr)
+                await _prepare_current_track_for_playback(db, room_id, pb, qi, tr)
                 current_track = _playback_track_payload(tr)
     return {
         **_playback_state_payload(pb),
         "current_track": current_track,
         "ordered_by": ordered_by,
         "queue": [],
+        "loudness_waiting": _is_loudness_waiting(room_id, pb.current_queue_item_id),
     }
