@@ -76,6 +76,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const volumeRef = useRef(volume);
   const anchorRef = useRef<SyncAnchor | null>(null);
   const lastNextAtRef = useRef(0);
+  const playRequestIdRef = useRef(0);
   const playRetryTimerRef = useRef<number | null>(null);
   const streamRetryTimerRef = useRef<number | null>(null);
   const optimisticNextTimerRef = useRef<number | null>(null);
@@ -134,6 +135,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, [applyDynamicOutputVolume, normalizerAudioUrl, normalizerEnabled, track, volume]);
 
   const clearPlayRetry = useCallback(() => {
+    playRequestIdRef.current += 1;
     if (playRetryTimerRef.current != null) {
       window.clearTimeout(playRetryTimerRef.current);
       playRetryTimerRef.current = null;
@@ -206,12 +208,15 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const requestAudioPlay = useCallback((retries = 2) => {
     if (!audio.src) return;
     clearPlayRetry();
+    const requestId = playRequestIdRef.current;
     const attempt = (remaining: number) => {
       audio.play()
         .then(() => {
+          if (requestId !== playRequestIdRef.current) return;
           clearPlayRetry();
         })
         .catch(() => {
+          if (requestId !== playRequestIdRef.current) return;
           if (remaining <= 0) return;
           playRetryTimerRef.current = window.setTimeout(() => attempt(remaining - 1), 350);
         });
@@ -240,8 +245,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
     if (!force && !playEnabled) return;
     applyOutputVolume(normalizerEnabled);
     unlockAudioGraph().catch(() => {});
-    requestAudioPlay(1);
-  }, [applyOutputVolume, normalizerEnabled, playEnabled, requestAudioPlay, unlockAudioGraph]);
+  }, [applyOutputVolume, normalizerEnabled, playEnabled, unlockAudioGraph]);
 
   const setPlayEnabled = useCallback((value: boolean) => {
     setPlayEnabledState(value);
@@ -249,11 +253,11 @@ export function useAudioController(roomId: number | null, token: string | null, 
     if (value) {
       unlockAudio(true);
       syncAudioToRoomRef.current(true, true);
-      requestAudioPlay(3);
+      if (playback?.is_playing) requestAudioPlay(3);
     } else {
       stopLocalAudio();
     }
-  }, [requestAudioPlay, stopLocalAudio, unlockAudio]);
+  }, [playback?.is_playing, requestAudioPlay, stopLocalAudio, unlockAudio]);
 
   const setNormalizerEnabled = useCallback((value: boolean) => {
     setNormalizerEnabledState(value);
@@ -286,8 +290,9 @@ export function useAudioController(roomId: number | null, token: string | null, 
 
   const syncAudioToRoom = useCallback((force = false, shouldPlay = playEnabled) => {
     const audioUrl = normalizerAudioUrl;
-    const allowLocalPlay = shouldPlay && !loudnessWaiting;
-    if (!playEnabled) {
+    const localPlaybackEnabled = playEnabled || shouldPlay;
+    const allowLocalPlay = localPlaybackEnabled && shouldPlay && !loudnessWaiting;
+    if (!localPlaybackEnabled) {
       stopLocalAudio();
       return;
     }
@@ -490,6 +495,16 @@ export function useAudioController(roomId: number | null, token: string | null, 
     if (playEnabled) unlockAudio();
     if (playback?.current_queue_item_id && playback.is_playing) {
       const pos = Math.round(playEnabled && !audio.paused ? audio.currentTime * 1000 : getRoomPositionMs());
+      const pausedAt = Date.now();
+      clearPlayRetry();
+      audio.pause();
+      anchorRef.current = { clientTsMs: pausedAt, effectivePositionMs: pos };
+      setPositionMs(pos);
+      setPlayback((previous) => (
+        previous && previous.current_queue_item_id === playback.current_queue_item_id
+          ? { ...previous, is_playing: false, position_ms: pos, updated_at: new Date(pausedAt).toISOString() }
+          : previous
+      ));
       await api(`/api/rooms/${roomId}/controls/pause`, {
         method: "POST",
         token,
@@ -498,7 +513,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
     } else {
       await api(`/api/rooms/${roomId}/controls/play`, { method: "POST", token });
     }
-  }, [audio, getRoomPositionMs, playEnabled, playback, roomId, token, unlockAudio]);
+  }, [audio, clearPlayRetry, getRoomPositionMs, playEnabled, playback, roomId, token, unlockAudio]);
 
   const commitSeek = useCallback(async (ratio: number) => {
     if (!roomId || !token) return;
