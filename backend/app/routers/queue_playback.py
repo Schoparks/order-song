@@ -61,6 +61,8 @@ _COVER_PROXY_HOST_SUFFIXES = (
     "biliimg.com",
     "hdslb.com",
 )
+_BACKEND_LOUDNESS_SOURCES = {TrackSource.netease, TrackSource.bilibili}
+_UNTRUSTED_LOUDNESS_SOURCES = {"netease:player-url"}
 
 
 @dataclass
@@ -259,11 +261,23 @@ def _recent_loudness_error(track: Track) -> bool:
 
 
 def _track_has_loudness(track: Track) -> bool:
+    if track.loudness_source in _UNTRUSTED_LOUDNESS_SOURCES:
+        return False
     return track.loudness_gain_db is not None or track.loudness_peak is not None or bool(track.loudness_source)
 
 
+def _clear_untrusted_loudness_metadata(track: Track) -> bool:
+    if track.loudness_source not in _UNTRUSTED_LOUDNESS_SOURCES:
+        return False
+    track.loudness_gain_db = None
+    track.loudness_peak = None
+    track.loudness_source = None
+    track.loudness_fetched_at = None
+    return True
+
+
 def _track_needs_backend_loudness(track: Track) -> bool:
-    return track.source == TrackSource.bilibili and not _track_has_loudness(track) and not _recent_loudness_error(track)
+    return track.source in _BACKEND_LOUDNESS_SOURCES and not _track_has_loudness(track) and not _recent_loudness_error(track)
 
 
 def _prune_room_normalizer_prefs(now: float | None = None) -> None:
@@ -291,8 +305,19 @@ def _clear_loudness_wait_if_changed(room_id: int, queue_item_id: int | None) -> 
         _ROOM_LOUDNESS_WAITING.pop(room_id, None)
 
 
-def _schedule_bilibili_loudness_analysis(track_id: int | None, analysis_audio_url: str | None, *, force: bool = False) -> None:
+def _loudness_analysis_headers(source: TrackSource) -> dict[str, str]:
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if source == TrackSource.bilibili:
+        headers["Referer"] = "https://www.bilibili.com/"
+    elif source == TrackSource.netease:
+        headers["Referer"] = "https://music.163.com/"
+    return headers
+
+
+def _schedule_loudness_analysis(track_id: int | None, source: TrackSource, analysis_audio_url: str | None, *, force: bool = False) -> None:
     if not track_id or not analysis_audio_url:
+        return
+    if source not in _BACKEND_LOUDNESS_SOURCES:
         return
     if not is_loudness_analysis_available():
         return
@@ -305,10 +330,8 @@ def _schedule_bilibili_loudness_analysis(track_id: int | None, analysis_audio_ur
             async with _LOUDNESS_ANALYSIS_SEMAPHORE:
                 result = await analyze_remote_audio_loudness(
                     analysis_audio_url,
-                    headers={
-                        "User-Agent": "Mozilla/5.0",
-                        "Referer": "https://www.bilibili.com/",
-                    },
+                    headers=_loudness_analysis_headers(source),
+                    source=f"{source.value}:ffmpeg-ebur128",
                 )
             with Session(engine) as db:
                 track = db.get(Track, track_id)
@@ -356,6 +379,11 @@ def _bilibili_loudness_from_playurl(data: dict[str, Any] | None) -> AudioResolve
 
 
 async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
+    if _clear_untrusted_loudness_metadata(track):
+        db.add(track)
+        db.commit()
+        db.refresh(track)
+
     if track.audio_url:
         if track.source == TrackSource.bilibili and not _is_bilibili_browser_direct_url(track.audio_url):
             await _resolve_audio_url(db, track, force=True)
@@ -363,8 +391,8 @@ async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
         if track.source == TrackSource.bilibili and track.loudness_source is None and not _recent_loudness_error(track):
             await _resolve_audio_url(db, track, force=True)
             return
-        if track.source == TrackSource.netease and track.loudness_source is None:
-            await _resolve_audio_url(db, track, force=True)
+        if track.source == TrackSource.netease and _track_needs_backend_loudness(track):
+            _schedule_loudness_analysis(track.id, track.source, track.audio_url, force=True)
             return
         if track.id:
             _AUDIO_URL_RESOLVE_ERRORS.pop(track.id, None)
@@ -385,6 +413,10 @@ async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
 def _playback_track_payload(track: Track) -> dict[str, Any]:
     payload = TrackOut.model_validate(track).model_dump(mode="json")
     payload["audio_url"] = _direct_playback_audio_url(track)
+    if not _track_has_loudness(track):
+        payload["loudness_gain_db"] = None
+        payload["loudness_peak"] = None
+        payload["loudness_source"] = None
     return payload
 
 
@@ -544,10 +576,12 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     if track.source == TrackSource.netease:
         result = await _resolve_netease_audio(track.source_track_id)
         track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
-        _store_loudness_metadata(track, result)
+        _clear_untrusted_loudness_metadata(track)
         db.add(track)
         db.commit()
         db.refresh(track)
+        if _track_needs_backend_loudness(track):
+            _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url or track.audio_url, force=force)
         return track.audio_url
 
     if track.source == TrackSource.bilibili:
@@ -584,7 +618,7 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
             db.commit()
             db.refresh(track)
             if not _result_has_loudness(result) and (force or not _recent_loudness_error(track)):
-                _schedule_bilibili_loudness_analysis(track.id, result.analysis_audio_url, force=force)
+                _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url, force=force)
         return track.audio_url
 
     return None
@@ -605,13 +639,10 @@ async def _resolve_netease_audio(source_track_id: str) -> AudioResolveResult:
             data = r.json()
             items = data.get("data") if isinstance(data, dict) else None
             item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
-            gain_db = _finite_float(item.get("gain"))
-            peak = _finite_float(item.get("peak"))
+            audio_url = item.get("url") if isinstance(item.get("url"), str) else None
             return AudioResolveResult(
-                audio_url=item.get("url") if isinstance(item.get("url"), str) else None,
-                loudness_gain_db=_clamp_loudness_gain_db(gain_db),
-                loudness_peak=peak,
-                loudness_source="netease:player-url" if gain_db is not None or peak is not None else None,
+                audio_url=audio_url,
+                analysis_audio_url=audio_url,
             )
     except Exception:
         return AudioResolveResult()
@@ -737,12 +768,13 @@ async def get_track_audio_url(
     if not tr:
         raise HTTPException(status_code=404, detail="track not found")
     await _resolve_audio_url(db, tr, force=force)
+    has_loudness = _track_has_loudness(tr)
     return {
         "track_id": track_id,
         "audio_url": _direct_playback_audio_url(tr),
-        "loudness_gain_db": tr.loudness_gain_db,
-        "loudness_peak": tr.loudness_peak,
-        "loudness_source": tr.loudness_source,
+        "loudness_gain_db": tr.loudness_gain_db if has_loudness else None,
+        "loudness_peak": tr.loudness_peak if has_loudness else None,
+        "loudness_source": tr.loudness_source if has_loudness else None,
         "loudness_error": tr.loudness_error,
     }
 

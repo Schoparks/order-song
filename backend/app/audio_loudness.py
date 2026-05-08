@@ -60,7 +60,7 @@ def _clamp_gain_db(value: float) -> float:
     return max(low, min(high, value))
 
 
-def _parse_ebur128(stderr: str) -> LoudnessAnalysisResult:
+def _parse_ebur128(stderr: str, *, source: str) -> LoudnessAnalysisResult:
     summary = stderr.rsplit("Summary:", 1)[-1]
     integrated_matches = _INTEGRATED_RE.findall(summary)
     if not integrated_matches:
@@ -83,7 +83,7 @@ def _parse_ebur128(stderr: str) -> LoudnessAnalysisResult:
         analysis=LoudnessAnalysis(
             gain_db=gain_db,
             peak=peak,
-            source="bilibili:ffmpeg-ebur128",
+            source=source,
         )
     )
 
@@ -92,6 +92,7 @@ async def analyze_remote_audio_loudness(
     audio_url: str,
     *,
     headers: Mapping[str, str] | None = None,
+    source: str = "ffmpeg-ebur128",
 ) -> LoudnessAnalysisResult:
     if not settings.audio_loudness.enabled:
         return LoudnessAnalysisResult(error="audio loudness analysis disabled")
@@ -132,7 +133,7 @@ async def analyze_remote_audio_loudness(
         except Exception as exc:
             return LoudnessAnalysisResult(error=f"ffmpeg loudness analysis failed: {exc}")
 
-        parsed = _parse_ebur128(completed.stderr or "")
+        parsed = _parse_ebur128(completed.stderr or "", source=source)
         if parsed.analysis:
             return parsed
         if completed.returncode != 0:

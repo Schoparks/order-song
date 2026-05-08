@@ -41,9 +41,16 @@ function roomPositionFromState(pb: PlaybackState | null, anchor: SyncAnchor | nu
 
 function metadataGainFromTrack(track: Track | null): number | null {
   if (track?.loudness_gain_db == null || !track.loudness_source) return null;
+  if (track.source === "netease" && track.loudness_source === "netease:player-url") return null;
   const gainDb = Number(track.loudness_gain_db);
   if (!Number.isFinite(gainDb)) return null;
   return clamp(10 ** (gainDb / 20), METADATA_MIN_GAIN, METADATA_MAX_GAIN);
+}
+
+function needsBackendLoudness(track: Track | null): boolean {
+  if (!track || track.source !== "netease") return false;
+  if (track.loudness_source === "netease:player-url") return true;
+  return track.loudness_gain_db == null && track.loudness_peak == null;
 }
 
 export function useAudioController(roomId: number | null, token: string | null, fallbackQueue: QueueItem[] = [], backendLoudnessAvailable = false) {
@@ -380,16 +387,20 @@ export function useAudioController(roomId: number | null, token: string | null, 
       loudness_error?: string | null;
     }>(`/api/tracks/${track.id}/audio-url${query}`, { token });
     const nextUrl = result.audio_url || null;
-    if (nextUrl || result.loudness_gain_db != null || result.loudness_peak != null || result.loudness_source || result.loudness_error) {
+    const hasLoudnessUpdate = Object.prototype.hasOwnProperty.call(result, "loudness_gain_db")
+      || Object.prototype.hasOwnProperty.call(result, "loudness_peak")
+      || Object.prototype.hasOwnProperty.call(result, "loudness_source")
+      || Object.prototype.hasOwnProperty.call(result, "loudness_error");
+    if (nextUrl || hasLoudnessUpdate) {
       setTrack((previous) => (
         previous && previous.id === track.id
           ? {
               ...previous,
               audio_url: nextUrl || previous.audio_url,
-              loudness_gain_db: result.loudness_gain_db ?? previous.loudness_gain_db,
-              loudness_peak: result.loudness_peak ?? previous.loudness_peak,
-              loudness_source: result.loudness_source ?? previous.loudness_source,
-              loudness_error: result.loudness_error ?? previous.loudness_error,
+              loudness_gain_db: hasLoudnessUpdate ? (result.loudness_gain_db ?? null) : previous.loudness_gain_db,
+              loudness_peak: hasLoudnessUpdate ? (result.loudness_peak ?? null) : previous.loudness_peak,
+              loudness_source: hasLoudnessUpdate ? (result.loudness_source ?? null) : previous.loudness_source,
+              loudness_error: hasLoudnessUpdate ? (result.loudness_error ?? null) : previous.loudness_error,
             }
           : previous
       ));
@@ -525,14 +536,14 @@ export function useAudioController(roomId: number | null, token: string | null, 
     const key = `${track.id}:${track.source}:${track.source_track_id}`;
     if (refreshedAudioTrackRef.current === key) return;
     const needsUrl = !playableAudioUrl(track);
-    const needsLoudness = normalizerEnabled && track.source === "netease" && track.loudness_gain_db == null && track.loudness_peak == null;
+    const needsLoudness = normalizerEnabled && needsBackendLoudness(track);
     const shouldRefresh = needsUrl || track.source === "bilibili" || needsLoudness;
     if (!shouldRefresh) return;
     refreshedAudioTrackRef.current = key;
     refreshDirectAudioUrl(track.source === "bilibili" || needsLoudness).catch(() => {
       refreshedAudioTrackRef.current = null;
     });
-  }, [normalizerEnabled, playEnabled, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.loudness_gain_db, track?.loudness_peak, track?.source, track?.source_track_id]);
+  }, [normalizerEnabled, playEnabled, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.loudness_gain_db, track?.loudness_peak, track?.loudness_source, track?.source, track?.source_track_id]);
 
   useEffect(() => {
     const onCanPlay = () => {
