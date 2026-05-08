@@ -7,16 +7,16 @@ from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, User
 from app.schemas import CreateRoomIn, RoomOut
-from app.routers.queue_playback import (
+from app.routers.playback_core import (
     _is_loudness_waiting,
     _prepare_current_track_for_playback,
-    _require_active_room_member,
     _pick_next_queue_item_id,
     _playback_track_payload,
     _playback_lock,
     _playback_state_payload,
     _set_playback,
 )
+from app.routers.queue_playback import _require_active_room_member
 from app.ws import hub
 
 
