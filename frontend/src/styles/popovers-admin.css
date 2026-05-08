@@ -1,0 +1,175 @@
+.popoverLayer {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: transparent;
+}
+
+.popover {
+  position: fixed;
+  top: 86px;
+  z-index: 31;
+  width: min(360px, calc(100vw - 24px));
+  border-radius: 28px;
+  padding: 14px;
+}
+
+.accountPopover {
+  left: 18px;
+}
+
+.membersPopover {
+  right: 18px;
+}
+
+.memberRow {
+  grid-template-columns: auto minmax(0, 1fr);
+  min-height: 46px;
+}
+
+.roomScene {
+  place-items: stretch;
+  align-content: start;
+  gap: 14px;
+}
+
+.roomHeader,
+.roomComposer {
+  width: min(980px, 100%);
+  margin: 0 auto;
+  border-radius: 30px;
+  padding: 18px;
+}
+
+.roomHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.eyebrow {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.roomComposer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.roomGrid {
+  width: min(980px, 100%);
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.roomTile {
+  min-height: 132px;
+  border-radius: 28px;
+  padding: 18px;
+  display: grid;
+  justify-items: start;
+  align-content: center;
+  gap: 8px;
+  text-align: left;
+}
+
+.roomIndex {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.adminPanel {
+  width: min(920px, 100%);
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+  border-radius: 32px;
+  padding: 20px;
+}
+
+.adminList {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.adminRow {
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 48px;
+}
+
+.userAdminRow {
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.adminPrimaryText,
+.adminRoomInfo strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+}
+
+.adminMeta,
+.adminRoomInfo span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.adminActions,
+.adminMemberChips {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.adminRoomRow {
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, auto) auto;
+  align-items: start;
+}
+
+.adminRoomInfo {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.memberChip {
+  max-width: 180px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.68);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.44);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.74), 0 8px 18px rgba(49, 67, 83, 0.08);
+}
+
+.memberChip span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.memberChip svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+}
+
+.memberChip svg:last-child {
+  width: 14px;
+  height: 14px;
+  color: var(--danger);
+}
+
