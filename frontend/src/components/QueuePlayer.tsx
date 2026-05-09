@@ -102,10 +102,9 @@ export function PlayerBar({ audio }: { audio: ReturnType<typeof useAudioControll
         <div className="volumeCluster">
           <button className="iconButton" onClick={audio.toggleMute}>{audio.volume > 0 ? <Volume2 /> : <VolumeX />}</button>
           <input type="range" min={0} max={100} value={audio.volume} disabled={!audio.playEnabled} onChange={(e) => audio.setVolume(Number(e.target.value))} />
-          <label className="checkPill" title={normalizerTitle}>
+          <label className={`checkPill normalizerPill ${audio.normalizerEnabled ? audio.normalizerState : "off"}`} title={normalizerTitle}>
             <input type="checkbox" checked={audio.normalizerEnabled} onChange={(e) => audio.setNormalizerEnabled(e.target.checked)} />
             <Gauge />音量均衡
-            {audio.normalizerStatusLabel ? <span className={`normalizerBadge ${audio.normalizerState}`}>{audio.normalizerStatusLabel}</span> : null}
           </label>
         </div>
       </div>

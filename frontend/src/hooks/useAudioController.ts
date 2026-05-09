@@ -704,17 +704,6 @@ export function useAudioController(roomId: number | null, token: string | null, 
     normalizerEnabled,
     loudnessWaiting,
     normalizerState: effectiveNormalizerState,
-    normalizerStatusLabel: normalizerEnabled
-      ? effectiveNormalizerState === "active"
-        ? "生效"
-        : effectiveNormalizerState === "metadata"
-          ? "元数据"
-        : effectiveNormalizerState === "pending"
-          ? "等待"
-        : playEnabled
-          ? "不可测"
-          : "待播放"
-      : "",
     volume,
     positionMs,
     durationMs,
