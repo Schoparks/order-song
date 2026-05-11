@@ -368,6 +368,31 @@ input[type="range"] {
   margin-bottom: 12px;
 }
 
+.collectionSummary {
+  display: grid;
+  gap: 5px;
+  margin-bottom: 12px;
+}
+
+.collectionSummary strong {
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.collectionSummary span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.collectionModeTabs {
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.collectionModeTabs button {
+  flex: 1;
+}
+
 .dialogCreate {
   margin-bottom: 12px;
 }

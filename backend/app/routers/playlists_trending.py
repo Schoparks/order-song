@@ -6,6 +6,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, delete, select
 
+from app.bilibili import parse_bilibili_source_track_id
 from app.core.config import settings
 from app.deps import get_current_user, get_db
 from app.models import Track, TrackOrderStats, TrackSource, User, UserPlaylist, UserPlaylistItem
@@ -13,6 +14,68 @@ from app.routers.queue_playback import _ensure_bilibili_metadata, _get_or_create
 
 
 router = APIRouter(prefix="/api", tags=["playlists", "trending"])
+
+
+def _validate_track_payload(payload: dict) -> tuple[TrackSource, str, str]:
+    source = payload.get("source")
+    source_track_id = payload.get("source_track_id")
+    title = payload.get("title")
+    if source not in {s.value for s in TrackSource}:
+        raise HTTPException(status_code=400, detail="invalid source")
+    if not source_track_id or not isinstance(source_track_id, str):
+        raise HTTPException(status_code=400, detail="invalid source_track_id")
+    if not title or not isinstance(title, str):
+        raise HTTPException(status_code=400, detail="invalid title")
+    return TrackSource(source), source_track_id, title
+
+
+def _validate_bilibili_part_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid track")
+    source, source_track_id, title = _validate_track_payload(payload)
+    ref = parse_bilibili_source_track_id(source_track_id)
+    if source != TrackSource.bilibili or not ref.is_part:
+        raise HTTPException(status_code=400, detail="only bilibili part tracks are supported")
+    return {
+        "source": source.value,
+        "source_track_id": source_track_id,
+        "title": title,
+        "artist": payload.get("artist"),
+        "duration_ms": payload.get("duration_ms"),
+        "cover_url": payload.get("cover_url"),
+        "audio_url": payload.get("audio_url"),
+    }
+
+
+async def _add_track_payload_to_playlist(
+    db: Session,
+    playlist_id: int,
+    payload: dict,
+) -> tuple[UserPlaylistItem, bool]:
+    source, source_track_id, title = _validate_track_payload(payload)
+    tr = _get_or_create_track(
+        db,
+        source=source,
+        source_track_id=source_track_id,
+        title=title,
+        artist=payload.get("artist"),
+        duration_ms=payload.get("duration_ms"),
+        cover_url=payload.get("cover_url"),
+        audio_url=payload.get("audio_url"),
+    )
+    if tr.source == TrackSource.bilibili and not tr.cover_url:
+        await _ensure_bilibili_metadata(db, tr)
+    existing = db.exec(
+        select(UserPlaylistItem).where(
+            UserPlaylistItem.playlist_id == playlist_id,
+            UserPlaylistItem.track_id == tr.id,
+        )
+    ).first()
+    if existing:
+        return existing, False
+    it = UserPlaylistItem(playlist_id=playlist_id, track_id=tr.id)
+    db.add(it)
+    return it, True
 
 
 @router.get("/playlists")
@@ -100,39 +163,10 @@ async def add_playlist_item(playlist_id: int, payload: dict, db: Session = Depen
     pl = db.get(UserPlaylist, playlist_id)
     if not pl or pl.user_id != user.id:
         raise HTTPException(status_code=404, detail="playlist not found")
-    source = payload.get("source")
-    source_track_id = payload.get("source_track_id")
-    title = payload.get("title")
-    if source not in {s.value for s in TrackSource}:
-        raise HTTPException(status_code=400, detail="invalid source")
-    if not source_track_id or not isinstance(source_track_id, str):
-        raise HTTPException(status_code=400, detail="invalid source_track_id")
-    if not title or not isinstance(title, str):
-        raise HTTPException(status_code=400, detail="invalid title")
-    tr = _get_or_create_track(
-        db,
-        source=TrackSource(source),
-        source_track_id=source_track_id,
-        title=title,
-        artist=payload.get("artist"),
-        duration_ms=payload.get("duration_ms"),
-        cover_url=payload.get("cover_url"),
-        audio_url=payload.get("audio_url"),
-    )
-    if tr.source == TrackSource.bilibili and not tr.cover_url:
-        await _ensure_bilibili_metadata(db, tr)
-    existing = db.exec(
-        select(UserPlaylistItem).where(
-            UserPlaylistItem.playlist_id == playlist_id,
-            UserPlaylistItem.track_id == tr.id,
-        )
-    ).first()
-    if existing:
-        return {"id": existing.id, "created_at": existing.created_at}
-    it = UserPlaylistItem(playlist_id=playlist_id, track_id=tr.id)
-    db.add(it)
-    db.commit()
-    db.refresh(it)
+    it, added = await _add_track_payload_to_playlist(db, playlist_id, payload)
+    if added:
+        db.commit()
+        db.refresh(it)
     return {"id": it.id, "created_at": it.created_at}
 
 
@@ -198,6 +232,76 @@ def track_playlist_map(db: Session = Depends(get_db), user: User = Depends(get_c
                 result[key] = []
             result[key].append({"item_id": it.id, "playlist_id": pl.id, "playlist_name": pl.name})
     return result
+
+
+@router.post("/playlists/import-bilibili-collection")
+async def import_bilibili_collection(payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    mode = (payload.get("mode") or "").strip()
+    if mode not in {"create", "existing"}:
+        raise HTTPException(status_code=400, detail="invalid mode")
+
+    raw_tracks = payload.get("tracks")
+    if not isinstance(raw_tracks, list) or not raw_tracks:
+        raise HTTPException(status_code=400, detail="tracks required")
+    tracks = [_validate_bilibili_part_payload(track) for track in raw_tracks]
+
+    playlists: list[UserPlaylist] = []
+    if mode == "create":
+        name = (payload.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="name required")
+        pl = UserPlaylist(user_id=user.id, name=name)
+        db.add(pl)
+        db.commit()
+        db.refresh(pl)
+        playlists = [pl]
+    else:
+        raw_ids = payload.get("playlist_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise HTTPException(status_code=400, detail="playlist_ids required")
+        seen_ids: set[int] = set()
+        for raw_id in raw_ids:
+            if isinstance(raw_id, bool) or not isinstance(raw_id, int):
+                raise HTTPException(status_code=400, detail="invalid playlist_id")
+            if raw_id in seen_ids:
+                continue
+            seen_ids.add(raw_id)
+            pl = db.get(UserPlaylist, raw_id)
+            if not pl or pl.user_id != user.id:
+                raise HTTPException(status_code=404, detail="playlist not found")
+            playlists.append(pl)
+
+    results = []
+    total_added = 0
+    total_skipped = 0
+    for pl in playlists:
+        added = 0
+        skipped = 0
+        for track in tracks:
+            _, was_added = await _add_track_payload_to_playlist(db, pl.id, track)
+            if was_added:
+                added += 1
+            else:
+                skipped += 1
+        db.commit()
+        total_added += added
+        total_skipped += skipped
+        results.append({
+            "playlist_id": pl.id,
+            "playlist_name": pl.name,
+            "added": added,
+            "skipped": skipped,
+        })
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "added": total_added,
+        "skipped": total_skipped,
+        "total": len(tracks) * len(playlists),
+        "track_total": len(tracks),
+        "results": results,
+    }
 
 
 @router.post("/playlists/import-netease")

@@ -19,9 +19,9 @@ export function RandomPlaylistOrderDialog({
   onConfirm: (count: number) => void | Promise<void>;
 }) {
   const maxCount = Math.max(1, itemCount);
-  const [count, setCount] = useState(1);
+  const [count, setCount] = useState(maxCount);
   const [editing, setEditing] = useState(false);
-  const [draftCount, setDraftCount] = useState("1");
+  const [draftCount, setDraftCount] = useState(() => String(maxCount));
   const countInputRef = useRef<HTMLInputElement>(null);
 
   const clampCount = useCallback(
@@ -30,10 +30,10 @@ export function RandomPlaylistOrderDialog({
   );
 
   useEffect(() => {
-    setCount(1);
-    setDraftCount("1");
+    setCount(maxCount);
+    setDraftCount(String(maxCount));
     setEditing(false);
-  }, [playlist.id, itemCount]);
+  }, [playlist.id, maxCount]);
 
   useEffect(() => {
     if (!editing) return;
