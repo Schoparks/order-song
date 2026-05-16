@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronLeft, CloudDownload, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
@@ -38,6 +38,7 @@ export function SearchOverlay({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [historyVisible, setHistoryVisible] = useState(false);
+  const historyScopeRef = useRef<HTMLDivElement | null>(null);
 
   async function run(nextQuery = query) {
     const q = nextQuery.trim();
@@ -58,33 +59,42 @@ export function SearchOverlay({
   }
 
   return (
-    <div className="overlay">
+    <div
+      className="overlay"
+      onPointerDownCapture={(event) => {
+        if (!historyVisible) return;
+        const node = historyScopeRef.current;
+        if (node && !node.contains(event.target as Node)) setHistoryVisible(false);
+      }}
+    >
       <section className="searchSheet glassPanel">
         <div className="searchSticky">
           <div className="sheetHeader">
             <h2>搜索</h2>
             <button className="iconButton" onClick={onClose}><X /></button>
           </div>
-          <div className="searchInputWrap">
-            <Search />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onFocus={() => setHistoryVisible(true)}
-              onClick={() => setHistoryVisible(true)}
-              onKeyDown={(e) => e.key === "Enter" && run()}
-              autoFocus
-              placeholder="歌曲、歌手、BV 号或 B 站标题"
-            />
-            <button className="primaryButton" onClick={() => run()} disabled={busy}>{busy ? "搜索中" : "搜索"}</button>
-          </div>
-          {historyVisible && !!history.length && (
-            <div className="chips">
-              {history.map((item) => (
-                <button key={item} onClick={() => { setQuery(item); setHistoryVisible(false); run(item); }}>{item}</button>
-              ))}
+          <div ref={historyScopeRef}>
+            <div className="searchInputWrap">
+              <Search />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onFocus={() => setHistoryVisible(true)}
+                onClick={() => setHistoryVisible(true)}
+                onKeyDown={(e) => e.key === "Enter" && run()}
+                autoFocus
+                placeholder="歌曲、歌手、BV 号或 B 站标题"
+              />
+              <button className="primaryButton" onClick={() => run()} disabled={busy}>{busy ? "搜索中" : "搜索"}</button>
             </div>
-          )}
+            {historyVisible && !!history.length && (
+              <div className="chips">
+                {history.map((item) => (
+                  <button key={item} onClick={() => { setQuery(item); setHistoryVisible(false); run(item); }}>{item}</button>
+                ))}
+              </div>
+            )}
+          </div>
           {error && <p className="hintText">{error}</p>}
         </div>
         <ScrollArea className="searchResults">
@@ -102,6 +112,7 @@ export function SearchOverlay({
             playlistMap={playlistMap}
             onChanged={onChanged}
             expandBilibiliParts
+            prioritizePlaylistMatches
           />
         </ScrollArea>
       </section>
@@ -226,7 +237,8 @@ export function PlaylistsView({
 
   const randomOrderDialog = randomOrderTarget ? (
     <RandomPlaylistOrderDialog
-      playlist={randomOrderTarget.playlist}
+      targetId={randomOrderTarget.playlist.id}
+      targetName={randomOrderTarget.playlist.name}
       itemCount={randomOrderTarget.itemCount}
       busy={randomOrdering}
       error={randomOrderError}

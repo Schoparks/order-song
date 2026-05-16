@@ -130,6 +130,14 @@ def _validate_queue_track_payload(payload: dict) -> tuple[TrackSource, str, str]
     return TrackSource(source), source_track_id, title
 
 
+def _parse_requested_count(raw_count: object) -> int | None:
+    if raw_count is None:
+        return None
+    if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 1:
+        raise HTTPException(status_code=400, detail="count must be a positive integer")
+    return raw_count
+
+
 def _get_existing_queue_item(db: Session, room_id: int, track_id: int) -> RoomQueueItem | None:
     return db.exec(
         select(RoomQueueItem)
@@ -348,6 +356,12 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be list")
+    requested_count = _parse_requested_count(payload.get("count"))
+    items = list(items)
+    if requested_count is not None:
+        requested_count = min(requested_count, len(items))
+    if payload.get("random") is True:
+        random.shuffle(items)
 
     seen: set[tuple[str, str]] = set()
     queue_item_ids: list[int] = []
@@ -358,6 +372,8 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
 
     async with _playback_lock(room_id):
         for raw in items:
+            if requested_count is not None and added_count >= requested_count:
+                break
             if not isinstance(raw, dict):
                 raise HTTPException(status_code=400, detail="invalid item")
             source = raw.get("source")
@@ -402,12 +418,7 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
     playlist_id = payload.get("playlist_id")
     if not isinstance(playlist_id, int):
         raise HTTPException(status_code=400, detail="playlist_id required")
-    raw_count = payload.get("count")
-    requested_count: int | None = None
-    if raw_count is not None:
-        if isinstance(raw_count, bool) or not isinstance(raw_count, int) or raw_count < 1:
-            raise HTTPException(status_code=400, detail="count must be a positive integer")
-        requested_count = raw_count
+    requested_count = _parse_requested_count(payload.get("count"))
 
     playlist = db.get(UserPlaylist, playlist_id)
     if not playlist or playlist.user_id != user.id:

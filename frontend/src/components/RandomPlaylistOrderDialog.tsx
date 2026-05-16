@@ -1,18 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Shuffle } from "lucide-react";
-import type { Playlist } from "../types";
 import { CardDialog } from "./common";
 
 export function RandomPlaylistOrderDialog({
-  playlist,
+  targetId,
+  targetName,
   itemCount,
+  itemLabel,
+  unitLabel = "首",
   busy,
   error,
   onCancel,
   onConfirm,
 }: {
-  playlist: Playlist;
+  targetId: number | string;
+  targetName: string;
   itemCount: number;
+  itemLabel?: string;
+  unitLabel?: string;
   busy: boolean;
   error: string;
   onCancel: () => void;
@@ -33,7 +38,7 @@ export function RandomPlaylistOrderDialog({
     setCount(maxCount);
     setDraftCount(String(maxCount));
     setEditing(false);
-  }, [playlist.id, maxCount]);
+  }, [targetId, maxCount]);
 
   useEffect(() => {
     if (!editing) return;
@@ -63,11 +68,11 @@ export function RandomPlaylistOrderDialog({
         }}
       >
         <div className="randomOrderTarget">
-          <strong>{playlist.name}</strong>
-          <span>{itemCount} 首歌曲</span>
+          <strong>{targetName}</strong>
+          <span>{itemLabel || `${itemCount} 首歌曲`}</span>
         </div>
         <div className="randomRangeLabels">
-          <span>1 首</span>
+          <span>1 {unitLabel}</span>
           <span>全部</span>
         </div>
         <div className="randomCountRow">
@@ -113,7 +118,7 @@ export function RandomPlaylistOrderDialog({
               title="双击输入数量"
               onDoubleClick={() => setEditing(true)}
             >
-              {count === maxCount ? "全部" : `${count} 首`}
+              {count === maxCount ? "全部" : `${count} ${unitLabel}`}
             </button>
           )}
         </div>

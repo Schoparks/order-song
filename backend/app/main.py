@@ -87,21 +87,14 @@ app.include_router(admin_router)
 
 FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 FRONTEND_DIST_DIR = FRONTEND_DIR / "dist"
-LEGACY_FRONTEND_INDEX = FRONTEND_DIR / "legacy-index.html"
 
 
 def _frontend_index_path() -> Path:
-    dist_index = FRONTEND_DIST_DIR / "index.html"
-    if dist_index.exists():
-        return dist_index
-    return LEGACY_FRONTEND_INDEX
+    return FRONTEND_DIST_DIR / "index.html"
 
 
-# Serve built React assets first; fall back to the legacy static app while dist is absent.
 if (FRONTEND_DIST_DIR / "assets").exists():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST_DIR / "assets")), name="assets")
-elif (FRONTEND_DIR / "assets").exists():
-    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIR / "assets")), name="assets")
 
 
 @app.get("/favicon.ico", include_in_schema=False)

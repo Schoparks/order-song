@@ -3,7 +3,8 @@ import { BadgePlus, Check, Heart, ListMusic, Plus } from "lucide-react";
 import { api } from "../lib/api";
 import { trackKey, trackPayload } from "../lib/track";
 import type { Playlist, Track } from "../types";
-import { CardDialog, EmptyState, SegmentedTabs, TrackCover } from "./common";
+import { CardDialog, EmptyState, TrackCover } from "./common";
+import { BilibiliCollectionActions } from "./BilibiliCollectionActions";
 
 export interface PlaylistMembership {
   item_id: number;
@@ -20,6 +21,7 @@ export function TrackList({
   playlistMap,
   onChanged,
   expandBilibiliParts = false,
+  prioritizePlaylistMatches = false,
 }: {
   items: Array<{ track: Track; meta?: string }>;
   token: string;
@@ -29,11 +31,24 @@ export function TrackList({
   playlistMap: Record<string, PlaylistMembership[]>;
   onChanged: () => void;
   expandBilibiliParts?: boolean;
+  prioritizePlaylistMatches?: boolean;
 }) {
-  if (!items.length) return <EmptyState title="暂无内容" />;
+  const visibleItems = useMemo(() => {
+    if (!prioritizePlaylistMatches) return items;
+    return items
+      .map((item, index) => ({
+        item,
+        index,
+        inPlaylist: isTrackInPlaylist(item.track, playlistMap),
+      }))
+      .sort((a, b) => Number(b.inPlaylist) - Number(a.inPlaylist) || a.index - b.index)
+      .map(({ item }) => item);
+  }, [items, playlistMap, prioritizePlaylistMatches]);
+
+  if (!visibleItems.length) return <EmptyState title="暂无内容" />;
   return (
     <div className="songList">
-      {items.map(({ track, meta }) => (
+      {visibleItems.map(({ track, meta }) => (
         <TrackRow
           key={trackKey(track)}
           track={track}
@@ -47,10 +62,16 @@ export function TrackList({
           playlistMemberships={playlistMap[trackKey(track)] || []}
           onChanged={onChanged}
           expandBilibiliParts={expandBilibiliParts}
+          prioritizePlaylistMatches={prioritizePlaylistMatches}
         />
       ))}
     </div>
   );
+}
+
+function isTrackInPlaylist(track: Track, playlistMap: Record<string, PlaylistMembership[]>): boolean {
+  if ((playlistMap[trackKey(track)] || []).length > 0) return true;
+  return Array.isArray(track.parts) && track.parts.some((part) => (playlistMap[trackKey(part)] || []).length > 0);
 }
 
 function TrackRow({
@@ -65,6 +86,7 @@ function TrackRow({
   playlistMemberships,
   onChanged,
   expandBilibiliParts,
+  prioritizePlaylistMatches,
 }: {
   track: Track;
   meta?: string;
@@ -77,6 +99,7 @@ function TrackRow({
   playlistMemberships: PlaylistMembership[];
   onChanged: () => void;
   expandBilibiliParts: boolean;
+  prioritizePlaylistMatches: boolean;
 }) {
   const [busy, setBusy] = useState<"queue" | "playlist" | null>(null);
   const [expanded, setExpanded] = useState(false);
@@ -101,13 +124,12 @@ function TrackRow({
               >
                 <ListMusic />{expanded ? "收起" : "展开"}
               </button>
-              <BilibiliCollectionPlaylistButton
+              <BilibiliCollectionActions
                 track={track}
                 parts={parts}
                 token={token}
+                roomId={roomId}
                 playlists={playlists}
-                busy={busy === "playlist"}
-                setBusy={(value) => setBusy(value ? "playlist" : null)}
                 onChanged={onChanged}
               />
             </>
@@ -151,184 +173,11 @@ function TrackRow({
             queuedKeys={queuedKeys}
             playlistMap={playlistMap}
             onChanged={onChanged}
+            prioritizePlaylistMatches={prioritizePlaylistMatches}
           />
         </div>
       )}
     </>
-  );
-}
-
-type CollectionMode = "create" | "existing";
-
-interface BilibiliCollectionImportResult {
-  ok: boolean;
-  added: number;
-  skipped: number;
-  total: number;
-  track_total?: number;
-  results: Array<{
-    playlist_id: number;
-    playlist_name: string;
-    added: number;
-    skipped: number;
-  }>;
-}
-
-function BilibiliCollectionPlaylistButton({
-  track,
-  parts,
-  token,
-  playlists,
-  busy,
-  setBusy,
-  onChanged,
-}: {
-  track: Track;
-  parts: Track[];
-  token: string;
-  playlists: Playlist[];
-  busy: boolean;
-  setBusy: (value: boolean) => void;
-  onChanged: () => void;
-}) {
-  const [open, setOpen] = useState(false);
-  return (
-    <>
-      <button className="smallButton" disabled={busy} onClick={() => setOpen(true)}>
-        <Heart />入歌单
-      </button>
-      {open && (
-        <BilibiliCollectionPlaylistDialog
-          track={track}
-          parts={parts}
-          token={token}
-          playlists={playlists}
-          busy={busy}
-          setBusy={setBusy}
-          onClose={() => setOpen(false)}
-          onChanged={onChanged}
-        />
-      )}
-    </>
-  );
-}
-
-function BilibiliCollectionPlaylistDialog({
-  track,
-  parts,
-  token,
-  playlists,
-  busy,
-  setBusy,
-  onClose,
-  onChanged,
-}: {
-  track: Track;
-  parts: Track[];
-  token: string;
-  playlists: Playlist[];
-  busy: boolean;
-  setBusy: (value: boolean) => void;
-  onClose: () => void;
-  onChanged: () => void;
-}) {
-  const [mode, setMode] = useState<CollectionMode>("create");
-  const [newName, setNewName] = useState(() => track.title.trim() || "B站合集");
-  const [checkedIds, setCheckedIds] = useState(() => new Set<number>());
-  const [error, setError] = useState("");
-  const selectedIds = useMemo(() => Array.from(checkedIds), [checkedIds]);
-
-  async function importCollection(nextMode: CollectionMode) {
-    const name = newName.trim();
-    if (nextMode === "create" && !name) return;
-    if (nextMode === "existing" && !selectedIds.length) return;
-    setError("");
-    setBusy(true);
-    try {
-      await api<BilibiliCollectionImportResult>("/api/playlists/import-bilibili-collection", {
-        method: "POST",
-        token,
-        json: nextMode === "create"
-          ? { mode: "create", name, tracks: parts.map(trackPayload) }
-          : { mode: "existing", playlist_ids: selectedIds, tracks: parts.map(trackPayload) },
-      });
-      onChanged();
-      onClose();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "保存合集失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <CardDialog title="合集加入歌单" onClose={onClose}>
-      <div className="collectionSummary">
-        <strong>{track.title}</strong>
-        <span>{track.artist || "-"} · 共 {parts.length} P</span>
-      </div>
-      <SegmentedTabs
-        className="collectionModeTabs"
-        value={mode}
-        items={[
-          { value: "create", label: "新建歌单", icon: <Plus /> },
-          { value: "existing", label: "加入已有", icon: <ListMusic /> },
-        ]}
-        onChange={(value) => setMode(value === "existing" ? "existing" : "create")}
-      />
-      {mode === "create" ? (
-        <form
-          className="dialogForm"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void importCollection("create");
-          }}
-        >
-          <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="歌单名称" />
-          {error && <p className="hintText">{error}</p>}
-          <div className="dialogActions">
-            <button type="button" className="glassButton" onClick={onClose} disabled={busy}>取消</button>
-            <button className="primaryButton" disabled={busy || !newName.trim()}>
-              <Plus />{busy ? "保存中" : "创建并加入"}
-            </button>
-          </div>
-        </form>
-      ) : (
-        <>
-          {playlists.length ? (
-            <div className="playlistPickerList">
-              {playlists.map((playlist) => (
-                <label className="checkRow" key={playlist.id}>
-                  <input
-                    type="checkbox"
-                    checked={checkedIds.has(playlist.id)}
-                    onChange={(event) => {
-                      setCheckedIds((previous) => {
-                        const next = new Set(previous);
-                        if (event.target.checked) next.add(playlist.id);
-                        else next.delete(playlist.id);
-                        return next;
-                      });
-                    }}
-                  />
-                  <span>{playlist.name}</span>
-                  <em>{playlist.item_count || 0} 首</em>
-                </label>
-              ))}
-            </div>
-          ) : (
-            <EmptyState title="暂无歌单" meta="可先新建歌单。" />
-          )}
-          {error && <p className="hintText">{error}</p>}
-          <div className="dialogActions">
-            <button className="glassButton" onClick={onClose} disabled={busy}>取消</button>
-            <button className="primaryButton" onClick={() => { void importCollection("existing"); }} disabled={busy || !selectedIds.length}>
-              <Check />{busy ? "保存中" : "加入选中歌单"}
-            </button>
-          </div>
-        </>
-      )}
-    </CardDialog>
   );
 }
 
