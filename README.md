@@ -23,13 +23,13 @@
 
 ### 后端环境
 
-建议使用 Python 3.10 或更高版本。
+建议使用 Python 3.10 或更高版本，并使用项目约定的 Conda 环境 `order-song`。
 
-创建并启用虚拟环境：
+创建并启用环境：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+conda create -n order-song python=3.10
+conda activate order-song
 ```
 
 安装后端依赖：
@@ -44,7 +44,7 @@ python -m pip install -r backend/requirements.txt
 Copy-Item config_template.toml config.toml
 ```
 
-首次部署时建议检查并修改 `config.toml` 中的配置，尤其是 `auth.jwt_secret`。
+首次启动会把 `config.toml` 中精确匹配模板的 `auth.jwt_secret` 占位值原子替换为持久随机密钥；如果配置文件不可写，应用会拒绝使用占位密钥启动。正式部署仍推荐通过 `ORDER_SONG_JWT_SECRET` 环境变量注入至少 32 字节的随机密钥。
 
 ### 前端环境
 
@@ -78,6 +78,23 @@ python backend/run.py
 
 ```powershell
 python backend/run.py --port=5732
+```
+
+## 验证
+
+后端语法和回归测试：
+
+```powershell
+conda activate order-song
+python -m compileall -q backend
+python -m unittest discover -s backend/tests
+```
+
+前端类型检查与生产构建：
+
+```powershell
+cd frontend
+npm run build
 ```
 
 开发前端时，也可以单独启动 Vite 开发服务器：

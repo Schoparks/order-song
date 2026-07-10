@@ -14,9 +14,11 @@ cors_allow_origins = "*"
 sqlite_path = "backend/order_song.sqlite3"
 
 [auth]
-# JWT 签名密钥。长期使用务必改成随机长字符串，不要提交 config.toml。
+# JWT 签名密钥。首次启动会把下方精确占位值原子替换为持久随机密钥；
+# 正式部署也可用 ORDER_SONG_JWT_SECRET 注入至少 32 字节的随机值。
+# 不要提交生成后的 config.toml。
 jwt_secret = "dev-secret-change-me"
-# JWT 签名算法，默认 HS256；不了解时不要改。
+# JWT 签名算法固定为 HS256，其他值会被启动校验拒绝。
 jwt_algorithm = "HS256"
 # 登录有效期，单位分钟；默认 14 天。
 jwt_exp_minutes = 20160

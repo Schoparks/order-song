@@ -26,7 +26,7 @@
 
 .liquidSwitch,
 .checkPill {
-  height: 38px;
+  min-height: 44px;
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -64,7 +64,16 @@
 }
 
 .liquidSwitch input {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.liquidSwitch input:focus-visible + span {
+  outline: 3px solid rgba(13, 124, 134, 0.62);
+  outline-offset: 3px;
 }
 
 .liquidSwitch input:checked + span {
@@ -125,6 +134,9 @@
   padding: 14px;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
+  background: rgba(246, 250, 249, 0.88);
+  backdrop-filter: blur(12px) saturate(120%);
+  -webkit-backdrop-filter: blur(12px) saturate(120%);
 }
 
 .segmented {
@@ -143,7 +155,7 @@
 .segmented button {
   appearance: none;
   -webkit-appearance: none;
-  min-height: 38px;
+  min-height: 44px;
   border: 0;
   border-radius: 16px;
   display: inline-flex;
@@ -198,8 +210,8 @@
   right: 18px;
   bottom: 24px;
   z-index: 4;
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   border: 1px solid rgba(255, 255, 255, 0.72);
   border-radius: 999px;
   color: white;
@@ -244,20 +256,16 @@
   padding: 10px;
   border: 1px solid rgba(255, 255, 255, 0.76);
   border-radius: 22px;
-  background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.72), rgba(248, 253, 251, 0.52)),
-    rgba(255, 255, 255, 0.58);
-  box-shadow: 0 14px 36px rgba(38, 53, 76, 0.12), inset 0 1px 1px rgba(255, 255, 255, 0.72);
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 5px 16px rgba(38, 53, 76, 0.07);
   transition: transform 160ms ease, box-shadow 160ms ease, background 160ms ease;
 }
 
 .songRow:hover,
 .playlistRow:hover {
   transform: translateY(-1px);
-  background:
-    linear-gradient(145deg, rgba(255, 255, 255, 0.86), rgba(244, 251, 249, 0.66)),
-    rgba(255, 255, 255, 0.7);
-  box-shadow: 0 18px 44px rgba(38, 53, 76, 0.18), inset 0 1px 1px rgba(255, 255, 255, 0.84);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 8px 20px rgba(38, 53, 76, 0.1);
 }
 
 .songRowExpandable {
@@ -309,7 +317,7 @@
 }
 
 .songInfo,
-.playlistRow div {
+.playlistOpenButton {
   min-width: 0;
   display: grid;
   gap: 4px;
@@ -331,7 +339,16 @@
 .playlistRow {
   width: 100%;
   grid-template-columns: minmax(0, 1fr) auto;
-  cursor: pointer;
+}
+
+.playlistOpenButton {
+  min-height: 48px;
+  border: 0;
+  padding: 4px 8px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  box-shadow: none;
 }
 
 .playlistRowActions {
@@ -355,4 +372,3 @@
 .playlistList .sectionToolbar {
   margin-bottom: 0;
 }
-

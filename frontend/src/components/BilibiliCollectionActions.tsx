@@ -199,13 +199,14 @@ function BilibiliCollectionPlaylistDialog({
   }
 
   return (
-    <CardDialog title="合集加入歌单" onClose={onClose}>
+    <CardDialog title="合集加入歌单" onClose={onClose} busy={busy}>
       <div className="collectionSummary">
         <strong>{track.title}</strong>
         <span>{track.artist || "-"} · 共 {parts.length} P</span>
       </div>
       <SegmentedTabs
         className="collectionModeTabs"
+        label="合集保存方式"
         value={mode}
         items={[
           { value: "create", label: "新建歌单", icon: <Plus /> },
@@ -221,7 +222,7 @@ function BilibiliCollectionPlaylistDialog({
             void importCollection("create");
           }}
         >
-          <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="歌单名称" />
+          <label className="fieldLabel"><span>歌单名称</span><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="例如：B站合集" /></label>
           {error && <p className="hintText">{error}</p>}
           <div className="dialogActions">
             <button type="button" className="glassButton" onClick={onClose} disabled={busy}>取消</button>

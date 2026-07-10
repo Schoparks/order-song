@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import secrets
 import shutil
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 CONFIG_TEMPLATE_PATH = PROJECT_ROOT / "config_template.toml"
 CONFIG_PATH = PROJECT_ROOT / "config.toml"
+DEFAULT_JWT_SECRET = "dev-secret-change-me"
+_INSECURE_JWT_SECRETS = {"", DEFAULT_JWT_SECRET, "change-me", "secret"}
 
 
 def _positive_int(value: int) -> int:
@@ -50,7 +54,7 @@ class DatabaseSettings(BaseModel):
 class AuthSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    jwt_secret: str = "dev-secret-change-me"
+    jwt_secret: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_exp_minutes: int = 60 * 24 * 14
 
@@ -263,6 +267,38 @@ def ensure_config_file() -> None:
         shutil.copyfile(CONFIG_TEMPLATE_PATH, CONFIG_PATH)
 
 
+def ensure_persistent_jwt_secret() -> None:
+    """Replace the template secret in local config with a persistent random one.
+
+    Explicit environment secrets remain authoritative. If the config cannot be
+    written, startup validation will fail closed instead of serving a public key.
+    """
+    if os.getenv("ORDER_SONG_JWT_SECRET") or os.getenv("ORDER_SONG_AUTH__JWT_SECRET"):
+        return
+    try:
+        content = CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError:
+        return
+    pattern = re.compile(
+        rf'^(?P<prefix>\s*jwt_secret\s*=\s*)["\']{re.escape(DEFAULT_JWT_SECRET)}["\'](?P<suffix>\s*(?:#.*)?)$',
+        re.MULTILINE,
+    )
+    if not pattern.search(content):
+        return
+    generated = secrets.token_urlsafe(48)
+    updated = pattern.sub(rf'\g<prefix>"{generated}"\g<suffix>', content, count=1)
+    temp_path = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.tmp")
+    try:
+        temp_path.write_text(updated, encoding="utf-8")
+        temp_path.chmod(0o600)
+        os.replace(temp_path, CONFIG_PATH)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _set_nested(data: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
     cur = data
     for key in path[:-1]:
@@ -321,12 +357,25 @@ def _apply_env_overrides(data: dict[str, Any]) -> None:
 
 def load_settings() -> Settings:
     ensure_config_file()
+    ensure_persistent_jwt_secret()
     data: dict[str, Any] = {}
     if CONFIG_PATH.exists():
         with CONFIG_PATH.open("rb") as f:
             data = tomllib.load(f)
     _apply_env_overrides(data)
     return Settings.model_validate(data)
+
+
+def validate_auth_configuration(config: Settings) -> None:
+    """Refuse to serve tokens signed by a public or empty placeholder secret."""
+    secret = config.jwt_secret.strip()
+    if secret.lower() in _INSECURE_JWT_SECRETS or len(secret.encode("utf-8")) < 32:
+        raise RuntimeError(
+            "Refusing to start with an insecure JWT secret. Set at least 32 UTF-8 bytes "
+            "in auth.jwt_secret or ORDER_SONG_JWT_SECRET."
+        )
+    if config.jwt_algorithm != "HS256":
+        raise RuntimeError("Unsupported JWT algorithm. auth.jwt_algorithm must be HS256.")
 
 
 settings = load_settings()

@@ -89,7 +89,7 @@
   position: relative;
   justify-self: center;
   max-width: min(520px, 100%);
-  padding: 0 34px;
+  padding: 0 52px;
   min-width: 0;
   text-align: center;
 }
@@ -98,9 +98,9 @@
   position: absolute;
   top: 50%;
   right: 0;
-  width: 24px;
-  height: 24px;
-  min-height: 24px;
+  width: 44px;
+  height: 44px;
+  min-height: 44px;
   padding: 0;
   transform: translateY(-50%);
   box-shadow: none;

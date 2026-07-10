@@ -52,6 +52,14 @@ class CreateRoomIn(BaseModel):
     name: Optional[str] = Field(default=None, max_length=120)
 
 
+class SetRoomModeIn(BaseModel):
+    mode: RoomMode
+
+
+class AdminUserUpdateIn(BaseModel):
+    is_admin: bool
+
+
 class TrackOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int

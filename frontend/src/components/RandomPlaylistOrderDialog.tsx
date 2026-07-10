@@ -59,7 +59,7 @@ export function RandomPlaylistOrderDialog({
   }
 
   return (
-    <CardDialog title="随机点歌" onClose={onCancel}>
+    <CardDialog title="随机点歌" onClose={onCancel} busy={busy}>
       <form
         className="randomOrderForm"
         onSubmit={(event) => {

@@ -1,9 +1,10 @@
-import { useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronLeft, CloudDownload, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
+import { useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import type { Playlist, PlaylistItem, Track } from "../types";
-import { CardDialog, ConfirmDialog, EmptyState, ScrollArea } from "./common";
+import { CardDialog, ConfirmDialog, EmptyState, ScrollArea, useModalFocus } from "./common";
 import { RandomPlaylistOrderDialog } from "./RandomPlaylistOrderDialog";
 import { TrackList, type PlaylistMembership } from "./TrackList";
 
@@ -26,6 +27,10 @@ export function SearchOverlay({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  useDialogViewportLock();
+  const titleId = useId();
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const { dialogRef, onDialogKeyDown } = useModalFocus({ onClose, initialFocusRef: searchInputRef });
   const [query, setQuery] = useState("");
   const [history, setHistory] = useState<string[]>(() => {
     try {
@@ -39,6 +44,9 @@ export function SearchOverlay({
   const [error, setError] = useState("");
   const [historyVisible, setHistoryVisible] = useState(false);
   const historyScopeRef = useRef<HTMLDivElement | null>(null);
+  const searchRequestRef = useRef<{ id: number; controller: AbortController } | null>(null);
+
+  useEffect(() => () => searchRequestRef.current?.controller.abort(), []);
 
   async function run(nextQuery = query) {
     const q = nextQuery.trim();
@@ -49,12 +57,18 @@ export function SearchOverlay({
     const nextHistory = [q, ...history.filter((item) => item !== q)].slice(0, historyLimit);
     setHistory(nextHistory);
     localStorage.setItem("searchHistory", JSON.stringify(nextHistory));
+    searchRequestRef.current?.controller.abort();
+    const request = { id: (searchRequestRef.current?.id || 0) + 1, controller: new AbortController() };
+    searchRequestRef.current = request;
     try {
-      setResults(await api<Track[]>(`/api/search?q=${encodeURIComponent(q)}`, { token }));
+      const nextResults = await api<Track[]>(`/api/search?q=${encodeURIComponent(q)}`, { token, signal: request.controller.signal });
+      if (searchRequestRef.current?.id === request.id) setResults(nextResults);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "搜索失败");
+      if (!(err instanceof Error && err.name === "AbortError") && searchRequestRef.current?.id === request.id) {
+        setError(err instanceof Error ? err.message : "搜索失败");
+      }
     } finally {
-      setBusy(false);
+      if (searchRequestRef.current?.id === request.id) setBusy(false);
     }
   }
 
@@ -67,22 +81,33 @@ export function SearchOverlay({
         if (node && !node.contains(event.target as Node)) setHistoryVisible(false);
       }}
     >
-      <section className="searchSheet glassPanel">
+      <section
+        id="search-overlay"
+        ref={dialogRef}
+        className="searchSheet glassPanel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onKeyDown={onDialogKeyDown}
+      >
         <div className="searchSticky">
           <div className="sheetHeader">
-            <h2>搜索</h2>
-            <button className="iconButton" onClick={onClose}><X /></button>
+            <h2 id={titleId}>搜索</h2>
+            <button className="iconButton" aria-label="关闭搜索" onClick={onClose}><X /></button>
           </div>
           <div ref={historyScopeRef}>
+            <label className="fieldLabel searchFieldLabel" htmlFor="song-search-input">搜索歌曲</label>
             <div className="searchInputWrap">
               <Search />
               <input
+                ref={searchInputRef}
+                id="song-search-input"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onFocus={() => setHistoryVisible(true)}
                 onClick={() => setHistoryVisible(true)}
                 onKeyDown={(e) => e.key === "Enter" && run()}
-                autoFocus
                 placeholder="歌曲、歌手、BV 号或 B 站标题"
               />
               <button className="primaryButton" onClick={() => run()} disabled={busy}>{busy ? "搜索中" : "搜索"}</button>
@@ -95,7 +120,7 @@ export function SearchOverlay({
               </div>
             )}
           </div>
-          {error && <p className="hintText">{error}</p>}
+          {error && <p className="actionError" role="alert">{error}</p>}
         </div>
         <ScrollArea className="searchResults">
           <TrackList
@@ -141,6 +166,8 @@ export function PlaylistsView({
   const [renameOpen, setRenameOpen] = useState(false);
   const [newName, setNewName] = useState("");
   const [renameName, setRenameName] = useState("");
+  const [savingDialog, setSavingDialog] = useState<"create" | "rename" | null>(null);
+  const [dialogError, setDialogError] = useState("");
   const [neteaseUrl, setNeteaseUrl] = useState("");
   const [neteaseName, setNeteaseName] = useState("");
   const [importMessage, setImportMessage] = useState("");
@@ -159,20 +186,36 @@ export function PlaylistsView({
   async function createPlaylist() {
     const name = newName.trim();
     if (!name) return;
-    await api("/api/playlists", { method: "POST", token, json: { name } });
-    setNewName("");
-    setCreateOpen(false);
-    onChanged();
+    setSavingDialog("create");
+    setDialogError("");
+    try {
+      await api("/api/playlists", { method: "POST", token, json: { name } });
+      setNewName("");
+      setCreateOpen(false);
+      onChanged();
+    } catch (error) {
+      setDialogError(error instanceof Error ? error.message : "创建歌单失败");
+    } finally {
+      setSavingDialog(null);
+    }
   }
 
   async function renamePlaylist() {
     if (!selected) return;
     const name = renameName.trim();
     if (!name) return;
-    await api(`/api/playlists/${selected.id}`, { method: "PATCH", token, json: { name } });
-    setSelected({ ...selected, name });
-    setRenameOpen(false);
-    onChanged();
+    setSavingDialog("rename");
+    setDialogError("");
+    try {
+      await api(`/api/playlists/${selected.id}`, { method: "PATCH", token, json: { name } });
+      setSelected({ ...selected, name });
+      setRenameOpen(false);
+      onChanged();
+    } catch (error) {
+      setDialogError(error instanceof Error ? error.message : "重命名失败");
+    } finally {
+      setSavingDialog(null);
+    }
   }
 
   async function importNeteasePlaylist() {
@@ -260,6 +303,7 @@ export function PlaylistsView({
               title="重命名歌单"
               aria-label="重命名歌单"
               onClick={() => {
+                setDialogError("");
                 setRenameName(selected.name);
                 setRenameOpen(true);
               }}
@@ -285,7 +329,7 @@ export function PlaylistsView({
           onChanged={onChanged}
         />
         {renameOpen && (
-          <CardDialog title="重命名歌单" onClose={() => setRenameOpen(false)}>
+          <CardDialog title="重命名歌单" onClose={() => setRenameOpen(false)} busy={savingDialog === "rename"}>
             <form
               className="dialogForm"
               onSubmit={(event) => {
@@ -293,10 +337,11 @@ export function PlaylistsView({
                 renamePlaylist();
               }}
             >
-              <input value={renameName} onChange={(event) => setRenameName(event.target.value)} placeholder="歌单名称" />
+              <label className="fieldLabel"><span>歌单名称</span><input value={renameName} onChange={(event) => setRenameName(event.target.value)} placeholder="请输入新名称" /></label>
+              {dialogError && <p className="actionError" role="alert">{dialogError}</p>}
               <div className="dialogActions">
-                <button type="button" className="glassButton" onClick={() => setRenameOpen(false)}>取消</button>
-                <button className="primaryButton" disabled={!renameName.trim()}><Check />保存</button>
+                <button type="button" className="glassButton" onClick={() => setRenameOpen(false)} disabled={savingDialog === "rename"}>取消</button>
+                <button className="primaryButton" disabled={!renameName.trim() || savingDialog === "rename"}><Check />{savingDialog === "rename" ? "保存中…" : "保存"}</button>
               </div>
             </form>
           </CardDialog>
@@ -311,23 +356,22 @@ export function PlaylistsView({
       <div className="sectionToolbar">
         <h3>我的歌单</h3>
         <div className="toolbarActions">
-          <button className="smallButton" onClick={() => setCreateOpen(true)}><Plus />新建歌单</button>
+          <button className="smallButton" onClick={() => { setDialogError(""); setCreateOpen(true); }}><Plus />新建歌单</button>
           <button className="smallButton" onClick={() => setImportOpen(true)}><CloudDownload />导入网易云</button>
         </div>
       </div>
       {importMessage && <p className="hintText">{importMessage}</p>}
       {!playlists.length && <EmptyState title="暂无歌单" meta="搜索后可将歌曲加入歌单。" />}
       {playlists.map((playlist) => (
-        <article key={playlist.id} className="playlistRow" onClick={() => setSelected(playlist)}>
-          <div>
+        <article key={playlist.id} className="playlistRow">
+          <button className="playlistOpenButton" aria-label={`打开歌单 ${playlist.name}`} onClick={() => setSelected(playlist)}>
             <strong>{playlist.name}</strong>
             <span>{playlist.item_count || 0} 首歌曲</span>
-          </div>
+          </button>
           <div className="rowActions playlistRowActions">
             <button
               className="smallButton"
-              onClick={(e) => {
-                e.stopPropagation();
+              onClick={() => {
                 openRandomOrderDialog(playlist);
               }}
               disabled={(playlist.item_count || 0) < 1}
@@ -336,8 +380,8 @@ export function PlaylistsView({
             </button>
             <button
               className="iconButton danger playlistDeleteButton"
-              onClick={async (e) => {
-                e.stopPropagation();
+              aria-label={`删除歌单 ${playlist.name}`}
+              onClick={() => {
                 setDeleteTarget(playlist);
               }}
             >
@@ -358,7 +402,7 @@ export function PlaylistsView({
         />
       )}
       {createOpen && (
-        <CardDialog title="新建歌单" onClose={() => setCreateOpen(false)}>
+        <CardDialog title="新建歌单" onClose={() => setCreateOpen(false)} busy={savingDialog === "create"}>
           <form
             className="dialogForm"
             onSubmit={(event) => {
@@ -366,16 +410,17 @@ export function PlaylistsView({
               createPlaylist();
             }}
           >
-            <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="歌单名称" />
+            <label className="fieldLabel"><span>歌单名称</span><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="例如：我的最爱" /></label>
+            {dialogError && <p className="actionError" role="alert">{dialogError}</p>}
             <div className="dialogActions">
-              <button type="button" className="glassButton" onClick={() => setCreateOpen(false)}>取消</button>
-              <button className="primaryButton" disabled={!newName.trim()}><Plus />创建</button>
+              <button type="button" className="glassButton" onClick={() => setCreateOpen(false)} disabled={savingDialog === "create"}>取消</button>
+              <button className="primaryButton" disabled={!newName.trim() || savingDialog === "create"}><Plus />{savingDialog === "create" ? "创建中…" : "创建"}</button>
             </div>
           </form>
         </CardDialog>
       )}
       {importOpen && (
-        <CardDialog title="导入网易云歌单" onClose={() => setImportOpen(false)}>
+        <CardDialog title="导入网易云歌单" onClose={() => setImportOpen(false)} busy={importing}>
           <form
             className="dialogForm"
             onSubmit={(event) => {
@@ -383,8 +428,8 @@ export function PlaylistsView({
               importNeteasePlaylist();
             }}
           >
-            <input value={neteaseUrl} onChange={(event) => setNeteaseUrl(event.target.value)} placeholder="网易云歌单链接或 ID" />
-            <input value={neteaseName} onChange={(event) => setNeteaseName(event.target.value)} placeholder="导入后的歌单名，可留空" />
+            <label className="fieldLabel"><span>网易云歌单链接或 ID</span><input value={neteaseUrl} onChange={(event) => setNeteaseUrl(event.target.value)} placeholder="粘贴链接或输入 ID" /></label>
+            <label className="fieldLabel"><span>导入后的歌单名（可留空）</span><input value={neteaseName} onChange={(event) => setNeteaseName(event.target.value)} placeholder="默认使用原歌单名" /></label>
             <div className="dialogActions">
               <button type="button" className="glassButton" onClick={() => setImportOpen(false)} disabled={importing}>取消</button>
               <button className="primaryButton" disabled={importing || !neteaseUrl.trim()}>

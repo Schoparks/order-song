@@ -1,13 +1,16 @@
+import asyncio
 import json
 import re
 from datetime import datetime
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, delete, select
 
 from app.bilibili import parse_bilibili_source_track_id
 from app.core.config import settings
+from app.db import engine
 from app.deps import get_current_user, get_db
 from app.models import Track, TrackOrderStats, TrackSource, User, UserPlaylist, UserPlaylistItem
 from app.routers.queue_playback import _ensure_bilibili_metadata, _get_or_create_track
@@ -43,11 +46,10 @@ def _validate_bilibili_part_payload(payload: dict) -> dict:
         "artist": payload.get("artist"),
         "duration_ms": payload.get("duration_ms"),
         "cover_url": payload.get("cover_url"),
-        "audio_url": payload.get("audio_url"),
     }
 
 
-async def _add_track_payload_to_playlist(
+def _add_track_payload_to_playlist(
     db: Session,
     playlist_id: int,
     payload: dict,
@@ -61,10 +63,7 @@ async def _add_track_payload_to_playlist(
         artist=payload.get("artist"),
         duration_ms=payload.get("duration_ms"),
         cover_url=payload.get("cover_url"),
-        audio_url=payload.get("audio_url"),
     )
-    if tr.source == TrackSource.bilibili and not tr.cover_url:
-        await _ensure_bilibili_metadata(db, tr)
     existing = db.exec(
         select(UserPlaylistItem).where(
             UserPlaylistItem.playlist_id == playlist_id,
@@ -73,9 +72,137 @@ async def _add_track_payload_to_playlist(
     ).first()
     if existing:
         return existing, False
-    it = UserPlaylistItem(playlist_id=playlist_id, track_id=tr.id)
-    db.add(it)
-    return it, True
+    statement = sqlite_insert(UserPlaylistItem).values(playlist_id=playlist_id, track_id=tr.id)
+    statement = statement.on_conflict_do_nothing(index_elements=["playlist_id", "track_id"])
+    result = db.execute(statement)
+    item = db.exec(
+        select(UserPlaylistItem).where(
+            UserPlaylistItem.playlist_id == playlist_id,
+            UserPlaylistItem.track_id == tr.id,
+        )
+    ).first()
+    if not item:
+        raise RuntimeError("playlist item upsert did not return a row")
+    return item, bool(result.rowcount)
+
+
+def _add_playlist_item_transaction(
+    playlist_id: int,
+    user_id: int,
+    payload: dict,
+) -> tuple[int, datetime, int, bool]:
+    with Session(engine) as write_db:
+        playlist = write_db.get(UserPlaylist, playlist_id)
+        if not playlist or playlist.user_id != user_id:
+            raise HTTPException(status_code=404, detail="playlist not found")
+        item, added = _add_track_payload_to_playlist(write_db, playlist_id, payload)
+        write_db.commit()
+        write_db.refresh(item)
+        return item.id, item.created_at, item.track_id, added
+
+
+def _import_bilibili_collection_transaction(
+    *,
+    mode: str,
+    name: str | None,
+    playlist_ids: list[int],
+    tracks: list[dict],
+    user_id: int,
+) -> dict:
+    with Session(engine) as write_db:
+        playlists: list[UserPlaylist] = []
+        if mode == "create":
+            playlist = UserPlaylist(user_id=user_id, name=name or "")
+            write_db.add(playlist)
+            write_db.flush()
+            playlists = [playlist]
+        else:
+            for playlist_id in playlist_ids:
+                playlist = write_db.get(UserPlaylist, playlist_id)
+                if not playlist or playlist.user_id != user_id:
+                    raise HTTPException(status_code=404, detail="playlist not found")
+                playlists.append(playlist)
+
+        results = []
+        total_added = 0
+        total_skipped = 0
+        try:
+            for playlist in playlists:
+                added = 0
+                skipped = 0
+                for track in tracks:
+                    _, was_added = _add_track_payload_to_playlist(write_db, playlist.id, track)
+                    if was_added:
+                        added += 1
+                    else:
+                        skipped += 1
+                total_added += added
+                total_skipped += skipped
+                results.append({
+                    "playlist_id": playlist.id,
+                    "playlist_name": playlist.name,
+                    "added": added,
+                    "skipped": skipped,
+                })
+            write_db.commit()
+        except BaseException:
+            write_db.rollback()
+            raise
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "added": total_added,
+            "skipped": total_skipped,
+            "total": len(tracks) * len(playlists),
+            "track_total": len(tracks),
+            "results": results,
+        }
+
+
+def _import_netease_tracks_transaction(
+    user_id: int,
+    playlist_name: str,
+    tracks: list[dict],
+    skipped: int,
+) -> dict:
+    with Session(engine) as write_db:
+        playlist = UserPlaylist(user_id=user_id, name=playlist_name)
+        write_db.add(playlist)
+        write_db.flush()
+        added = 0
+        try:
+            for payload in tracks:
+                track = _get_or_create_track(
+                    write_db,
+                    source=TrackSource.netease,
+                    source_track_id=payload["source_track_id"],
+                    title=payload["title"],
+                    artist=payload["artist"],
+                    duration_ms=payload["duration_ms"],
+                    cover_url=payload["cover_url"],
+                )
+                existing = write_db.exec(
+                    select(UserPlaylistItem).where(
+                        UserPlaylistItem.playlist_id == playlist.id,
+                        UserPlaylistItem.track_id == track.id,
+                    )
+                ).first()
+                if not existing:
+                    write_db.add(UserPlaylistItem(playlist_id=playlist.id, track_id=track.id))
+                    added += 1
+            write_db.commit()
+        except BaseException:
+            write_db.rollback()
+            raise
+        return {
+            "ok": True,
+            "playlist_id": playlist.id,
+            "playlist_name": playlist_name,
+            "added": added,
+            "skipped": skipped,
+            "total": len(tracks) + skipped,
+        }
 
 
 @router.get("/playlists")
@@ -151,7 +278,6 @@ def playlist_items(playlist_id: int, db: Session = Depends(get_db), user: User =
                 "artist": tr.artist,
                 "duration_ms": tr.duration_ms,
                 "cover_url": tr.cover_url,
-                "audio_url": tr.audio_url,
             },
         }
         for it, tr in rows
@@ -160,14 +286,20 @@ def playlist_items(playlist_id: int, db: Session = Depends(get_db), user: User =
 
 @router.post("/playlists/{playlist_id}/items")
 async def add_playlist_item(playlist_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    pl = db.get(UserPlaylist, playlist_id)
-    if not pl or pl.user_id != user.id:
-        raise HTTPException(status_code=404, detail="playlist not found")
-    it, added = await _add_track_payload_to_playlist(db, playlist_id, payload)
+    _validate_track_payload(payload)
+    db.rollback()
+    item_id, created_at, track_id, added = await asyncio.to_thread(
+        _add_playlist_item_transaction,
+        playlist_id,
+        user.id,
+        payload,
+    )
     if added:
-        db.commit()
-        db.refresh(it)
-    return {"id": it.id, "created_at": it.created_at}
+        db.expire_all()
+        track = db.get(Track, track_id)
+        if track and track.source == TrackSource.bilibili and not track.cover_url:
+            await _ensure_bilibili_metadata(db, track)
+    return {"id": item_id, "created_at": created_at}
 
 
 @router.delete("/playlists/{playlist_id}/items/{item_id}")
@@ -245,16 +377,12 @@ async def import_bilibili_collection(payload: dict, db: Session = Depends(get_db
         raise HTTPException(status_code=400, detail="tracks required")
     tracks = [_validate_bilibili_part_payload(track) for track in raw_tracks]
 
-    playlists: list[UserPlaylist] = []
+    name: str | None = None
+    playlist_ids: list[int] = []
     if mode == "create":
         name = (payload.get("name") or "").strip()
         if not name:
             raise HTTPException(status_code=400, detail="name required")
-        pl = UserPlaylist(user_id=user.id, name=name)
-        db.add(pl)
-        db.commit()
-        db.refresh(pl)
-        playlists = [pl]
     else:
         raw_ids = payload.get("playlist_ids")
         if not isinstance(raw_ids, list) or not raw_ids:
@@ -266,42 +394,17 @@ async def import_bilibili_collection(payload: dict, db: Session = Depends(get_db
             if raw_id in seen_ids:
                 continue
             seen_ids.add(raw_id)
-            pl = db.get(UserPlaylist, raw_id)
-            if not pl or pl.user_id != user.id:
-                raise HTTPException(status_code=404, detail="playlist not found")
-            playlists.append(pl)
+            playlist_ids.append(raw_id)
 
-    results = []
-    total_added = 0
-    total_skipped = 0
-    for pl in playlists:
-        added = 0
-        skipped = 0
-        for track in tracks:
-            _, was_added = await _add_track_payload_to_playlist(db, pl.id, track)
-            if was_added:
-                added += 1
-            else:
-                skipped += 1
-        db.commit()
-        total_added += added
-        total_skipped += skipped
-        results.append({
-            "playlist_id": pl.id,
-            "playlist_name": pl.name,
-            "added": added,
-            "skipped": skipped,
-        })
-
-    return {
-        "ok": True,
-        "mode": mode,
-        "added": total_added,
-        "skipped": total_skipped,
-        "total": len(tracks) * len(playlists),
-        "track_total": len(tracks),
-        "results": results,
-    }
+    db.rollback()
+    return await asyncio.to_thread(
+        _import_bilibili_collection_transaction,
+        mode=mode,
+        name=name,
+        playlist_ids=playlist_ids,
+        tracks=tracks,
+        user_id=user.id,
+    )
 
 
 @router.post("/playlists/import-netease")
@@ -379,12 +482,7 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
                 pass
 
     playlist_name = (payload.get("name") or "").strip() or netease_name
-    pl = UserPlaylist(user_id=user.id, name=playlist_name)
-    db.add(pl)
-    db.commit()
-    db.refresh(pl)
-
-    added = 0
+    import_tracks: list[dict] = []
     skipped = 0
     for s in tracks_raw:
         sid = s.get("id")
@@ -402,34 +500,26 @@ async def import_netease_playlist(payload: dict, db: Session = Depends(get_db), 
         cover_url = album.get("picUrl")
         duration_ms = s.get("dt") or s.get("duration")
 
-        tr = _get_or_create_track(
-            db,
-            source=TrackSource.netease,
-            source_track_id=str(sid),
-            title=s.get("name") or str(sid),
-            artist=artist,
-            duration_ms=duration_ms,
-            cover_url=cover_url,
-        )
-        existing = db.exec(
-            select(UserPlaylistItem).where(
-                UserPlaylistItem.playlist_id == pl.id,
-                UserPlaylistItem.track_id == tr.id,
-            )
-        ).first()
-        if not existing:
-            db.add(UserPlaylistItem(playlist_id=pl.id, track_id=tr.id))
-            added += 1
+        import_tracks.append({
+            "source_track_id": str(sid),
+            "title": s.get("name") or str(sid),
+            "artist": artist,
+            "duration_ms": duration_ms,
+            "cover_url": cover_url,
+        })
 
-    db.commit()
-    return {
-        "ok": True,
-        "playlist_id": pl.id,
-        "playlist_name": playlist_name,
-        "added": added,
-        "skipped": skipped,
-        "total": len(tracks_raw),
-    }
+    db.rollback()
+    result = await asyncio.to_thread(
+        _import_netease_tracks_transaction,
+        user.id,
+        playlist_name,
+        import_tracks,
+        skipped,
+    )
+    # Preserve the upstream total, including malformed entries that were ignored
+    # before persistence.
+    result["total"] = len(tracks_raw)
+    return result
 
 
 @router.get("/trending")

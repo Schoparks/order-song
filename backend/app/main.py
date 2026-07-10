@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -10,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
 from app.audio_loudness import is_loudness_analysis_available
-from app.core.config import settings
+from app.core.config import settings, validate_auth_configuration
 from app.core.security import decode_token
 from app.db import engine, init_db
 from app.models import RoomMember
@@ -23,7 +25,48 @@ from app.routers.admin import router as admin_router
 from app.ws import hub
 
 
-app = FastAPI(title=settings.app_name)
+logger = logging.getLogger(__name__)
+
+
+async def _cleanup_stale_members() -> None:
+    """Remove members after both socket presence and REST activity go stale."""
+    while True:
+        await asyncio.sleep(settings.rooms.stale_check_interval_s)
+        try:
+            stale = await hub.get_stale_users(timeout_seconds=settings.rooms.stale_timeout_s)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to collect stale room members")
+            continue
+        for room_id, user_id in stale:
+            try:
+                await remove_member_from_room(room_id, user_id)
+                await hub.clear_stale_user(room_id, user_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Failed to remove stale room member room_id=%s user_id=%s",
+                    room_id,
+                    user_id,
+                )
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    validate_auth_configuration(settings)
+    init_db()
+    cleanup_task = asyncio.create_task(_cleanup_stale_members(), name="stale-room-member-cleanup")
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+
+
+app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 
 _origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
 app.add_middleware(
@@ -33,33 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def _startup() -> None:
-    init_db()
-
-
-@app.on_event("startup")
-async def _startup_bg_tasks() -> None:
-    asyncio.create_task(_cleanup_stale_members())
-
-
-async def _cleanup_stale_members() -> None:
-    """Remove members who have been disconnected for 30+ minutes."""
-    while True:
-        await asyncio.sleep(settings.rooms.stale_check_interval_s)
-        try:
-            stale = await hub.get_stale_users(timeout_seconds=settings.rooms.stale_timeout_s)
-            for room_id, user_id in stale:
-                try:
-                    with Session(engine) as db:
-                        await remove_member_from_room(db, room_id, user_id)
-                    await hub.clear_stale_user(room_id, user_id)
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
 
 @app.get("/health")

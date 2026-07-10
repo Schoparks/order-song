@@ -303,10 +303,11 @@ export function App() {
     setToken(null);
     setAdminToken(null);
     localStorage.removeItem(TOKEN_STORAGE_KEY);
-    setRoomId(null);
+    // Keep roomId:{user_id} so the same account can resume its room after logging in again.
+    setRoomIdState(null);
     setHint("");
     queryClient.clear();
-  }, [queryClient, setRoomId]);
+  }, [queryClient]);
 
   useEffect(() => {
     if (meQuery.error instanceof ApiError && meQuery.error.status === 401) logout();
@@ -362,9 +363,20 @@ export function App() {
         onTogglePlayEnabled={audio.setPlayEnabled}
         userMenuOpen={userMenuOpen}
         membersOpen={membersOpen}
-        onToggleUserMenu={() => setUserMenuOpen((v) => !v)}
-        onToggleMembers={() => setMembersOpen((v) => !v)}
-        onSearch={() => setSearchOpen(true)}
+        searchOpen={searchOpen}
+        onToggleUserMenu={() => {
+          setMembersOpen(false);
+          setUserMenuOpen((v) => !v);
+        }}
+        onToggleMembers={() => {
+          setUserMenuOpen(false);
+          setMembersOpen((v) => !v);
+        }}
+        onSearch={() => {
+          setUserMenuOpen(false);
+          setMembersOpen(false);
+          setSearchOpen(true);
+        }}
         onLeave={async () => {
           await api(`/api/rooms/${roomId}/leave`, { method: "POST", token }).catch(() => {});
           handleRoomGone();
@@ -394,6 +406,7 @@ export function App() {
           <section className="glassPanel libraryPanel">
             <SegmentedTabs
               className="libraryTabs"
+              label="内容分类"
               value={tab}
               onChange={(value) => setTab(value as Tab)}
               items={libraryTabs}
@@ -438,6 +451,7 @@ export function App() {
 
         <aside className="sideColumn glassPanel">
           <SegmentedTabs
+            label="队列视图"
             value={queueTab}
             onChange={(value) => setQueueTab(value as QueueTab)}
             items={[

@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -5,8 +6,10 @@ from urllib.parse import urlparse
 import httpx
 from sqlmodel import Session
 
+from app.audio_loudness import validate_trusted_audio_url
 from app.bilibili import find_bilibili_page, normalize_bilibili_pic, parse_bilibili_source_track_id
 from app.core.config import settings
+from app.db import engine
 from app.models import Track, TrackSource
 
 
@@ -20,8 +23,9 @@ class AudioResolveResult:
 
 
 def _direct_playback_audio_url(track: Track) -> str | None:
-    if track.audio_url:
-        return track.audio_url
+    if track.audio_url and validate_trusted_audio_url(track.audio_url, track.source.value) is None:
+        if track.source != TrackSource.bilibili or _is_bilibili_browser_direct_url(track.audio_url):
+            return track.audio_url
     if track.source == TrackSource.netease:
         return f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
     return None
@@ -100,47 +104,66 @@ async def _fetch_bilibili_video_metadata(source_track_id: str) -> dict[str, Any]
 async def _ensure_bilibili_metadata(db: Session, track: Track) -> dict[str, Any] | None:
     if track.source != TrackSource.bilibili:
         return None
-    video = await _fetch_bilibili_video_metadata(track.source_track_id)
+    source_track_id = track.source_track_id
+    track_id = track.id
+    db.rollback()
+    video = await _fetch_bilibili_video_metadata(source_track_id)
     if not video:
         return None
 
-    ref = parse_bilibili_source_track_id(track.source_track_id)
-    page = find_bilibili_page(video, ref)
-    changed = False
-    cover_url = normalize_bilibili_pic(video.get("pic"))
-    owner = video.get("owner") or {}
-    video_duration = video.get("duration")
-    page_duration = page.get("duration") if page else None
-    target_duration = page_duration if ref.is_part and page_duration is not None else video_duration
-    video_duration_ms = int(video_duration) * 1000 if isinstance(video_duration, (int, float)) else None
-    target_duration_ms = int(target_duration) * 1000 if isinstance(target_duration, (int, float)) else None
-    part_title = str(page.get("part") or "").strip() if page else ""
+    if not track_id:
+        return video
 
-    if cover_url and not track.cover_url:
-        track.cover_url = cover_url
-        changed = True
-    if isinstance(owner, dict) and owner.get("name") and not track.artist:
-        track.artist = owner["name"]
-        changed = True
-    if target_duration_ms and (not track.duration_ms or (ref.is_part and track.duration_ms == video_duration_ms)):
-        track.duration_ms = target_duration_ms
-        changed = True
-    if ref.is_part and part_title and (
-        not track.title
-        or track.title == track.source_track_id
-        or track.title == video.get("title")
-    ):
-        track.title = part_title
-        changed = True
-    elif video.get("title") and (not track.title or track.title == track.source_track_id):
-        track.title = video["title"]
-        changed = True
-
-    if changed:
-        db.add(track)
-        db.commit()
-        db.refresh(track)
+    # The upstream request above runs on the event loop. Persist its result in a
+    # fresh worker-owned Session so a slow SQLite commit cannot stall playback
+    # heartbeats, and never move the request Session across threads.
+    await asyncio.to_thread(_apply_bilibili_metadata_transaction, track_id, video)
+    db.expire_all()
+    db.refresh(track)
     return video
+
+
+def _apply_bilibili_metadata_transaction(track_id: int, video: dict[str, Any]) -> None:
+    with Session(engine) as write_db:
+        track = write_db.get(Track, track_id)
+        if not track or track.source != TrackSource.bilibili:
+            return
+
+        ref = parse_bilibili_source_track_id(track.source_track_id)
+        page = find_bilibili_page(video, ref)
+        changed = False
+        cover_url = normalize_bilibili_pic(video.get("pic"))
+        owner = video.get("owner") or {}
+        video_duration = video.get("duration")
+        page_duration = page.get("duration") if page else None
+        target_duration = page_duration if ref.is_part and page_duration is not None else video_duration
+        video_duration_ms = int(video_duration) * 1000 if isinstance(video_duration, (int, float)) else None
+        target_duration_ms = int(target_duration) * 1000 if isinstance(target_duration, (int, float)) else None
+        part_title = str(page.get("part") or "").strip() if page else ""
+
+        if cover_url and not track.cover_url:
+            track.cover_url = cover_url
+            changed = True
+        if isinstance(owner, dict) and owner.get("name") and not track.artist:
+            track.artist = owner["name"]
+            changed = True
+        if target_duration_ms and (not track.duration_ms or (ref.is_part and track.duration_ms == video_duration_ms)):
+            track.duration_ms = target_duration_ms
+            changed = True
+        if ref.is_part and part_title and (
+            not track.title
+            or track.title == track.source_track_id
+            or track.title == video.get("title")
+        ):
+            track.title = part_title
+            changed = True
+        elif video.get("title") and (not track.title or track.title == track.source_track_id):
+            track.title = video["title"]
+            changed = True
+
+        if changed:
+            write_db.add(track)
+            write_db.commit()
 
 
 async def _resolve_netease_audio(source_track_id: str) -> AudioResolveResult:
@@ -243,7 +266,9 @@ async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str,
             candidates = aac if aac else audio_list
             candidates.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
             loudness.analysis_audio_url = candidates[0].get("baseUrl") or candidates[0].get("base_url")
-            loudness.audio_url = playback_url or loudness.analysis_audio_url
+            # DASH audio-only URLs are for backend analysis. They commonly return 403
+            # to browsers, so never promote them to the browser playback field.
+            loudness.audio_url = playback_url
             return loudness
     except Exception:
         return AudioResolveResult()

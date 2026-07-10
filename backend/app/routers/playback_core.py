@@ -1,5 +1,5 @@
 import asyncio
-import subprocess
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -7,7 +7,6 @@ from typing import Any, Optional
 from sqlmodel import Session, select
 
 from app.audio_loudness import analyze_remote_audio_loudness, is_loudness_analysis_available
-from app.bilibili import bilibili_page_url
 from app.core.config import settings
 from app.db import engine
 from app.models import QueueStatus, RoomMode, RoomPlaybackState, RoomQueueItem, Track, TrackSource, User
@@ -29,6 +28,7 @@ _PLAYBACK_LOCKS: dict[int, asyncio.Lock] = {}
 _AUDIO_URL_RESOLVE_ERRORS: dict[int, float] = {}
 _AUDIO_URL_ERROR_RETRY_SECONDS = 30
 _LOUDNESS_ANALYSIS_TASKS: dict[int, asyncio.Task] = {}
+_LOUDNESS_RECOVERY_TASKS: dict[tuple[int, int], asyncio.Task] = {}
 _LOUDNESS_ERROR_RETRY_SECONDS = 3600
 _LOUDNESS_ANALYSIS_SEMAPHORE = asyncio.Semaphore(1)
 _LOUDNESS_PREFETCH_TASKS: dict[int, asyncio.Task] = {}
@@ -39,6 +39,7 @@ _ROOM_NORMALIZER_PREF_TTL_SECONDS = 600
 _ROOM_LOUDNESS_WAITING: dict[int, int] = {}
 _BACKEND_LOUDNESS_SOURCES = {TrackSource.netease, TrackSource.bilibili}
 _UNTRUSTED_LOUDNESS_SOURCES = {"netease:player-url"}
+logger = logging.getLogger(__name__)
 
 
 def _playback_lock(room_id: int) -> asyncio.Lock:
@@ -188,39 +189,103 @@ def _schedule_loudness_analysis(track_id: int | None, source: TrackSource, analy
                     analysis_audio_url,
                     headers=_loudness_analysis_headers(source),
                     source=f"{source.value}:ffmpeg-ebur128",
+                    trusted_source=source.value,
                 )
-            with Session(engine) as db:
-                track = db.get(Track, track_id)
-                if not track:
-                    return
-                if result.analysis:
-                    track.loudness_gain_db = _clamp_loudness_gain_db(result.analysis.gain_db)
-                    track.loudness_peak = result.analysis.peak
-                    track.loudness_source = result.analysis.source
-                    track.loudness_error = None
-                    track.loudness_fetched_at = datetime.utcnow()
-                elif result.error and (force or not _recent_loudness_error(track)):
-                    _store_loudness_error(track, result.error)
-                db.add(track)
-                db.commit()
-            await _handle_loudness_analysis_finished(track_id)
+            await asyncio.to_thread(
+                _persist_loudness_result_transaction,
+                track_id,
+                result.analysis.gain_db if result.analysis else None,
+                result.analysis.peak if result.analysis else None,
+                result.analysis.source if result.analysis else None,
+                result.error,
+                force,
+            )
+        except asyncio.CancelledError:
+            logger.info("loudness analysis cancelled for track %s", track_id)
+            raise
+        except Exception as exc:
+            logger.exception("loudness analysis failed unexpectedly for track %s", track_id)
+            try:
+                await asyncio.to_thread(
+                    _persist_loudness_exception_transaction,
+                    track_id,
+                    f"unexpected analysis failure: {exc}",
+                )
+            except Exception:
+                logger.exception("failed to persist loudness error for track %s", track_id)
         finally:
-            _LOUDNESS_ANALYSIS_TASKS.pop(track_id, None)
+            try:
+                await asyncio.shield(_handle_loudness_analysis_finished(track_id))
+            except Exception:
+                logger.exception("failed to release loudness wait for track %s", track_id)
+            finally:
+                _LOUDNESS_ANALYSIS_TASKS.pop(track_id, None)
 
     _LOUDNESS_ANALYSIS_TASKS[track_id] = asyncio.create_task(_run())
 
 
+def _persist_loudness_result_transaction(
+    track_id: int,
+    gain_db: float | None,
+    peak: float | None,
+    source: str | None,
+    error: str | None,
+    force: bool,
+) -> None:
+    with Session(engine) as write_db:
+        track = write_db.get(Track, track_id)
+        if not track:
+            return
+        if source is not None:
+            track.loudness_gain_db = _clamp_loudness_gain_db(gain_db)
+            track.loudness_peak = peak
+            track.loudness_source = source
+            track.loudness_error = None
+            track.loudness_fetched_at = datetime.utcnow()
+        elif error and (force or not _recent_loudness_error(track)):
+            _store_loudness_error(track, error)
+        else:
+            return
+        write_db.add(track)
+        write_db.commit()
+
+
+def _persist_loudness_exception_transaction(track_id: int, error: str) -> None:
+    with Session(engine) as write_db:
+        track = write_db.get(Track, track_id)
+        if not track:
+            return
+        _store_loudness_error(track, error)
+        write_db.add(track)
+        write_db.commit()
+
+
+def _clear_untrusted_loudness_transaction(track_id: int) -> None:
+    with Session(engine) as write_db:
+        track = write_db.get(Track, track_id)
+        if track and _clear_untrusted_loudness_metadata(track):
+            write_db.add(track)
+            write_db.commit()
+
+
 async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
-    if _clear_untrusted_loudness_metadata(track):
-        db.add(track)
-        db.commit()
+    if track.id and track.loudness_source in _UNTRUSTED_LOUDNESS_SOURCES:
+        db.rollback()
+        await asyncio.to_thread(_clear_untrusted_loudness_transaction, track.id)
+        db.expire_all()
         db.refresh(track)
 
     if track.audio_url:
-        if track.source == TrackSource.bilibili and not _is_bilibili_browser_direct_url(track.audio_url):
+        if track.source == TrackSource.bilibili and (
+            not _is_bilibili_browser_direct_url(track.audio_url)
+            or _direct_playback_audio_url(track) != track.audio_url
+        ):
             await _resolve_audio_url(db, track, force=True)
             return
         if track.source == TrackSource.bilibili and track.loudness_source is None and not _recent_loudness_error(track):
+            await _resolve_audio_url(db, track, force=True)
+            return
+        if track.source == TrackSource.netease and _direct_playback_audio_url(track) != track.audio_url:
             await _resolve_audio_url(db, track, force=True)
             return
         if track.source == TrackSource.netease and _track_needs_backend_loudness(track):
@@ -261,11 +326,12 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         return track.audio_url
 
     if track.source == TrackSource.netease:
-        result = await _resolve_netease_audio(track.source_track_id)
-        track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
-        _clear_untrusted_loudness_metadata(track)
-        db.add(track)
-        db.commit()
+        track_id = track.id
+        source_track_id = track.source_track_id
+        db.rollback()
+        result = await _resolve_netease_audio(source_track_id)
+        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
+        db.expire_all()
         db.refresh(track)
         if _track_needs_backend_loudness(track):
             _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url or track.audio_url, force=force)
@@ -274,41 +340,44 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     if track.source == TrackSource.bilibili:
         if video is None:
             video = await _ensure_bilibili_metadata(db, track)
-        result = await _resolve_bilibili_audio(track.source_track_id, video_data=video)
-        audio_url = result.audio_url
-
-        if not audio_url:
-            page_url = bilibili_page_url(track.source_track_id)
-
-            def _run() -> Optional[str]:
-                try:
-                    r = subprocess.run(
-                        ["yt-dlp", "-f", "ba", "-g", "--no-playlist", page_url],
-                        capture_output=True,
-                        text=True,
-                        timeout=settings.upstream.yt_dlp_timeout_s,
-                        check=False,
-                    )
-                    if r.returncode != 0:
-                        return None
-                    out = (r.stdout or "").strip().splitlines()
-                    return out[-1].strip() if out else None
-                except Exception:
-                    return None
-
-            audio_url = await asyncio.to_thread(_run)
-
-        if audio_url:
-            track.audio_url = audio_url
-            _store_loudness_metadata(track, result)
-            db.add(track)
-            db.commit()
-            db.refresh(track)
-            if not _result_has_loudness(result) and (force or not _recent_loudness_error(track)):
-                _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url, force=force)
+        track_id = track.id
+        source_track_id = track.source_track_id
+        db.rollback()
+        result = await _resolve_bilibili_audio(source_track_id, video_data=video)
+        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
+        db.expire_all()
+        db.refresh(track)
+        if not _result_has_loudness(result) and (force or not _recent_loudness_error(track)):
+            _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url, force=force)
         return track.audio_url
 
     return None
+
+
+def _persist_audio_resolution_transaction(
+    track_id: int | None,
+    result: AudioResolveResult,
+    force: bool,
+) -> None:
+    if not track_id:
+        return
+    with Session(engine) as write_db:
+        track = write_db.get(Track, track_id)
+        if not track:
+            return
+        if track.source == TrackSource.netease:
+            track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
+            _clear_untrusted_loudness_metadata(track)
+            write_db.add(track)
+            write_db.commit()
+            return
+        if track.source != TrackSource.bilibili:
+            return
+        if force or result.audio_url or _result_has_loudness(result):
+            track.audio_url = result.audio_url
+            _store_loudness_metadata(track, result)
+            write_db.add(track)
+            write_db.commit()
 
 
 def _schedule_track_loudness_prefetch(track_id: int | None) -> None:
@@ -354,32 +423,64 @@ def _schedule_next_loudness_prefetch(db: Session, room_id: int) -> None:
         _schedule_track_loudness_prefetch(track.id)
 
 
-async def _prepare_current_track_for_playback(db: Session, room_id: int, pb: RoomPlaybackState, qi: RoomQueueItem | None, tr: Track | None) -> None:
+def _hold_for_loudness_transaction(room_id: int, queue_item_id: int) -> bool:
+    with Session(engine) as write_db:
+        pb = write_db.get(RoomPlaybackState, room_id)
+        if not pb or pb.current_queue_item_id != queue_item_id or not pb.is_playing:
+            return False
+        pb.is_playing = False
+        pb.position_ms = 0
+        pb.updated_at = datetime.utcnow()
+        write_db.add(pb)
+        write_db.commit()
+        return True
+
+
+async def _prepare_current_track_for_playback(db: Session, room_id: int, pb: RoomPlaybackState, qi: RoomQueueItem | None, tr: Track | None) -> bool:
+    """Prepare one expected queue item, returning False if it changed across an await."""
+    expected_queue_item_id = qi.id if qi else None
     room_prefers_loudness_wait = _room_prefers_loudness_wait(room_id)
     if tr and (pb.mode == RoomMode.play_enabled or room_prefers_loudness_wait):
         await _ensure_playback_audio_url(db, tr)
-        db.refresh(tr)
+        # End any read snapshot held across the upstream request, then re-read the
+        # authoritative playback row before applying pause/wait state.
+        db.rollback()
+        db.expire_all()
+        pb = db.get(RoomPlaybackState, room_id)
+        if not pb or pb.current_queue_item_id != expected_queue_item_id:
+            _clear_loudness_wait_if_changed(room_id, pb.current_queue_item_id if pb else None)
+            return False
+        qi = db.get(RoomQueueItem, expected_queue_item_id) if expected_queue_item_id else None
+        tr = db.get(Track, qi.track_id) if qi else None
     if not qi or not tr or not tr.id:
-        return
+        return expected_queue_item_id is None
+    if (
+        _is_loudness_waiting(room_id, qi.id)
+        and tr.id not in _LOUDNESS_ANALYSIS_TASKS
+        and not _track_needs_backend_loudness(tr)
+    ):
+        # Preparation is called both with and without the room lock. Schedule an
+        # independent recovery task instead of trying to acquire the same lock
+        # recursively or mutating playback without it.
+        _schedule_loudness_wait_recovery(room_id, qi.id)
     if not (
         pb.is_playing
         and room_prefers_loudness_wait
         and is_loudness_analysis_available()
         and _track_needs_backend_loudness(tr)
     ):
-        return
+        return True
     if _effective_position_ms(pb) > 1500:
-        return
+        return True
     if tr.id not in _LOUDNESS_ANALYSIS_TASKS:
-        return
+        return True
 
-    pb.is_playing = False
-    pb.position_ms = 0
-    pb.updated_at = datetime.utcnow()
-    db.add(pb)
-    db.commit()
-    db.refresh(pb)
-    _ROOM_LOUDNESS_WAITING[room_id] = qi.id
+    db.rollback()
+    held = await asyncio.to_thread(_hold_for_loudness_transaction, room_id, qi.id)
+    db.expire_all()
+    if held:
+        _ROOM_LOUDNESS_WAITING[room_id] = qi.id
+    return held
 
 
 async def _handle_loudness_analysis_finished(track_id: int) -> None:
@@ -390,37 +491,114 @@ async def _handle_loudness_analysis_finished(track_id: int) -> None:
             .where(RoomQueueItem.track_id == track_id)
         ).all()
     for room_id, queue_item_id in rows:
-        async with _playback_lock(room_id):
-            with Session(engine) as db:
-                pb = db.get(RoomPlaybackState, room_id)
-                if not pb or pb.current_queue_item_id != queue_item_id:
-                    _clear_loudness_wait_if_changed(room_id, pb.current_queue_item_id if pb else None)
-                    continue
-                if _is_loudness_waiting(room_id, queue_item_id):
-                    _ROOM_LOUDNESS_WAITING.pop(room_id, None)
-                    await _set_playback(db, room_id, is_playing=True, position_ms=0)
-                else:
+        if _is_loudness_waiting(room_id, queue_item_id):
+            _schedule_loudness_wait_recovery(room_id, queue_item_id)
+        else:
+            async with _playback_lock(room_id):
+                with Session(engine) as db:
                     await _broadcast_playback_snapshot(db, room_id)
 
 
+def _resume_loudness_wait_transaction(room_id: int, queue_item_id: int) -> str:
+    with Session(engine) as write_db:
+        pb = write_db.get(RoomPlaybackState, room_id)
+        if not pb or pb.current_queue_item_id != queue_item_id:
+            return "changed"
+        pb.is_playing = True
+        pb.position_ms = 0
+        pb.updated_at = datetime.utcnow()
+        write_db.add(pb)
+        write_db.commit()
+        return "resumed"
+
+
+async def _resume_loudness_wait_with_retry(
+    room_id: int,
+    queue_item_id: int,
+    *,
+    attempts: int = 4,
+) -> bool:
+    """Fail open after analysis, retrying transient SQLite contention."""
+    for attempt in range(max(1, attempts)):
+        async with _playback_lock(room_id):
+            if not _is_loudness_waiting(room_id, queue_item_id):
+                return True
+            try:
+                outcome = await asyncio.to_thread(
+                    _resume_loudness_wait_transaction,
+                    room_id,
+                    queue_item_id,
+                )
+            except Exception:
+                logger.exception(
+                    "failed to resume room %s after loudness analysis (attempt %s/%s)",
+                    room_id,
+                    attempt + 1,
+                    attempts,
+                )
+            else:
+                _ROOM_LOUDNESS_WAITING.pop(room_id, None)
+                if outcome == "resumed":
+                    try:
+                        with Session(engine) as db:
+                            await _broadcast_playback_snapshot(db, room_id)
+                    except Exception:
+                        logger.exception("failed to broadcast resumed loudness state for room %s", room_id)
+                return True
+        if attempt + 1 < attempts:
+            await asyncio.sleep(min(2 ** attempt, 4))
+    # Keep the marker so a later room-state request or normalizer-off request can
+    # make another recovery attempt instead of leaving an unobservable pause.
+    return False
+
+
+def _schedule_loudness_wait_recovery(room_id: int, queue_item_id: int) -> asyncio.Task:
+    """Start one bounded, lock-owned fail-open recovery attempt for a room."""
+    key = (room_id, queue_item_id)
+    existing = _LOUDNESS_RECOVERY_TASKS.get(key)
+    if existing and not existing.done():
+        return existing
+
+    async def _run() -> bool:
+        try:
+            return await _resume_loudness_wait_with_retry(room_id, queue_item_id)
+        finally:
+            _LOUDNESS_RECOVERY_TASKS.pop(key, None)
+
+    task = asyncio.create_task(_run())
+    _LOUDNESS_RECOVERY_TASKS[key] = task
+    return task
+
+
 async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
+    db.expire_all()
     pb = db.get(RoomPlaybackState, room_id)
     if not pb:
         return
 
-    current_track = None
-    ordered_by = None
-    current_queue_item_id = pb.current_queue_item_id
     if pb.current_queue_item_id:
         qi = db.get(RoomQueueItem, pb.current_queue_item_id)
         if qi:
-            u = db.get(User, qi.ordered_by_user_id)
-            if u:
-                ordered_by = {"id": u.id, "username": u.username}
             tr = db.get(Track, qi.track_id)
             await _prepare_current_track_for_playback(db, room_id, pb, qi, tr)
-            if tr:
-                current_track = _playback_track_payload(tr)
+
+    db.rollback()
+    db.expire_all()
+    pb = db.get(RoomPlaybackState, room_id)
+    if not pb:
+        return
+    current_track = None
+    ordered_by = None
+    current_queue_item_id = pb.current_queue_item_id
+    if current_queue_item_id:
+        qi = db.get(RoomQueueItem, current_queue_item_id)
+        if qi:
+            user = db.get(User, qi.ordered_by_user_id)
+            if user:
+                ordered_by = {"id": user.id, "username": user.username}
+            track = db.get(Track, qi.track_id)
+            if track:
+                current_track = _playback_track_payload(track)
 
     await hub.broadcast(
         room_id,
@@ -435,6 +613,66 @@ async def _broadcast_playback_snapshot(db: Session, room_id: int) -> None:
     )
 
 
+def _set_playback_transaction(
+    room_id: int,
+    *,
+    is_playing: Optional[bool],
+    position_ms: Optional[int],
+    volume: Optional[int],
+    update_current_queue_item: bool,
+    current_queue_item_id: int | None,
+) -> None:
+    with Session(engine) as write_db:
+        try:
+            pb = write_db.get(RoomPlaybackState, room_id)
+            if not pb:
+                pb = RoomPlaybackState(room_id=room_id, volume=settings.rooms.default_volume)
+            if update_current_queue_item and current_queue_item_id is not None:
+                next_item = write_db.get(RoomQueueItem, current_queue_item_id)
+                if not next_item or next_item.room_id != room_id:
+                    raise ValueError("current queue item does not belong to room")
+            if is_playing is not None:
+                pb.is_playing = is_playing
+            if position_ms is not None:
+                pb.position_ms = max(0, int(position_ms))
+            if volume is not None:
+                pb.volume = max(0, min(100, int(volume)))
+            if update_current_queue_item:
+                pb.current_queue_item_id = current_queue_item_id
+            pb.updated_at = datetime.utcnow()
+            write_db.add(pb)
+
+            if pb.current_queue_item_id:
+                playing_items = write_db.exec(
+                    select(RoomQueueItem).where(
+                        RoomQueueItem.room_id == room_id,
+                        RoomQueueItem.status == QueueStatus.playing,
+                        RoomQueueItem.id != pb.current_queue_item_id,
+                    )
+                ).all()
+                for item in playing_items:
+                    item.status = QueueStatus.played
+                    write_db.add(item)
+                current_item = write_db.get(RoomQueueItem, pb.current_queue_item_id)
+                if current_item:
+                    current_item.status = QueueStatus.playing
+                    write_db.add(current_item)
+            elif update_current_queue_item:
+                playing_items = write_db.exec(
+                    select(RoomQueueItem).where(
+                        RoomQueueItem.room_id == room_id,
+                        RoomQueueItem.status == QueueStatus.playing,
+                    )
+                ).all()
+                for item in playing_items:
+                    item.status = QueueStatus.played
+                    write_db.add(item)
+            write_db.commit()
+        except BaseException:
+            write_db.rollback()
+            raise
+
+
 async def _set_playback(
     db: Session,
     room_id: int,
@@ -444,60 +682,24 @@ async def _set_playback(
     volume: Optional[int] = None,
     current_queue_item_id: Any = _UNSET,
 ) -> RoomPlaybackState:
+    update_current_queue_item = current_queue_item_id is not _UNSET
+    next_queue_item_id = current_queue_item_id if update_current_queue_item else None
+    db.rollback()
+    await asyncio.to_thread(
+        _set_playback_transaction,
+        room_id,
+        is_playing=is_playing,
+        position_ms=position_ms,
+        volume=volume,
+        update_current_queue_item=update_current_queue_item,
+        current_queue_item_id=next_queue_item_id,
+    )
+    if update_current_queue_item:
+        _clear_loudness_wait_if_changed(room_id, next_queue_item_id)
+    db.expire_all()
     pb = db.get(RoomPlaybackState, room_id)
     if not pb:
-        pb = RoomPlaybackState(room_id=room_id, volume=settings.rooms.default_volume)
-    old_queue_item_id = pb.current_queue_item_id
-    if is_playing is not None:
-        pb.is_playing = is_playing
-    if position_ms is not None:
-        pb.position_ms = max(0, int(position_ms))
-    if volume is not None:
-        pb.volume = max(0, min(100, int(volume)))
-    if current_queue_item_id is not _UNSET:
-        pb.current_queue_item_id = current_queue_item_id
-        _clear_loudness_wait_if_changed(room_id, current_queue_item_id)
-    pb.updated_at = datetime.utcnow()
-    db.add(pb)
-    db.commit()
-    db.refresh(pb)
-
-    if current_queue_item_id is not _UNSET and old_queue_item_id and old_queue_item_id != pb.current_queue_item_id:
-        old_qi = db.get(RoomQueueItem, old_queue_item_id)
-        if old_qi and old_qi.status == QueueStatus.playing:
-            old_qi.status = QueueStatus.played
-            db.add(old_qi)
-            db.commit()
-    if pb.current_queue_item_id:
-        playing_items = db.exec(
-            select(RoomQueueItem).where(
-                RoomQueueItem.room_id == room_id,
-                RoomQueueItem.status == QueueStatus.playing,
-                RoomQueueItem.id != pb.current_queue_item_id,
-            )
-        ).all()
-        for item in playing_items:
-            item.status = QueueStatus.played
-            db.add(item)
-        if playing_items:
-            db.commit()
-        qi = db.get(RoomQueueItem, pb.current_queue_item_id)
-        if qi:
-            qi.status = QueueStatus.playing
-            db.add(qi)
-            db.commit()
-    elif current_queue_item_id is not _UNSET:
-        playing_items = db.exec(
-            select(RoomQueueItem).where(
-                RoomQueueItem.room_id == room_id,
-                RoomQueueItem.status == QueueStatus.playing,
-            )
-        ).all()
-        for item in playing_items:
-            item.status = QueueStatus.played
-            db.add(item)
-        if playing_items:
-            db.commit()
+        raise RuntimeError("playback transaction did not persist state")
     await _broadcast_playback_snapshot(db, room_id)
     if current_queue_item_id is not _UNSET:
         await hub.broadcast(room_id, {"type": "queue_updated"})
@@ -524,11 +726,31 @@ async def _set_normalizer_preference_for_user(db: Session, room_id: int, user_id
     else:
         _ROOM_NORMALIZER_PREFS.pop(key, None)
         if not _room_prefers_loudness_wait(room_id) and _ROOM_LOUDNESS_WAITING.get(room_id):
+            recovery_needed = False
             async with _playback_lock(room_id):
                 pb = db.get(RoomPlaybackState, room_id)
                 if pb and _is_loudness_waiting(room_id, pb.current_queue_item_id):
-                    _ROOM_LOUDNESS_WAITING.pop(room_id, None)
-                    await _set_playback(db, room_id, is_playing=True, position_ms=0)
+                    queue_item_id = pb.current_queue_item_id
+                    db.rollback()
+                    try:
+                        outcome = await asyncio.to_thread(
+                            _resume_loudness_wait_transaction,
+                            room_id,
+                            queue_item_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "failed to release loudness wait after normalizer was disabled in room %s",
+                            room_id,
+                        )
+                        recovery_needed = True
+                    else:
+                        _ROOM_LOUDNESS_WAITING.pop(room_id, None)
+                        if outcome == "resumed":
+                            db.expire_all()
+                            await _broadcast_playback_snapshot(db, room_id)
+            if recovery_needed:
+                _schedule_loudness_wait_recovery(room_id, queue_item_id)
     return {
         "ok": True,
         "enabled": enabled,

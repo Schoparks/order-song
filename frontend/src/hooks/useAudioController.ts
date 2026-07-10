@@ -487,8 +487,10 @@ export function useAudioController(roomId: number | null, token: string | null, 
       method: "POST",
       token,
       json: { expected_queue_item_id: expectedQueueItemId },
-    }).catch(() => {});
-  }, [playback?.current_queue_item_id, roomId, scheduleOptimisticNext, token]);
+    }).catch(() => {
+      clearOptimisticNext();
+    });
+  }, [clearOptimisticNext, playback?.current_queue_item_id, roomId, scheduleOptimisticNext, token]);
 
   const playPause = useCallback(async () => {
     if (!roomId || !token) return;

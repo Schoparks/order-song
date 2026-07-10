@@ -1,14 +1,15 @@
+import asyncio
 import random
 from datetime import datetime, timedelta
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Any, Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlmodel import Session, select
-from starlette.responses import Response
 
 from app.core.config import settings
+from app.db import engine
 from app.deps import get_current_user, get_db
 from app.models import (
     QueueStatus,
@@ -28,7 +29,10 @@ from app.routers.playback_audio import (
     _direct_playback_audio_url,
     _ensure_bilibili_metadata,
 )
+from app.routers.media_cover import fetch_cover_response
 from app.routers.playback_core import (
+    _broadcast_playback_snapshot,
+    _clear_loudness_wait_if_changed,
     _effective_position_ms,
     _is_stale_control,
     _pick_next_queue_item_id,
@@ -47,11 +51,17 @@ from app.ws import hub
 
 router = APIRouter(prefix="/api", tags=["queue"])
 
-_COVER_PROXY_HOST_SUFFIXES = (
-    "bilibili.com",
-    "biliimg.com",
-    "hdslb.com",
-)
+class _QueueTrackInput(BaseModel):
+    """Client-provided display metadata; playback URLs are deliberately absent."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    source: TrackSource
+    source_track_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1, max_length=200)
+    artist: str | None = Field(default=None, max_length=120)
+    duration_ms: int | None = Field(default=None, ge=0, le=86_400_000)
+    cover_url: str | None = Field(default=None, max_length=2048)
 
 
 def _get_room(db: Session, room_id: int) -> Room:
@@ -88,46 +98,37 @@ def _get_or_create_track(
     artist: Optional[str] = None,
     duration_ms: Optional[int] = None,
     cover_url: Optional[str] = None,
-    audio_url: Optional[str] = None,
 ) -> Track:
-    track = db.exec(select(Track).where(Track.source == source, Track.source_track_id == source_track_id)).first()
-    if track:
-        if title and track.title != title:
-            track.title = title
-        track.artist = track.artist or artist
-        track.duration_ms = track.duration_ms or duration_ms
-        track.cover_url = track.cover_url or cover_url
-        track.audio_url = track.audio_url or audio_url
-        db.add(track)
-        db.commit()
-        db.refresh(track)
-        return track
-    track = Track(
+    # One global Track is shared by every room. Client display metadata may seed a
+    # new row, but must never overwrite a row already populated by another room or
+    # by a trusted upstream resolver.
+    statement = sqlite_insert(Track).values(
         source=source,
         source_track_id=source_track_id,
         title=title,
         artist=artist,
         duration_ms=duration_ms,
         cover_url=cover_url,
-        audio_url=audio_url,
+        audio_url=None,
     )
-    db.add(track)
-    db.commit()
-    db.refresh(track)
+    statement = statement.on_conflict_do_nothing(index_elements=["source", "source_track_id"])
+    db.execute(statement)
+    track = db.exec(
+        select(Track).where(Track.source == source, Track.source_track_id == source_track_id)
+    ).first()
+    if not track:
+        raise RuntimeError("track upsert did not return a row")
     return track
 
 
-def _validate_queue_track_payload(payload: dict) -> tuple[TrackSource, str, str]:
-    source = payload.get("source")
-    source_track_id = payload.get("source_track_id")
-    title = payload.get("title")
-    if source not in {s.value for s in TrackSource}:
-        raise HTTPException(status_code=400, detail="invalid source")
-    if not source_track_id or not isinstance(source_track_id, str):
-        raise HTTPException(status_code=400, detail="invalid source_track_id")
-    if not title or not isinstance(title, str):
-        raise HTTPException(status_code=400, detail="invalid title")
-    return TrackSource(source), source_track_id, title
+def _validate_queue_track_payload(payload: object) -> _QueueTrackInput:
+    try:
+        track_input = _QueueTrackInput.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(status_code=400, detail="invalid track payload") from exc
+    if track_input.source == TrackSource.netease and not track_input.source_track_id.isdigit():
+        raise HTTPException(status_code=400, detail="invalid netease source_track_id")
+    return track_input
 
 
 def _parse_requested_count(raw_count: object) -> int | None:
@@ -152,33 +153,39 @@ def _get_existing_queue_item(db: Session, room_id: int, track_id: int) -> RoomQu
 
 
 def _record_track_order(db: Session, track_id: int, ordered_at: datetime) -> None:
-    stats = db.get(TrackOrderStats, track_id)
-    if not stats:
-        stats = TrackOrderStats(track_id=track_id, order_count=0, last_ordered_at=ordered_at)
-    stats.order_count += 1
-    stats.last_ordered_at = ordered_at
-    db.add(stats)
+    statement = sqlite_insert(TrackOrderStats).values(
+        track_id=track_id,
+        order_count=1,
+        last_ordered_at=ordered_at,
+    )
+    statement = statement.on_conflict_do_update(
+        index_elements=["track_id"],
+        set_={
+            "order_count": TrackOrderStats.order_count + 1,
+            "last_ordered_at": ordered_at,
+        },
+    )
+    db.execute(statement)
 
 
 def _enqueue_track_payload(
     db: Session,
     room_id: int,
-    payload: dict,
+    payload: dict | _QueueTrackInput,
     user_id: int,
     *,
     created_at: datetime | None = None,
 ) -> tuple[RoomQueueItem, bool]:
-    source, source_track_id, title = _validate_queue_track_payload(payload)
+    track_input = payload if isinstance(payload, _QueueTrackInput) else _validate_queue_track_payload(payload)
     queued_at = created_at or datetime.utcnow()
     track = _get_or_create_track(
         db,
-        source=source,
-        source_track_id=source_track_id,
-        title=title,
-        artist=payload.get("artist"),
-        duration_ms=payload.get("duration_ms"),
-        cover_url=payload.get("cover_url"),
-        audio_url=payload.get("audio_url"),
+        source=track_input.source,
+        source_track_id=track_input.source_track_id,
+        title=track_input.title,
+        artist=track_input.artist,
+        duration_ms=track_input.duration_ms,
+        cover_url=track_input.cover_url,
     )
 
     existing = _get_existing_queue_item(db, room_id, track.id)
@@ -190,8 +197,7 @@ def _enqueue_track_payload(
         existing.ordered_by_user_id = user_id
         existing.created_at = queued_at
         db.add(existing)
-        db.commit()
-        db.refresh(existing)
+        db.flush()
         qi = existing
     else:
         qi = RoomQueueItem(
@@ -202,12 +208,138 @@ def _enqueue_track_payload(
             created_at=queued_at,
         )
         db.add(qi)
-        db.commit()
-        db.refresh(qi)
+        db.flush()
 
     _record_track_order(db, track.id, queued_at)
-    db.commit()
     return qi, True
+
+
+def _enqueue_track_inputs_transaction(
+    room_id: int,
+    track_inputs: list[_QueueTrackInput],
+    user_id: int,
+    *,
+    requested_count: int | None = None,
+) -> tuple[list[int], int, int, int | None]:
+    """Run the whole SQLite write transaction in one worker-owned Session."""
+    queue_item_ids: list[int] = []
+    added_count = 0
+    skipped_count = 0
+    first_queue_item_id: int | None = None
+    seen: set[tuple[TrackSource, str]] = set()
+    now = datetime.utcnow()
+    with Session(engine) as write_db:
+        try:
+            for track_input in track_inputs:
+                if requested_count is not None and added_count >= requested_count:
+                    break
+                key = (track_input.source, track_input.source_track_id)
+                if key in seen:
+                    skipped_count += 1
+                    continue
+                seen.add(key)
+                queue_item, added = _enqueue_track_payload(
+                    write_db,
+                    room_id,
+                    track_input,
+                    user_id,
+                    created_at=now + timedelta(milliseconds=added_count),
+                )
+                if first_queue_item_id is None:
+                    first_queue_item_id = queue_item.id
+                if added:
+                    added_count += 1
+                    queue_item_ids.append(queue_item.id)
+                else:
+                    skipped_count += 1
+            write_db.commit()
+        except BaseException:
+            write_db.rollback()
+            raise
+    return queue_item_ids, added_count, skipped_count, first_queue_item_id
+
+
+def _remove_queue_item_transaction(room_id: int, queue_item_id: int) -> tuple[str, int | None]:
+    with Session(engine) as write_db:
+        try:
+            qi = write_db.get(RoomQueueItem, queue_item_id)
+            if not qi or qi.room_id != room_id:
+                return "not_found", None
+            pb = write_db.get(RoomPlaybackState, room_id)
+            removing_current = bool(pb and pb.current_queue_item_id == qi.id)
+            qi.status = QueueStatus.removed
+            write_db.add(qi)
+            write_db.flush()
+            next_id = _pick_next_queue_item_id(write_db, room_id) if removing_current else None
+
+            if removing_current and pb:
+                pb.current_queue_item_id = next_id
+                pb.is_playing = next_id is not None
+                pb.position_ms = 0
+                pb.updated_at = datetime.utcnow()
+                write_db.add(pb)
+
+                playing_items = write_db.exec(
+                    select(RoomQueueItem).where(
+                        RoomQueueItem.room_id == room_id,
+                        RoomQueueItem.status == QueueStatus.playing,
+                    )
+                ).all()
+                for playing_item in playing_items:
+                    if playing_item.id != next_id and playing_item.id != qi.id:
+                        playing_item.status = QueueStatus.played
+                        write_db.add(playing_item)
+                if next_id is not None:
+                    next_item = write_db.get(RoomQueueItem, next_id)
+                    if not next_item:
+                        raise RuntimeError("selected next queue item disappeared")
+                    next_item.status = QueueStatus.playing
+                    write_db.add(next_item)
+
+            write_db.commit()
+            return ("current" if removing_current else "removed"), next_id
+        except BaseException:
+            write_db.rollback()
+            raise
+
+
+def _bump_queue_item_transaction(room_id: int, queue_item_id: int) -> str:
+    with Session(engine) as write_db:
+        qi = write_db.get(RoomQueueItem, queue_item_id)
+        if not qi or qi.room_id != room_id:
+            return "not_found"
+        if qi.status != QueueStatus.queued:
+            return "ignored"
+        first = write_db.exec(
+            select(RoomQueueItem)
+            .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
+            .order_by(RoomQueueItem.created_at.asc())
+            .limit(1)
+        ).first()
+        if not first or first.id == qi.id:
+            return "unchanged"
+        qi.created_at = first.created_at - timedelta(microseconds=1)
+        write_db.add(qi)
+        write_db.commit()
+        return "moved"
+
+
+def _shuffle_queue_transaction(room_id: int) -> bool:
+    with Session(engine) as write_db:
+        items = write_db.exec(
+            select(RoomQueueItem)
+            .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
+            .order_by(RoomQueueItem.created_at.asc())
+        ).all()
+        if len(items) <= 1:
+            return False
+        random.shuffle(items)
+        now = datetime.utcnow()
+        for position, item in enumerate(items):
+            item.created_at = now + timedelta(milliseconds=position)
+            write_db.add(item)
+        write_db.commit()
+        return True
 
 
 async def _ensure_queue_item_metadata(db: Session, queue_item: RoomQueueItem) -> None:
@@ -229,29 +361,7 @@ async def _broadcast_or_start_after_enqueue(db: Session, room_id: int, fallback_
 
 @router.get("/media/cover")
 async def proxy_cover(url: str):
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme not in {"http", "https"} or not any(host == suffix or host.endswith(f".{suffix}") for suffix in _COVER_PROXY_HOST_SUFFIXES):
-        raise HTTPException(status_code=400, detail="unsupported cover host")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bilibili.com/",
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=settings.upstream.bilibili_audio_timeout_s, follow_redirects=True, headers=headers) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-    except Exception:
-        raise HTTPException(status_code=502, detail="cover fetch failed")
-
-    content_type = r.headers.get("content-type") or "image/jpeg"
-    return Response(
-        content=r.content,
-        media_type=content_type,
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    return await fetch_cover_response(url)
 
 
 @router.get("/tracks/{track_id}/audio-url")
@@ -339,11 +449,23 @@ async def get_history(room_id: int, db: Session = Depends(get_db), user: User = 
 @router.post("/rooms/{room_id}/queue")
 async def add_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     await _require_active_room_member(db, room_id, user)
+    track_input = _validate_queue_track_payload(payload)
+    db.rollback()
 
     async with _playback_lock(room_id):
-        qi, added = _enqueue_track_payload(db, room_id, payload, user.id)
+        queue_item_ids, added_count, _, first_queue_item_id = await asyncio.to_thread(
+            _enqueue_track_inputs_transaction,
+            room_id,
+            [track_input],
+            user.id,
+        )
+    db.expire_all()
+    queue_item_id = queue_item_ids[0] if queue_item_ids else first_queue_item_id
+    qi = db.get(RoomQueueItem, queue_item_id) if queue_item_id is not None else None
+    if qi is None:
+        raise RuntimeError("queue transaction did not return an item")
     await _ensure_queue_item_metadata(db, qi)
-    if not added:
+    if not added_count:
         return {"ok": True, "queue_item_id": qi.id, "already_queued": True}
 
     await _broadcast_or_start_after_enqueue(db, room_id, qi.id)
@@ -356,50 +478,30 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
     items = payload.get("items")
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="items must be list")
+    validated_items = [_validate_queue_track_payload(item) for item in items]
     requested_count = _parse_requested_count(payload.get("count"))
-    items = list(items)
+    items = list(validated_items)
     if requested_count is not None:
         requested_count = min(requested_count, len(items))
     if payload.get("random") is True:
         random.shuffle(items)
 
-    seen: set[tuple[str, str]] = set()
-    queue_item_ids: list[int] = []
-    queue_items: list[RoomQueueItem] = []
-    added_count = 0
-    skipped_count = 0
-    now = datetime.utcnow()
+    db.rollback()
 
     async with _playback_lock(room_id):
-        for raw in items:
-            if requested_count is not None and added_count >= requested_count:
-                break
-            if not isinstance(raw, dict):
-                raise HTTPException(status_code=400, detail="invalid item")
-            source = raw.get("source")
-            source_track_id = raw.get("source_track_id")
-            key = (str(source), str(source_track_id))
-            if key in seen:
-                skipped_count += 1
-                continue
-            seen.add(key)
+        queue_item_ids, added_count, skipped_count, _ = await asyncio.to_thread(
+            _enqueue_track_inputs_transaction,
+            room_id,
+            items,
+            user.id,
+            requested_count=requested_count,
+        )
 
-            qi, added = _enqueue_track_payload(
-                db,
-                room_id,
-                raw,
-                user.id,
-                created_at=now + timedelta(milliseconds=added_count),
-            )
-            if added:
-                added_count += 1
-                queue_item_ids.append(qi.id)
-                queue_items.append(qi)
-            else:
-                skipped_count += 1
-
-    for qi in queue_items:
-        await _ensure_queue_item_metadata(db, qi)
+    db.expire_all()
+    for queue_item_id in queue_item_ids:
+        qi = db.get(RoomQueueItem, queue_item_id)
+        if qi:
+            await _ensure_queue_item_metadata(db, qi)
 
     if added_count:
         await _broadcast_or_start_after_enqueue(db, room_id, queue_item_ids[0])
@@ -435,44 +537,33 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
         requested_count = min(requested_count, len(rows))
     random.shuffle(rows)
 
-    queue_item_ids: list[int] = []
-    queue_items: list[RoomQueueItem] = []
-    added_count = 0
-    skipped_count = 0
-    now = datetime.utcnow()
+    track_inputs = [
+        _QueueTrackInput(
+            source=tr.source,
+            source_track_id=tr.source_track_id,
+            title=tr.title,
+            artist=tr.artist,
+            duration_ms=tr.duration_ms,
+            cover_url=tr.cover_url,
+        )
+        for _, tr in rows
+    ]
+    db.rollback()
 
     async with _playback_lock(room_id):
-        for _, tr in rows:
-            if requested_count is not None and added_count >= requested_count:
-                break
-            existing = _get_existing_queue_item(db, room_id, tr.id)
-            if existing and existing.status in (QueueStatus.playing, QueueStatus.queued):
-                skipped_count += 1
-                continue
-            qi, added = _enqueue_track_payload(
-                db,
-                room_id,
-                {
-                    "source": tr.source.value,
-                    "source_track_id": tr.source_track_id,
-                    "title": tr.title,
-                    "artist": tr.artist,
-                    "duration_ms": tr.duration_ms,
-                    "cover_url": tr.cover_url,
-                    "audio_url": tr.audio_url,
-                },
-                user.id,
-                created_at=now + timedelta(milliseconds=added_count),
-            )
-            if added:
-                added_count += 1
-                queue_item_ids.append(qi.id)
-                queue_items.append(qi)
-            else:
-                skipped_count += 1
+        queue_item_ids, added_count, skipped_count, _ = await asyncio.to_thread(
+            _enqueue_track_inputs_transaction,
+            room_id,
+            track_inputs,
+            user.id,
+            requested_count=requested_count,
+        )
 
-    for qi in queue_items:
-        await _ensure_queue_item_metadata(db, qi)
+    db.expire_all()
+    for queue_item_id in queue_item_ids:
+        qi = db.get(RoomQueueItem, queue_item_id)
+        if qi:
+            await _ensure_queue_item_metadata(db, qi)
 
     if added_count:
         await _broadcast_or_start_after_enqueue(db, room_id, queue_item_ids[0])
@@ -488,18 +579,21 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
 @router.delete("/rooms/{room_id}/queue/{queue_item_id}")
 async def remove_queue_item(room_id: int, queue_item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     await _require_active_room_member(db, room_id, user)
+    db.rollback()
     async with _playback_lock(room_id):
-        qi = db.get(RoomQueueItem, queue_item_id)
-        if not qi or qi.room_id != room_id:
+        outcome, next_id = await asyncio.to_thread(
+            _remove_queue_item_transaction,
+            room_id,
+            queue_item_id,
+        )
+        if outcome == "not_found":
             raise HTTPException(status_code=404, detail="queue item not found")
-        pb = db.get(RoomPlaybackState, room_id)
-        removing_current = bool(pb and pb.current_queue_item_id == qi.id)
-        qi.status = QueueStatus.removed
-        db.add(qi)
-        db.commit()
-        if removing_current:
-            next_id = _pick_next_queue_item_id(db, room_id)
-            await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=next_id is not None, position_ms=0)
+        db.expire_all()
+        if outcome == "current":
+            _clear_loudness_wait_if_changed(room_id, next_id)
+            await _broadcast_playback_snapshot(db, room_id)
+            await hub.broadcast(room_id, {"type": "queue_updated"})
+            _schedule_next_loudness_prefetch(db, room_id)
         else:
             await hub.broadcast(room_id, {"type": "queue_updated"})
     return {"ok": True}
@@ -508,27 +602,15 @@ async def remove_queue_item(room_id: int, queue_item_id: int, db: Session = Depe
 @router.post("/rooms/{room_id}/queue/{queue_item_id}/bump")
 async def bump_queue_item(room_id: int, queue_item_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     await _require_active_room_member(db, room_id, user)
-    qi = db.get(RoomQueueItem, queue_item_id)
-    if not qi or qi.room_id != room_id:
-        raise HTTPException(status_code=404, detail="queue item not found")
-    if qi.status != QueueStatus.queued:
-        return {"ok": True, "ignored": True}
-
-    first = db.exec(
-        select(RoomQueueItem)
-        .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
-        .order_by(RoomQueueItem.created_at.asc())
-        .limit(1)
-    ).first()
-    if not first:
-        return {"ok": True}
-    if first.id == qi.id:
-        return {"ok": True}
-
-    qi.created_at = first.created_at - timedelta(microseconds=1)
-    db.add(qi)
-    db.commit()
-    await hub.broadcast(room_id, {"type": "queue_updated"})
+    db.rollback()
+    async with _playback_lock(room_id):
+        outcome = await asyncio.to_thread(_bump_queue_item_transaction, room_id, queue_item_id)
+        if outcome == "not_found":
+            raise HTTPException(status_code=404, detail="queue item not found")
+        if outcome == "ignored":
+            return {"ok": True, "ignored": True}
+        if outcome == "moved":
+            await hub.broadcast(room_id, {"type": "queue_updated"})
     return {"ok": True}
 
 
@@ -581,12 +663,6 @@ async def next_track(room_id: int, payload: PlaybackControlIn | None = None, db:
             raise HTTPException(status_code=404, detail="room not found")
         if _is_stale_control(pb, payload):
             return _stale_control_response(pb)
-        if pb.current_queue_item_id:
-            cur = db.get(RoomQueueItem, pb.current_queue_item_id)
-            if cur:
-                cur.status = QueueStatus.played
-                db.add(cur)
-                db.commit()
         next_id = _pick_next_queue_item_id(db, room_id)
         await _set_playback(db, room_id, current_queue_item_id=next_id, is_playing=next_id is not None, position_ms=0)
     return {"ok": True}
@@ -603,21 +679,11 @@ async def prev_track(room_id: int, db: Session = Depends(get_db), user: User = D
 @router.post("/rooms/{room_id}/queue/shuffle")
 async def shuffle_queue(room_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     await _require_active_room_member(db, room_id, user)
-    items = db.exec(
-        select(RoomQueueItem)
-        .where(RoomQueueItem.room_id == room_id, RoomQueueItem.status == QueueStatus.queued)
-        .order_by(RoomQueueItem.created_at.asc())
-    ).all()
-    if len(items) <= 1:
-        return {"ok": True}
-    now = datetime.utcnow()
-    indices = list(range(len(items)))
-    random.shuffle(indices)
-    for new_pos, idx in enumerate(indices):
-        items[idx].created_at = now + timedelta(milliseconds=new_pos)
-        db.add(items[idx])
-    db.commit()
-    await hub.broadcast(room_id, {"type": "queue_updated"})
+    db.rollback()
+    async with _playback_lock(room_id):
+        changed = await asyncio.to_thread(_shuffle_queue_transaction, room_id)
+        if changed:
+            await hub.broadcast(room_id, {"type": "queue_updated"})
     return {"ok": True}
 
 

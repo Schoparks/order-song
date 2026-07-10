@@ -53,8 +53,8 @@ export function AuthView({
         <h1>order-song</h1>
         <p>多人在线点歌、同步播放和歌单管理。</p>
         <div className="authFields">
-          <input className="input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="用户名" autoComplete="username" />
-          <input className="input" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="密码" type="password" autoComplete="current-password" onKeyDown={(e) => e.key === "Enter" && submit("login")} />
+          <label className="fieldLabel"><span>用户名</span><input className="input" value={username} onChange={(e) => setUsername(e.target.value)} placeholder="请输入用户名" autoComplete="username" /></label>
+          <label className="fieldLabel"><span>密码</span><input className="input" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="请输入密码" type="password" autoComplete="current-password" onKeyDown={(e) => e.key === "Enter" && submit("login")} /></label>
         </div>
         <div className="buttonRow">
           <button className="primaryButton" disabled={!!busy} onClick={() => submit("login")}>{busy === "login" ? "登录中" : "登录"}</button>
@@ -84,6 +84,8 @@ export function RoomView({
 }) {
   const queryClient = useQueryClient();
   const [name, setName] = useState("");
+  const [joiningRoomId, setJoiningRoomId] = useState<number | null>(null);
+  const [joinError, setJoinError] = useState("");
   const createRoom = useMutation({
     mutationFn: () => api<Room>("/api/rooms", { method: "POST", token, json: { name: name.trim() || null } }),
     onSuccess: (room) => onEnter(room.id),
@@ -99,11 +101,14 @@ export function RoomView({
         <button className="iconTextButton" onClick={onLogout}><LogOut />退出</button>
       </header>
       <section className="roomComposer glassPanel">
-        <input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="房间名称（可为空）" />
+        <label className="fieldLabel"><span>房间名称（可为空）</span><input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：周末歌房" /></label>
         <button className="primaryButton" onClick={() => createRoom.mutate()} disabled={createRoom.isPending}>
           <Plus />{createRoom.isPending ? "创建中" : "创建并进入"}
         </button>
       </section>
+      {(joinError || createRoom.error) && (
+        <p className="actionError" role="alert">{joinError || (createRoom.error instanceof Error ? createRoom.error.message : "创建房间失败")}</p>
+      )}
       <section className="roomGrid">
         {loading && <EmptyState title="正在加载房间" />}
         {!loading && !rooms.length && <EmptyState title="暂无房间" meta="创建一个房间开始点歌。" />}
@@ -111,14 +116,23 @@ export function RoomView({
           <button
             key={room.id}
             className="roomTile glassPanel"
+            disabled={joiningRoomId !== null}
             onClick={async () => {
-              await api(`/api/rooms/${room.id}/join`, { method: "POST", token });
-              queryClient.invalidateQueries({ queryKey: ["rooms", token] });
-              onEnter(room.id);
+              setJoinError("");
+              setJoiningRoomId(room.id);
+              try {
+                await api(`/api/rooms/${room.id}/join`, { method: "POST", token });
+                queryClient.invalidateQueries({ queryKey: ["rooms", token] });
+                onEnter(room.id);
+              } catch (error) {
+                setJoinError(error instanceof Error ? error.message : "加入房间失败");
+              } finally {
+                setJoiningRoomId(null);
+              }
             }}
           >
             <span className="roomIndex">#{room.id}</span>
-            <strong>{room.name}</strong>
+            <strong>{joiningRoomId === room.id ? "加入中…" : room.name}</strong>
             <span>{room.member_count || 0} 人 · {(room.member_names || []).join("、") || "等待加入"}</span>
           </button>
         ))}
@@ -132,6 +146,7 @@ export function TopBar({
   playEnabled,
   userMenuOpen,
   membersOpen,
+  searchOpen,
   onTogglePlayEnabled,
   onToggleUserMenu,
   onToggleMembers,
@@ -142,6 +157,7 @@ export function TopBar({
   playEnabled: boolean;
   userMenuOpen: boolean;
   membersOpen: boolean;
+  searchOpen: boolean;
   onTogglePlayEnabled: (value: boolean) => void;
   onToggleUserMenu: () => void;
   onToggleMembers: () => void;
@@ -151,16 +167,37 @@ export function TopBar({
   return (
     <header className="topBar glassPanel">
       <div className="topCluster">
-        <button className={`pillButton ${userMenuOpen ? "active" : ""}`} onClick={onToggleUserMenu}><CircleUserRound />{username}</button>
-        <label className="liquidSwitch">
+        <button
+          className={`pillButton accountButton ${userMenuOpen ? "active" : ""}`}
+          aria-haspopup="dialog"
+          aria-expanded={userMenuOpen}
+          aria-controls="account-popover"
+          onClick={onToggleUserMenu}
+        >
+          <CircleUserRound /><span>{username}</span>
+        </button>
+        <label className="liquidSwitch" title="切换本机是否加载并播放音频">
           <input type="checkbox" checked={playEnabled} onChange={(e) => onTogglePlayEnabled(e.target.checked)} />
-          <span />
+          <span aria-hidden="true" />
           <b>{playEnabled ? "可播放" : "仅点歌"}</b>
         </label>
-        <button className="pillButton mobileSearchButton" onClick={onSearch}><Search /><span>搜索</span></button>
+        <button
+          className="pillButton mobileSearchButton"
+          aria-label="搜索歌曲"
+          aria-haspopup="dialog"
+          aria-expanded={searchOpen}
+          aria-controls="search-overlay"
+          onClick={onSearch}
+        ><Search /><span>搜索</span></button>
       </div>
       <div className="topCluster">
-        <button className={`pillButton ${membersOpen ? "active" : ""}`} onClick={onToggleMembers}><UsersRound /><span>成员</span></button>
+        <button
+          className={`pillButton ${membersOpen ? "active" : ""}`}
+          aria-haspopup="dialog"
+          aria-expanded={membersOpen}
+          aria-controls="members-popover"
+          onClick={onToggleMembers}
+        ><UsersRound /><span>成员</span></button>
         <button className="dangerButton leaveRoomButton" onClick={onLeave}><LogOut /><span>退出</span></button>
       </div>
     </header>

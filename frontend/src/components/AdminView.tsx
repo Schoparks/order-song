@@ -99,6 +99,7 @@ export function AdminView({ token, onExit }: { token: string; onExit: () => void
                   </button>
                   <button
                     className="iconButton dangerIconButton"
+                    aria-label={`删除用户 ${user.username}`}
                     disabled={isSelf}
                     title={isSelf ? "不能删除自己" : "删除用户"}
                     onClick={() => setDeleteUserTarget(user)}
@@ -135,6 +136,7 @@ export function AdminView({ token, onExit }: { token: string; onExit: () => void
               </div>
               <button
                 className="iconButton dangerIconButton"
+                aria-label={`删除房间 ${room.name}`}
                 title="删除房间"
                 onClick={() => setDeleteRoomTarget(room)}
               >
@@ -147,7 +149,7 @@ export function AdminView({ token, onExit }: { token: string; onExit: () => void
       {deleteUserTarget && (
         <ConfirmDialog
           title="删除用户"
-          message={`确定删除用户「${deleteUserTarget.username}」吗？该用户的歌单和房间成员关系会被移除。`}
+          message={`确定删除用户「${deleteUserTarget.username}」吗？其创建的房间（即使仍有其他成员）、房间队列与播放状态、个人歌单和成员关系都会被删除。`}
           confirmText="删除用户"
           busy={destructiveBusy}
           onCancel={() => setDeleteUserTarget(null)}

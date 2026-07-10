@@ -102,6 +102,7 @@ function TrackRow({
   prioritizePlaylistMatches: boolean;
 }) {
   const [busy, setBusy] = useState<"queue" | "playlist" | null>(null);
+  const [queueError, setQueueError] = useState("");
   const [expanded, setExpanded] = useState(false);
   const playlisted = playlistMemberships.length > 0;
   const parts = track.source === "bilibili" && Array.isArray(track.parts) ? track.parts : [];
@@ -140,11 +141,18 @@ function TrackRow({
                 disabled={busy === "queue"}
                 onClick={async () => {
                   setBusy("queue");
-                  await api(`/api/rooms/${roomId}/queue`, { method: "POST", token, json: trackPayload(track) }).finally(() => setBusy(null));
-                  onChanged();
+                  setQueueError("");
+                  try {
+                    await api(`/api/rooms/${roomId}/queue`, { method: "POST", token, json: trackPayload(track) });
+                    onChanged();
+                  } catch (error) {
+                    setQueueError(error instanceof Error ? error.message : "点歌失败，请重试");
+                  } finally {
+                    setBusy(null);
+                  }
                 }}
               >
-                <BadgePlus />{queued ? "已点" : "点歌"}
+                <BadgePlus />{busy === "queue" ? "点歌中…" : queued ? "已点" : "点歌"}
               </button>
               <PlaylistQuickButton
                 track={track}
@@ -160,6 +168,7 @@ function TrackRow({
           )}
         </div>
       </article>
+      {queueError && <p className="actionError rowActionError" role="alert">{queueError}</p>}
       {expandable && expanded && (
         <div className="songPartsCard" role="region" aria-label={`${track.title} 分P`}>
           <TrackList
@@ -296,7 +305,7 @@ function PlaylistPickerCard({
   }
 
   return (
-    <CardDialog title="收藏到歌单" onClose={onClose}>
+    <CardDialog title="收藏到歌单" onClose={onClose} busy={busy}>
       <div className="pickerTrack">
         <TrackCover track={track} />
         <div className="songInfo">
@@ -305,7 +314,7 @@ function PlaylistPickerCard({
         </div>
       </div>
       <form className="inlineCreate dialogCreate" onSubmit={(event) => { event.preventDefault(); createPlaylist(); }}>
-        <input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="新歌单" />
+        <label className="fieldLabel growField"><span>新歌单名称</span><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="例如：通勤" /></label>
         <button className="smallButton" disabled={busy || !newName.trim()}><Plus />创建</button>
       </form>
       {localPlaylists.length ? (

@@ -68,6 +68,59 @@ class RoomHub:
             with suppress(Exception):
                 await ws.close()
 
+    async def disconnect_user(
+        self,
+        room_id: int,
+        user_id: int,
+        *,
+        code: int = 1008,
+        reason: str = "room membership ended",
+    ) -> int:
+        """Remove and close every socket for one user in a room."""
+        async with self._lock:
+            room_sockets = self._room_sockets.get(room_id, set())
+            sockets = [ws for ws in room_sockets if self._ws_user.get(ws) == user_id]
+            for ws in sockets:
+                room_sockets.discard(ws)
+                self._ws_user.pop(ws, None)
+            if not room_sockets:
+                self._room_sockets.pop(room_id, None)
+            disconnected = self._disconnected.get(room_id)
+            if disconnected:
+                disconnected.pop(user_id, None)
+                if not disconnected:
+                    self._disconnected.pop(room_id, None)
+            activity = self._last_activity.get(room_id)
+            if activity:
+                activity.pop(user_id, None)
+                if not activity:
+                    self._last_activity.pop(room_id, None)
+
+        for ws in sockets:
+            with suppress(Exception):
+                await asyncio.wait_for(ws.close(code=code, reason=reason), timeout=_BROADCAST_SEND_TIMEOUT_S)
+        return len(sockets)
+
+    async def disconnect_room(
+        self,
+        room_id: int,
+        *,
+        code: int = 1001,
+        reason: str = "room ended",
+    ) -> int:
+        """Remove and close every socket in a room."""
+        async with self._lock:
+            sockets = list(self._room_sockets.pop(room_id, set()))
+            for ws in sockets:
+                self._ws_user.pop(ws, None)
+            self._disconnected.pop(room_id, None)
+            self._last_activity.pop(room_id, None)
+
+        for ws in sockets:
+            with suppress(Exception):
+                await asyncio.wait_for(ws.close(code=code, reason=reason), timeout=_BROADCAST_SEND_TIMEOUT_S)
+        return len(sockets)
+
     async def get_stale_users(self, timeout_seconds: int = 1800) -> list[tuple[int, int]]:
         now = datetime.utcnow()
         stale: list[tuple[int, int]] = []
