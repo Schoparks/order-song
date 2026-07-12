@@ -36,7 +36,7 @@ from app.models import (
 )
 from app.routers.admin import _stage_user_deletion, list_all_rooms
 from app.routers.playback_core import _playback_lock
-from app.routers.rooms import create_room, list_rooms, room_state, set_room_mode
+from app.routers.rooms import create_room, get_room_summary, list_rooms, room_state, set_room_mode
 from app.schemas import CreateRoomIn, SetRoomModeIn
 from app.ws import RoomHub
 
@@ -496,6 +496,34 @@ class RoomTransactionAndQueryTests(unittest.TestCase):
             db.add(RoomMember(room_id=rooms[0].id, user_id=admin.id))
             db.add(RoomMember(room_id=rooms[0].id, user_id=listener.id))
             db.add(RoomMember(room_id=rooms[1].id, user_id=listener.id))
+            track = Track(
+                source=TrackSource.bilibili,
+                source_track_id="BV-summary",
+                title="Current song",
+                artist="Artist",
+                cover_url="https://example.test/cover.jpg",
+                audio_url="https://secret-upstream.test/audio.mp4",
+            )
+            db.add(track)
+            db.commit()
+            db.refresh(track)
+            current_item = RoomQueueItem(
+                room_id=rooms[0].id,
+                track_id=track.id,
+                ordered_by_user_id=admin.id,
+                status=QueueStatus.playing,
+            )
+            db.add(current_item)
+            db.commit()
+            db.refresh(current_item)
+            db.add(
+                RoomPlaybackState(
+                    room_id=rooms[0].id,
+                    mode=RoomMode.play_enabled,
+                    current_queue_item_id=current_item.id,
+                    is_playing=True,
+                )
+            )
             db.commit()
 
             selects: list[str] = []
@@ -514,12 +542,25 @@ class RoomTransactionAndQueryTests(unittest.TestCase):
             finally:
                 event.remove(self.engine, "before_cursor_execute", count_selects)
 
-            self.assertEqual(public_select_count, 2)
+            self.assertEqual(public_select_count, 3)
             self.assertEqual(admin_select_count, 3)
             self.assertEqual(
                 {room["name"]: room["member_count"] for room in public_result},
                 {"one": 2, "two": 1},
             )
+            one_summary = next(room for room in public_result if room["name"] == "one")
+            self.assertEqual(
+                one_summary["now_playing"],
+                {
+                    "title": "Current song",
+                    "artist": "Artist",
+                    "source": "bilibili",
+                    "cover_url": "https://example.test/cover.jpg",
+                    "is_playing": True,
+                },
+            )
+            self.assertNotIn("audio_url", one_summary["now_playing"])
+            self.assertIsNone(next(room for room in public_result if room["name"] == "two")["now_playing"])
             self.assertEqual(
                 {room["name"]: room["created_by"] for room in admin_result},
                 {"one": "admin", "two": "listener"},
@@ -531,6 +572,34 @@ class RoomTransactionAndQueryTests(unittest.TestCase):
                 },
                 {"one": {"admin", "listener"}, "two": {"listener"}},
             )
+
+    def test_room_summary_requires_membership_and_keeps_member_preview(self) -> None:
+        with Session(self.engine) as db:
+            member = User(username="member", password_hash="x")
+            guest = User(username="guest", password_hash="x")
+            db.add(member)
+            db.add(guest)
+            db.commit()
+            db.refresh(member)
+            db.refresh(guest)
+            room = Room(name="members only", created_by_user_id=member.id)
+            db.add(room)
+            db.commit()
+            db.refresh(room)
+            db.add(RoomMember(room_id=room.id, user_id=member.id))
+            db.commit()
+
+            with patch("app.routers.rooms.hub.note_activity", new=AsyncMock()) as note_activity:
+                result = asyncio.run(get_room_summary(room.id, db, member))
+
+            self.assertEqual(result["id"], room.id)
+            self.assertEqual(result["member_count"], 1)
+            self.assertEqual(result["member_names"], ["member"])
+            self.assertIsNone(result["now_playing"])
+            note_activity.assert_awaited_once_with(room.id, member.id)
+
+            with self.assertRaisesRegex(Exception, "403"):
+                asyncio.run(get_room_summary(room.id, db, guest))
 
 
 class RoomModeEnvelopeTests(unittest.IsolatedAsyncioTestCase):

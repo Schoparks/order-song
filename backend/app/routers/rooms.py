@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.db import engine
 from app.deps import get_current_user, get_db
 from app.models import QueueStatus, Room, RoomMember, RoomPlaybackState, RoomMode, RoomQueueItem, Track, User
-from app.schemas import CreateRoomIn, RoomOut, SetRoomModeIn
+from app.schemas import CreateRoomIn, RoomOut, RoomSummaryOut, SetRoomModeIn
 from app.routers.playback_core import (
     _broadcast_playback_snapshot,
     _clear_loudness_wait_if_changed,
@@ -31,28 +31,79 @@ def _default_room_name(username: str) -> str:
     return f"{username}的听歌房"
 
 
-@router.get("/rooms")
-def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    rooms = db.exec(select(Room).order_by(Room.created_at.desc()).limit(settings.rooms.list_limit)).all()
-    member_names_by_room: dict[int, list[str]] = {int(room.id): [] for room in rooms}
-    if member_names_by_room:
+def _room_summary_payloads(db: Session, rooms: list[Room]) -> list[dict]:
+    """Build room cards with a fixed number of queries for related data.
+
+    The playback query deliberately selects only presentation metadata.  In
+    particular, it must not load or resolve Track.audio_url while rendering a
+    room list/card.
+    """
+    room_ids = [int(room.id) for room in rooms]
+    member_names_by_room: dict[int, list[str]] = {room_id: [] for room_id in room_ids}
+    now_playing_by_room: dict[int, dict] = {}
+
+    if room_ids:
         member_rows = db.exec(
             select(RoomMember.room_id, User.username)
             .join(User, RoomMember.user_id == User.id)
-            .where(RoomMember.room_id.in_(member_names_by_room))
+            .where(RoomMember.room_id.in_(room_ids))
             .order_by(RoomMember.joined_at.asc())
         ).all()
         for room_id, username in member_rows:
             member_names_by_room[int(room_id)].append(username)
+
+        playback_rows = db.exec(
+            select(
+                RoomPlaybackState.room_id,
+                RoomPlaybackState.is_playing,
+                Track.title,
+                Track.artist,
+                Track.source,
+                Track.cover_url,
+            )
+            .join(
+                RoomQueueItem,
+                RoomPlaybackState.current_queue_item_id == RoomQueueItem.id,
+            )
+            .join(Track, RoomQueueItem.track_id == Track.id)
+            .where(RoomPlaybackState.room_id.in_(room_ids))
+        ).all()
+        for room_id, is_playing, title, artist, source, cover_url in playback_rows:
+            now_playing_by_room[int(room_id)] = {
+                "title": title,
+                "artist": artist,
+                "source": source.value if hasattr(source, "value") else source,
+                "cover_url": cover_url,
+                "is_playing": bool(is_playing),
+            }
+
     out = []
-    for r in rooms:
-        members = member_names_by_room[int(r.id)]
+    for room in rooms:
+        room_id = int(room.id)
+        members = member_names_by_room[room_id]
         out.append({
-            **RoomOut.model_validate(r).model_dump(mode="json"),
+            **RoomOut.model_validate(room).model_dump(mode="json"),
             "member_count": len(members),
             "member_names": list(members[: settings.rooms.member_preview_count]),
+            "now_playing": now_playing_by_room.get(room_id),
         })
     return out
+
+
+@router.get("/rooms", response_model=list[RoomSummaryOut])
+def list_rooms(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    rooms = db.exec(select(Room).order_by(Room.created_at.desc()).limit(settings.rooms.list_limit)).all()
+    return _room_summary_payloads(db, list(rooms))
+
+
+@router.get("/rooms/{room_id}", response_model=RoomSummaryOut)
+async def get_room_summary(
+    room_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    room = await _require_active_room_member(db, room_id, user)
+    return _room_summary_payloads(db, [room])[0]
 
 
 @router.get("/rooms/{room_id}/members")

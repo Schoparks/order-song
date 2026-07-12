@@ -1,10 +1,20 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CircleUserRound, LogOut, Music2, Plus, Search, UsersRound } from "lucide-react";
+import { LogOut, MoreHorizontal, Music2, Plus, Search, Settings, UsersRound } from "lucide-react";
 import { api } from "../lib/api";
 import { beginMobileKeyboardDismissal, settleMobileViewportBeforeRouteChange } from "../hooks/useStableViewportHeight";
+import { useAnchoredPopover } from "../hooks/useRoomChrome";
 import type { LoginOut, Room, UserPublic } from "../types";
 import { EmptyState } from "./common";
+
+export function avatarTone(value: string): number {
+  return Array.from(value).reduce((total, char) => total + char.charCodeAt(0), 0) % 6;
+}
+
+export function InitialAvatar({ name, small = false }: { name: string; small?: boolean }) {
+  return <span className={`initialAvatar tone${avatarTone(name)} ${small ? "small" : ""}`} aria-hidden="true">{name.trim().slice(0, 1).toUpperCase() || "?"}</span>;
+}
 
 export function AuthView({
   hint,
@@ -131,9 +141,18 @@ export function RoomView({
               }
             }}
           >
-            <span className="roomIndex">#{room.id}</span>
-            <strong>{joiningRoomId === room.id ? "加入中…" : room.name}</strong>
-            <span>{room.member_count || 0} 人 · {(room.member_names || []).join("、") || "等待加入"}</span>
+            <div className="roomTileCover">
+              {room.now_playing?.cover_url
+                ? <img src={room.now_playing.cover_url} alt="" referrerPolicy="no-referrer" />
+                : <Music2 />}
+              <span className={`roomPlaybackState ${room.now_playing?.is_playing ? "playing" : ""}`}>{room.now_playing ? (room.now_playing.is_playing ? "播放中" : "已暂停") : "等待开场"}</span>
+            </div>
+            <div className="roomTileBody">
+              <span className="roomIndex">#{room.id}</span>
+              <strong>{joiningRoomId === room.id ? "加入中…" : room.name}</strong>
+              <span className="roomNowPlaying">{room.now_playing ? `${room.now_playing.title}${room.now_playing.artist ? ` · ${room.now_playing.artist}` : ""}` : "还没有人点歌"}</span>
+              <div className="roomMembers"><span className="avatarStack">{(room.member_names || []).slice(0, 4).map((name) => <InitialAvatar key={name} name={name} small />)}</span><span>{room.member_count || 0} 人</span></div>
+            </div>
           </button>
         ))}
       </section>
@@ -142,63 +161,68 @@ export function RoomView({
 }
 
 export function TopBar({
+  roomName,
   username,
-  playEnabled,
-  userMenuOpen,
+  members,
+  connectionState,
+  roomMenuOpen,
   membersOpen,
   searchOpen,
-  onTogglePlayEnabled,
   onToggleUserMenu,
   onToggleMembers,
   onSearch,
-  onLeave,
+  onToggleRoomMenu,
+  onLeaveRequest,
 }: {
+  roomName: string;
   username: string;
-  playEnabled: boolean;
-  userMenuOpen: boolean;
+  members: Array<{ id: number; username: string }>;
+  connectionState: "connected" | "reconnecting" | "offline";
+  roomMenuOpen: boolean;
   membersOpen: boolean;
   searchOpen: boolean;
-  onTogglePlayEnabled: (value: boolean) => void;
   onToggleUserMenu: () => void;
   onToggleMembers: () => void;
   onSearch: () => void;
-  onLeave: () => void;
+  onToggleRoomMenu: () => void;
+  onLeaveRequest: () => void;
 }) {
+  const roomMenuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const roomMenuPosition = useAnchoredPopover(roomMenuOpen, roomMenuButtonRef, "below");
   return (
     <header className="topBar glassPanel">
-      <div className="topCluster">
-        <button
-          className={`pillButton accountButton ${userMenuOpen ? "active" : ""}`}
-          aria-haspopup="dialog"
-          aria-expanded={userMenuOpen}
-          aria-controls="account-popover"
-          onClick={onToggleUserMenu}
-        >
-          <CircleUserRound /><span>{username}</span>
+      <div className="roomIdentity">
+        <div><span className={`connectionDot ${connectionState}`} /><span className="eyebrow">{connectionState === "connected" ? "已连接" : connectionState === "offline" ? "离线" : "重连中"}</span></div>
+        <strong>{roomName}</strong>
+      </div>
+      <div className="topActions">
+        <button className={`avatarStackButton ${membersOpen ? "active" : ""}`} aria-label={`查看 ${members.length} 位房间成员`} aria-haspopup="dialog" aria-controls="members-popover" aria-expanded={membersOpen} onClick={onToggleMembers}>
+          <span className="avatarStack">{members.slice(0, 4).map((member) => <InitialAvatar key={member.id} name={member.username} small />)}</span>
+          <span className="memberCount">{members.length}</span>
         </button>
-        <label className="liquidSwitch" title="切换本机是否加载并播放音频">
-          <input type="checkbox" checked={playEnabled} onChange={(e) => onTogglePlayEnabled(e.target.checked)} />
-          <span aria-hidden="true" />
-          <b>{playEnabled ? "可播放" : "仅点歌"}</b>
-        </label>
         <button
-          className="pillButton mobileSearchButton"
+          className="pillButton searchButton"
           aria-label="搜索歌曲"
           aria-haspopup="dialog"
           aria-expanded={searchOpen}
           aria-controls="search-overlay"
           onClick={onSearch}
         ><Search /><span>搜索</span></button>
-      </div>
-      <div className="topCluster">
         <button
-          className={`pillButton ${membersOpen ? "active" : ""}`}
-          aria-haspopup="dialog"
-          aria-expanded={membersOpen}
-          aria-controls="members-popover"
-          onClick={onToggleMembers}
-        ><UsersRound /><span>成员</span></button>
-        <button className="dangerButton leaveRoomButton" onClick={onLeave}><LogOut /><span>退出</span></button>
+          ref={roomMenuButtonRef}
+          className={`iconButton roomMenuButton ${roomMenuOpen ? "active" : ""}`}
+          aria-label="房间与账户菜单"
+          aria-haspopup="menu"
+          aria-expanded={roomMenuOpen}
+          aria-controls="room-menu"
+          onClick={onToggleRoomMenu}
+        ><MoreHorizontal /></button>
+        {roomMenuOpen && createPortal(<div id="room-menu" className="roomMenu glassPanel" style={roomMenuPosition} role="menu" aria-label="房间与账户菜单">
+          <div className="roomMenuUser"><InitialAvatar name={username} /><span><strong>{username}</strong><small>当前账户</small></span></div>
+          <button role="menuitem" onClick={onToggleMembers}><UsersRound />房间成员 <small>{members.length}</small></button>
+          <button role="menuitem" onClick={onToggleUserMenu}><Settings />账户设置</button>
+          <button role="menuitem" className="dangerText" onClick={onLeaveRequest}><LogOut />退出房间</button>
+        </div>, document.body)}
       </div>
     </header>
   );

@@ -1,9 +1,10 @@
 import { useCallback, useId, useRef, useState } from "react";
-import { CircleUserRound, LogOut, X } from "lucide-react";
+import { LogOut, X } from "lucide-react";
 import { api } from "../lib/api";
 import { useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import type { UserPublic } from "../types";
 import { EmptyState, useModalFocus } from "./common";
+import { InitialAvatar } from "./AuthRoom";
 
 export function UserMenu({ token, user, onClose, onLogout, onUpdated }: { token: string; user?: UserPublic; onClose: () => void; onLogout: () => void; onUpdated: () => void }) {
   useDialogViewportLock();
@@ -106,7 +107,7 @@ export function MembersPanel({ members, loading, onClose }: { members: Array<{ i
         </div>
         {loading && <EmptyState title="加载中" />}
         {!loading && !members.length && <EmptyState title="暂无成员" />}
-        {members.map((member) => <div className="memberRow" key={member.id}><CircleUserRound />{member.username}</div>)}
+        {members.map((member) => <div className="memberRow" key={member.id}><InitialAvatar name={member.username} small />{member.username}</div>)}
       </aside>
     </div>
   );

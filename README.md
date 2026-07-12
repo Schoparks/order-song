@@ -44,7 +44,9 @@ python -m pip install -r backend/requirements.txt
 Copy-Item config_template.toml config.toml
 ```
 
-首次启动会把 `config.toml` 中精确匹配模板的 `auth.jwt_secret` 占位值原子替换为持久随机密钥；如果配置文件不可写，应用会拒绝使用占位密钥启动。正式部署仍推荐通过 `ORDER_SONG_JWT_SECRET` 环境变量注入至少 32 字节的随机密钥。
+启动时会把 `config_template.toml` 中新增而本地缺失的普通配置键原子补入旧 `config.toml`，已有值、注释、密钥和文件权限不会被覆盖；重复启动不会重复写入。如果旧文件使用的 inline/dotted table 与新模板结构冲突，合并会安全跳过并由程序默认值兜底，不会写坏原配置。
+
+首次启动还会把 `config.toml` 中精确匹配模板的 `auth.jwt_secret` 占位值原子替换为持久随机密钥；如果配置文件不可写，应用会拒绝使用占位密钥启动。正式部署仍推荐通过 `ORDER_SONG_JWT_SECRET` 环境变量注入至少 32 字节的随机密钥。
 
 ### 前端环境
 

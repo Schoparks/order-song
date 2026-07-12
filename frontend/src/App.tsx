@@ -19,13 +19,15 @@ import {
 } from "./lib/ws";
 import { useStableViewportHeight, resetMobileViewport } from "./hooks/useStableViewportHeight";
 import { useMediaQuery } from "./hooks/useMediaQuery";
+import { useRoomConnectionState, useRoomMenuDismissal } from "./hooks/useRoomChrome";
 import { useAudioController } from "./hooks/useAudioController";
 import { AdminView } from "./components/AdminView";
 import { AuthView, RoomView, TopBar } from "./components/AuthRoom";
-import { PlayerBar, QueueTabs, type QueueTab } from "./components/QueuePlayer";
+import { QueueTabs, type QueueTab } from "./components/QueuePlayer";
+import { MiniPlayer, NowPlayingDock, PlayerSheet } from "./components/NowPlaying";
 import { MembersPanel, UserMenu } from "./components/Popovers";
 import { PlaylistsView, SearchOverlay } from "./components/SearchPlaylists";
-import { ScrollArea, SegmentedTabs } from "./components/common";
+import { ConfirmDialog, ScrollArea, SegmentedTabs } from "./components/common";
 import { TrackList, type PlaylistMembership } from "./components/TrackList";
 import type {
   PlaybackEnvelope,
@@ -39,6 +41,7 @@ import type {
 } from "./types";
 
 type Tab = "trending" | "playlists" | "queue";
+type Overlay = "search" | "members" | "account" | "roomMenu" | "player" | null;
 
 export function App() {
   useStableViewportHeight();
@@ -49,11 +52,12 @@ export function App() {
   const [roomId, setRoomIdState] = useState<number | null>(() => readInitialRoomId());
   const [tab, setTab] = useState<Tab>("trending");
   const [queueTab, setQueueTab] = useState<QueueTab>("queue");
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [membersOpen, setMembersOpen] = useState(false);
-  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [activeOverlay, setActiveOverlay] = useState<Overlay>(null);
+  const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false);
+  const [connectionState, setConnectionState] = useRoomConnectionState(roomId);
   const [hint, setHint] = useState("");
   const queueTabInPrimary = useMediaQuery("(max-width: 1100px)");
+  const isMobile = useMediaQuery("(max-width: 620px)");
 
   const configQuery = useQuery({
     queryKey: ["public-config"],
@@ -84,6 +88,12 @@ export function App() {
   const queueQuery = useQuery({
     queryKey: ["queue", roomId, token],
     queryFn: () => api<QueueItem[]>(`/api/rooms/${roomId}/queue`, { token }),
+    enabled: !!token && !!roomId,
+  });
+
+  const roomQuery = useQuery({
+    queryKey: ["room", roomId, token],
+    queryFn: () => api<Room>(`/api/rooms/${roomId}`, { token }),
     enabled: !!token && !!roomId,
   });
 
@@ -118,7 +128,7 @@ export function App() {
   const membersQuery = useQuery({
     queryKey: ["members", roomId, token],
     queryFn: () => api<Array<{ id: number; username: string }>>(`/api/rooms/${roomId}/members`, { token }),
-    enabled: !!token && !!roomId && membersOpen,
+    enabled: !!token && !!roomId,
   });
 
   const queuedKeys = useMemo(() => new Set((queueQuery.data || []).map((item) => trackKey(item.track))), [queueQuery.data]);
@@ -142,6 +152,9 @@ export function App() {
   useEffect(() => {
     if (token) resetMobileViewport();
   }, [roomId, token]);
+
+  const closeRoomMenu = useCallback(() => setActiveOverlay(null), []);
+  useRoomMenuDismissal(activeOverlay === "roomMenu", closeRoomMenu);
 
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
@@ -173,6 +186,8 @@ export function App() {
   const applyPlaybackEnvelope = audio.applyPlaybackEnvelope;
 
   const handleRoomGone = useCallback(() => {
+    setActiveOverlay(null);
+    setConnectionState(navigator.onLine ? "reconnecting" : "offline");
     setRoomId(null);
     applyPlaybackEnvelope({
       playback_state: {
@@ -248,9 +263,11 @@ export function App() {
     }
 
     function connect() {
+      setConnectionState(navigator.onLine ? "reconnecting" : "offline");
       const protocol = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${protocol}://${location.host}${withBase("/ws")}`);
       ws.addEventListener("open", () => {
+        setConnectionState("connected");
         attempt = 0;
         lastWsMessageAt = Date.now();
         ws?.send(JSON.stringify({ type: "join_room", room_id: roomId, token }));
@@ -282,6 +299,7 @@ export function App() {
       });
       ws.addEventListener("error", closeStaleSocket);
       ws.addEventListener("close", () => {
+        setConnectionState(navigator.onLine ? "reconnecting" : "offline");
         stopHeartbeat();
         if (closed || !roomId) return;
         const delay = Math.min(30000, 1000 * 2 ** attempt);
@@ -358,46 +376,37 @@ export function App() {
   return (
     <div className="appFrame">
       <TopBar
+        roomName={roomQuery.data?.name || `房间 #${roomId}`}
         username={meQuery.data?.username || "账户"}
-        playEnabled={audio.playEnabled}
-        onTogglePlayEnabled={audio.setPlayEnabled}
-        userMenuOpen={userMenuOpen}
-        membersOpen={membersOpen}
-        searchOpen={searchOpen}
+        members={membersQuery.data || []}
+        connectionState={connectionState}
+        roomMenuOpen={activeOverlay === "roomMenu"}
+        membersOpen={activeOverlay === "members"}
+        searchOpen={activeOverlay === "search"}
         onToggleUserMenu={() => {
-          setMembersOpen(false);
-          setUserMenuOpen((v) => !v);
+          setActiveOverlay("account");
         }}
-        onToggleMembers={() => {
-          setUserMenuOpen(false);
-          setMembersOpen((v) => !v);
-        }}
-        onSearch={() => {
-          setUserMenuOpen(false);
-          setMembersOpen(false);
-          setSearchOpen(true);
-        }}
-        onLeave={async () => {
-          await api(`/api/rooms/${roomId}/leave`, { method: "POST", token }).catch(() => {});
-          handleRoomGone();
-        }}
+        onToggleMembers={() => setActiveOverlay((value) => value === "members" ? null : "members")}
+        onSearch={() => setActiveOverlay("search")}
+        onToggleRoomMenu={() => setActiveOverlay((value) => value === "roomMenu" ? null : "roomMenu")}
+        onLeaveRequest={() => { setActiveOverlay(null); setLeaveConfirmOpen(true); }}
       />
 
-      {userMenuOpen && (
+      {activeOverlay === "account" && (
         <UserMenu
           token={token}
           user={meQuery.data}
-          onClose={() => setUserMenuOpen(false)}
+          onClose={() => setActiveOverlay(null)}
           onLogout={logout}
           onUpdated={() => queryClient.invalidateQueries({ queryKey: ["me", token] })}
         />
       )}
 
-      {membersOpen && (
+      {activeOverlay === "members" && (
         <MembersPanel
           members={membersQuery.data || []}
           loading={membersQuery.isLoading}
-          onClose={() => setMembersOpen(false)}
+          onClose={() => setActiveOverlay(null)}
         />
       )}
 
@@ -475,9 +484,15 @@ export function App() {
         </aside>
       </main>
 
-      <PlayerBar audio={audio} />
+      {isMobile ? <MiniPlayer audio={audio} onOpen={() => setActiveOverlay("player")} /> : <NowPlayingDock audio={audio} />}
 
-      {searchOpen && (
+      {isMobile && <nav className="mobileNav glassPanel" aria-label="主要内容">
+        {libraryTabs.map((item) => <button key={item.value} className={tab === item.value ? "active" : ""} onClick={() => setTab(item.value as Tab)}>{item.icon}<span>{item.value === "queue" ? "队列" : item.label}</span></button>)}
+      </nav>}
+
+      {activeOverlay === "player" && <PlayerSheet audio={audio} onClose={() => setActiveOverlay(null)} />}
+
+      {activeOverlay === "search" && (
         <SearchOverlay
           token={token}
           roomId={roomId}
@@ -485,10 +500,15 @@ export function App() {
           playlistMap={playlistMap}
           playlists={playlists}
           historyLimit={config.client.search_history_limit}
-          onClose={() => setSearchOpen(false)}
+          onClose={() => setActiveOverlay(null)}
           onChanged={refreshRoomData}
         />
       )}
+      {leaveConfirmOpen && <ConfirmDialog title="退出房间？" message="退出后需要重新加入才能继续点歌。" confirmText="退出房间" onCancel={() => setLeaveConfirmOpen(false)} onConfirm={async () => {
+        await api(`/api/rooms/${roomId}/leave`, { method: "POST", token });
+        setLeaveConfirmOpen(false);
+        handleRoomGone();
+      }} />}
     </div>
   );
 }

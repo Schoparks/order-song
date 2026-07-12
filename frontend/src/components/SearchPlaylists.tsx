@@ -2,11 +2,15 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronLeft, CloudDownload, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
+import { formatTime } from "../lib/time";
 import { useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import type { Playlist, PlaylistItem, Track } from "../types";
 import { CardDialog, ConfirmDialog, EmptyState, ScrollArea, useModalFocus } from "./common";
 import { RandomPlaylistOrderDialog } from "./RandomPlaylistOrderDialog";
 import { TrackList, type PlaylistMembership } from "./TrackList";
+
+type SearchSource = "all" | "bilibili" | "netease";
+const searchCache = new Map<string, Track[]>();
 
 export function SearchOverlay({
   token,
@@ -40,6 +44,8 @@ export function SearchOverlay({
     }
   });
   const [results, setResults] = useState<Track[]>([]);
+  const [submittedQuery, setSubmittedQuery] = useState("");
+  const [source, setSource] = useState<SearchSource>("all");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [historyVisible, setHistoryVisible] = useState(false);
@@ -48,28 +54,43 @@ export function SearchOverlay({
 
   useEffect(() => () => searchRequestRef.current?.controller.abort(), []);
 
-  async function run(nextQuery = query) {
+  async function run(nextQuery = query, nextSource = source, writeHistory = true) {
     const q = nextQuery.trim();
     if (!q) return;
+    setSubmittedQuery(q);
     setBusy(true);
     setError("");
     setHistoryVisible(false);
-    const nextHistory = [q, ...history.filter((item) => item !== q)].slice(0, historyLimit);
-    setHistory(nextHistory);
-    localStorage.setItem("searchHistory", JSON.stringify(nextHistory));
+    if (writeHistory) {
+      const nextHistory = [q, ...history.filter((item) => item !== q)].slice(0, historyLimit);
+      setHistory(nextHistory);
+      localStorage.setItem("searchHistory", JSON.stringify(nextHistory));
+    }
     searchRequestRef.current?.controller.abort();
     const request = { id: (searchRequestRef.current?.id || 0) + 1, controller: new AbortController() };
     searchRequestRef.current = request;
     try {
-      const nextResults = await api<Track[]>(`/api/search?q=${encodeURIComponent(q)}`, { token, signal: request.controller.signal });
+      const cacheKey = `${token}:${q.toLocaleLowerCase()}:${nextSource}`;
+      const cached = searchCache.get(cacheKey);
+      const nextResults = cached || await api<Track[]>(`/api/search?q=${encodeURIComponent(q)}&source=${nextSource}`, { token, signal: request.controller.signal });
+      if (!cached) {
+        searchCache.set(cacheKey, nextResults);
+        if (searchCache.size > 60) searchCache.delete(searchCache.keys().next().value as string);
+      }
       if (searchRequestRef.current?.id === request.id) setResults(nextResults);
     } catch (err) {
       if (!(err instanceof Error && err.name === "AbortError") && searchRequestRef.current?.id === request.id) {
+        setResults([]);
         setError(err instanceof Error ? err.message : "搜索失败");
       }
     } finally {
       if (searchRequestRef.current?.id === request.id) setBusy(false);
     }
+  }
+
+  function changeSource(nextSource: SearchSource) {
+    setSource(nextSource);
+    if (submittedQuery) void run(submittedQuery, nextSource, false);
   }
 
   return (
@@ -121,14 +142,21 @@ export function SearchOverlay({
             )}
           </div>
           {error && <p className="actionError" role="alert">{error}</p>}
+          <div className="sourceFilters" role="radiogroup" aria-label="搜索来源">
+            {([['all', '全部'], ['bilibili', 'B站'], ['netease', '网易云']] as const).map(([value, label]) => (
+              <button key={value} role="radio" className={source === value ? "active" : ""} aria-checked={source === value} onClick={() => changeSource(value)}>{label}</button>
+            ))}
+          </div>
         </div>
-        <ScrollArea className="searchResults">
+        <ScrollArea className="searchResults" resetKey={`${submittedQuery}:${source}`}>
           <TrackList
             items={results.map((track) => ({
               track,
-              meta: track.source === "bilibili" && track.parts?.length
-                ? `bilibili · ${track.artist || "-"} · ${track.parts.length}P`
-                : undefined,
+              meta: [
+                track.source === "bilibili" ? "B站" : track.source === "netease" ? "网易云" : track.source,
+                track.artist || "未知歌手",
+                track.parts?.length ? `合集 · 可点 ${track.parts.length} P` : track.duration_ms ? formatTime(track.duration_ms) : null,
+              ].filter(Boolean).join(" · "),
             }))}
             token={token}
             roomId={roomId}

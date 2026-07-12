@@ -5,6 +5,7 @@ import { trackKey, trackPayload } from "../lib/track";
 import type { Playlist, Track } from "../types";
 import { CardDialog, EmptyState, TrackCover } from "./common";
 import { BilibiliCollectionActions } from "./BilibiliCollectionActions";
+import { formatTime } from "../lib/time";
 
 export interface PlaylistMembership {
   item_id: number;
@@ -125,14 +126,16 @@ function TrackRow({
               >
                 <ListMusic />{expanded ? "收起" : "展开"}
               </button>
-              <BilibiliCollectionActions
-                track={track}
-                parts={parts}
-                token={token}
-                roomId={roomId}
-                playlists={playlists}
-                onChanged={onChanged}
-              />
+              {expanded && (
+                <BilibiliCollectionActions
+                  track={track}
+                  parts={parts}
+                  token={token}
+                  roomId={roomId}
+                  playlists={playlists}
+                  onChanged={onChanged}
+                />
+              )}
             </>
           ) : (
             <>
@@ -174,7 +177,7 @@ function TrackRow({
           <TrackList
             items={parts.map((part, index) => ({
               track: part,
-              meta: `P${index + 1} · ${part.source} · ${part.artist || "-"}`,
+              meta: `P${part.part_number ?? index + 1} · ${part.artist || "未知歌手"}${part.duration_ms ? ` · ${formatTime(part.duration_ms)}` : ""}`,
             }))}
             token={token}
             roomId={roomId}

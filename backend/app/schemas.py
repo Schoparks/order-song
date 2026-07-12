@@ -48,6 +48,20 @@ class RoomOut(BaseModel):
     created_at: datetime
 
 
+class RoomNowPlayingOut(BaseModel):
+    title: str
+    artist: Optional[str] = None
+    source: TrackSource
+    cover_url: Optional[str] = None
+    is_playing: bool
+
+
+class RoomSummaryOut(RoomOut):
+    member_count: int = 0
+    member_names: list[str] = Field(default_factory=list)
+    now_playing: Optional[RoomNowPlayingOut] = None
+
+
 class CreateRoomIn(BaseModel):
     name: Optional[str] = Field(default=None, max_length=120)
 
@@ -83,6 +97,7 @@ class SearchTrackPartOut(BaseModel):
     artist: Optional[str] = None
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
+    part_number: Optional[int] = None
 
 
 class SearchTrackOut(SearchTrackPartOut):

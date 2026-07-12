@@ -21,6 +21,15 @@ export interface Room {
   created_at: string;
   member_count?: number;
   member_names?: string[];
+  now_playing?: RoomNowPlaying | null;
+}
+
+export interface RoomNowPlaying {
+  title: string;
+  artist?: string | null;
+  source: TrackSource;
+  cover_url?: string | null;
+  is_playing: boolean;
 }
 
 export interface Track {
@@ -36,6 +45,7 @@ export interface Track {
   loudness_peak?: number | null;
   loudness_source?: string | null;
   loudness_error?: string | null;
+  part_number?: number | null;
   parts?: Track[];
 }
 

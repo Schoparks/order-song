@@ -101,12 +101,14 @@ class SearchSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     aggregate_limit: int = 40
+    max_duration_s: int = 1800
     attempts: int = 3
     timeout_s: float = 12.0
     bilibili: BilibiliSearchSettings = Field(default_factory=BilibiliSearchSettings)
     netease: NeteaseSearchSettings = Field(default_factory=NeteaseSearchSettings)
 
     _valid_aggregate_limit = field_validator("aggregate_limit")(_positive_int)
+    _valid_max_duration = field_validator("max_duration_s")(_positive_int)
     _valid_attempts = field_validator("attempts")(_positive_int)
 
     @field_validator("timeout_s")
@@ -267,6 +269,104 @@ def ensure_config_file() -> None:
         shutil.copyfile(CONFIG_TEMPLATE_PATH, CONFIG_PATH)
 
 
+_TOML_SECTION_RE = re.compile(r"^\s*\[([^\[\]]+)]\s*(?:#.*)?$")
+_TOML_KEY_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=")
+
+
+def _nested_toml_value(data: dict[str, Any], section: str) -> dict[str, Any] | None:
+    value: Any = data
+    for part in section.split(".") if section else ():
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value if isinstance(value, dict) else None
+
+
+def _template_key_blocks(content: str) -> list[tuple[str, str, str]]:
+    """Return (section, key, comment-preserving block) for simple template keys."""
+    lines = content.splitlines(keepends=True)
+    section = ""
+    pending: list[str] = []
+    blocks: list[tuple[str, str, str]] = []
+    for line in lines:
+        section_match = _TOML_SECTION_RE.match(line.rstrip("\r\n"))
+        if section_match:
+            section = section_match.group(1).strip()
+            pending = []
+            continue
+        key_match = _TOML_KEY_RE.match(line)
+        if key_match:
+            comments = list(pending)
+            while comments and not comments[0].lstrip().startswith("#"):
+                comments.pop(0)
+            blocks.append((section, key_match.group(1), "".join(comments + [line]).lstrip("\r\n")))
+            pending = []
+            continue
+        if not line.strip() or line.lstrip().startswith("#"):
+            pending.append(line)
+        else:
+            pending = []
+    return blocks
+
+
+def ensure_config_template_defaults() -> None:
+    """Merge missing template keys into local TOML while preserving user text/values."""
+    if not CONFIG_PATH.exists() or not CONFIG_TEMPLATE_PATH.exists():
+        return
+    try:
+        with CONFIG_PATH.open("rb") as current_file:
+            current = tomllib.load(current_file)
+        template_content = CONFIG_TEMPLATE_PATH.read_text(encoding="utf-8")
+        content = CONFIG_PATH.read_text(encoding="utf-8")
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return
+
+    missing: dict[str, list[str]] = {}
+    for section, key, block in _template_key_blocks(template_content):
+        current_section = _nested_toml_value(current, section)
+        if current_section is None or key not in current_section:
+            missing.setdefault(section, []).append(block)
+    if not missing:
+        return
+
+    updated = content
+    for section, blocks in missing.items():
+        addition = "\n".join(block.rstrip("\r\n") for block in blocks) + "\n"
+        header_re = re.compile(rf"(?m)^\s*\[{re.escape(section)}]\s*(?:#.*)?$") if section else None
+        section_match = header_re.search(updated) if header_re else None
+        if section_match:
+            next_header = re.search(r"(?m)^\s*\[", updated[section_match.end() :])
+            insert_at = section_match.end() + (next_header.start() if next_header else len(updated[section_match.end() :]))
+            before = updated[:insert_at].rstrip("\r\n")
+            after = updated[insert_at:].lstrip("\r\n")
+            updated = before + "\n" + addition + ("\n" + after if after else "")
+        elif section:
+            updated = updated.rstrip("\r\n") + f"\n\n[{section}]\n" + addition
+        else:
+            updated = addition + "\n" + updated.lstrip("\r\n")
+
+    # Inline/dotted tables in an older config can conflict with a section from
+    # the newer template (for example `bilibili = {...}` and
+    # `[search.bilibili]`). Never replace a valid user config with invalid TOML;
+    # model defaults still cover keys that cannot be merged textually.
+    try:
+        tomllib.loads(updated)
+    except (ValueError, tomllib.TOMLDecodeError):
+        return
+
+    temp_path = CONFIG_PATH.with_name(f".{CONFIG_PATH.name}.defaults.tmp")
+    try:
+        mode = CONFIG_PATH.stat().st_mode & 0o777
+        temp_path.write_text(updated, encoding="utf-8")
+        temp_path.chmod(mode)
+        os.replace(temp_path, CONFIG_PATH)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def ensure_persistent_jwt_secret() -> None:
     """Replace the template secret in local config with a persistent random one.
 
@@ -357,6 +457,7 @@ def _apply_env_overrides(data: dict[str, Any]) -> None:
 
 def load_settings() -> Settings:
     ensure_config_file()
+    ensure_config_template_defaults()
     ensure_persistent_jwt_secret()
     data: dict[str, Any] = {}
     if CONFIG_PATH.exists():

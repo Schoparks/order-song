@@ -4,7 +4,7 @@ import { ArrowUp, Music2, X } from "lucide-react";
 import { blurActiveElement, useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import type { Track } from "../types";
 
-export function ScrollArea({ children, className = "" }: { children: ReactNode; className?: string }) {
+export function ScrollArea({ children, className = "", resetKey }: { children: ReactNode; className?: string; resetKey?: string }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [showTop, setShowTop] = useState(false);
 
@@ -16,6 +16,10 @@ export function ScrollArea({ children, className = "" }: { children: ReactNode; 
     node.addEventListener("scroll", onScroll, { passive: true });
     return () => node.removeEventListener("scroll", onScroll);
   }, []);
+
+  useEffect(() => {
+    ref.current?.scrollTo({ top: 0 });
+  }, [resetKey]);
 
   return (
     <div className={`scrollShell ${className}`}>
@@ -185,7 +189,7 @@ export function ConfirmDialog({
   );
 }
 
-function trackCoverSrc(track: Track): string | null {
+export function trackCoverSrc(track: Track): string | null {
   if (!track.cover_url) return null;
   if (track.source === "bilibili") {
     if (track.cover_url.startsWith("//")) return `https:${track.cover_url}`;
