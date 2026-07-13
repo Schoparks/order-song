@@ -1,12 +1,13 @@
-import { useCallback, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type RefObject } from "react";
 import { LogOut, X } from "lucide-react";
 import { api } from "../lib/api";
+import { useAnchoredPopover } from "../hooks/useRoomChrome";
 import { useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import type { UserPublic } from "../types";
 import { EmptyState, useModalFocus } from "./common";
 import { InitialAvatar } from "./AuthRoom";
 
-export function UserMenu({ token, user, onClose, onLogout, onUpdated }: { token: string; user?: UserPublic; onClose: () => void; onLogout: () => void; onUpdated: () => void }) {
+export function UserMenu({ token, user, anchorRef, onClose, onLogout, onUpdated }: { token: string; user?: UserPublic; anchorRef: RefObject<HTMLElement>; onClose: () => void; onLogout: () => void; onUpdated: () => void }) {
   useDialogViewportLock();
   const titleId = useId();
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -15,10 +16,14 @@ export function UserMenu({ token, user, onClose, onLogout, onUpdated }: { token:
   const [newPassword, setNewPassword] = useState("");
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
   const [pending, setPending] = useState<"username" | "password" | null>(null);
+  const popoverPosition = useAnchoredPopover(true, anchorRef, "below");
   const closeMenu = useCallback(() => {
     if (!pending) onClose();
   }, [onClose, pending]);
   const { dialogRef, onDialogKeyDown } = useModalFocus({ onClose: closeMenu, canDismiss: !pending, initialFocusRef: nameInputRef });
+  useEffect(() => () => {
+    window.requestAnimationFrame(() => anchorRef.current?.focus());
+  }, [anchorRef]);
 
   async function saveUsername() {
     const username = name.trim();
@@ -58,6 +63,7 @@ export function UserMenu({ token, user, onClose, onLogout, onUpdated }: { token:
         id="account-popover"
         ref={dialogRef}
         className="popover glassPanel accountPopover"
+        style={popoverPosition}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -66,7 +72,7 @@ export function UserMenu({ token, user, onClose, onLogout, onUpdated }: { token:
         onKeyDown={onDialogKeyDown}
       >
         <div className="sheetHeader">
-          <h3 id={titleId}>账户</h3>
+          <h3 id={titleId}>账户设置</h3>
           <button className="iconButton" aria-label="关闭账户菜单" onClick={closeMenu} disabled={!!pending}><X /></button>
         </div>
         <form className="miniForm" onSubmit={(event) => { event.preventDefault(); void saveUsername(); }}>

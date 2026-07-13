@@ -15,7 +15,8 @@
 }
 
 .accountPopover {
-  left: 18px;
+  max-height: calc(100vh - 120px);
+  overflow: auto;
 }
 
 .membersPopover {
@@ -45,6 +46,14 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+.roomHeaderActions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .eyebrow {
@@ -82,6 +91,11 @@
   font-weight: 700;
 }
 
+.adminScene {
+  place-items: start center;
+  align-content: start;
+}
+
 .adminPanel {
   width: min(920px, 100%);
   max-height: calc(100vh - 48px);
@@ -94,6 +108,30 @@
   display: grid;
   gap: 8px;
   margin-bottom: 16px;
+}
+
+.adminSectionTabs {
+  width: 100%;
+  margin: 4px 0 18px;
+}
+
+.adminSection h2 {
+  margin-top: 0;
+}
+
+.adminPagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: -6px 0 18px;
+}
+
+.adminPagination span {
+  min-width: 72px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
 }
 
 .adminRow {
@@ -172,4 +210,3 @@
   height: 14px;
   color: var(--danger);
 }
-

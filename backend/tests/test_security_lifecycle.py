@@ -20,6 +20,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from app import main as main_module
 from app.core import config as config_module
 from app.core.config import AuthSettings, DEFAULT_JWT_SECRET, Settings, validate_auth_configuration
+from app.core.security import hash_password, verify_password
 from app.db import _repair_legacy_foreign_key_data, _set_sqlite_pragmas
 from app.models import (
     QueueStatus,
@@ -34,7 +35,7 @@ from app.models import (
     UserPlaylist,
     UserPlaylistItem,
 )
-from app.routers.admin import _stage_user_deletion, list_all_rooms
+from app.routers.admin import _stage_user_deletion, list_all_rooms, reset_user_password
 from app.routers.playback_core import _playback_lock
 from app.routers.rooms import create_room, get_room_summary, list_rooms, room_state, set_room_mode
 from app.schemas import CreateRoomIn, SetRoomModeIn
@@ -323,6 +324,40 @@ class LifespanTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(cleanup_tasks[0].done())
             self.assertTrue(cleanup_tasks[0].cancelled())
         init_db.assert_called_once_with()
+
+
+class AdminUserManagementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db_path = Path(self.temp_dir.name) / "admin.sqlite3"
+        self.engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"check_same_thread": False},
+            poolclass=NullPool,
+        )
+        event.listen(self.engine, "connect", _set_sqlite_pragmas)
+        SQLModel.metadata.create_all(self.engine)
+
+    def tearDown(self) -> None:
+        self.engine.dispose()
+        self.temp_dir.cleanup()
+
+    def test_admin_can_reset_a_user_password_to_default(self) -> None:
+        with Session(self.engine) as db:
+            admin = User(username="admin", password_hash=hash_password("admin-pass"), is_admin=True)
+            user = User(username="listener", password_hash=hash_password("forgotten"))
+            db.add(admin)
+            db.add(user)
+            db.commit()
+            db.refresh(admin)
+            db.refresh(user)
+
+            result = reset_user_password(int(user.id), db, admin)
+
+            db.refresh(user)
+            self.assertEqual(result, {"ok": True})
+            self.assertTrue(verify_password("123456", user.password_hash))
+            self.assertFalse(verify_password("forgotten", user.password_hash))
 
 
 class UserDeletionLifecycleTests(unittest.TestCase):

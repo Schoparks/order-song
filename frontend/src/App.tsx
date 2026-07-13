@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Heart, History, ListMusic, WandSparkles } from "lucide-react";
 import { api, ApiError, defaultConfig, mergeConfig, withBase } from "./lib/api";
@@ -47,7 +47,7 @@ export function App() {
   useStableViewportHeight();
   const queryClient = useQueryClient();
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_STORAGE_KEY));
-  const [adminToken, setAdminToken] = useState<string | null>(null);
+  const [adminOpen, setAdminOpen] = useState(false);
   const [sessionUserId, setSessionUserId] = useState<number | null>(() => numericStorageValue(SESSION_USER_ID_KEY));
   const [roomId, setRoomIdState] = useState<number | null>(() => readInitialRoomId());
   const [tab, setTab] = useState<Tab>("trending");
@@ -56,6 +56,8 @@ export function App() {
   const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false);
   const [connectionState, setConnectionState] = useRoomConnectionState(roomId);
   const [hint, setHint] = useState("");
+  const roomListAccountButtonRef = useRef<HTMLButtonElement>(null);
+  const roomMenuButtonRef = useRef<HTMLButtonElement>(null);
   const queueTabInPrimary = useMediaQuery("(max-width: 1100px)");
   const isMobile = useMediaQuery("(max-width: 620px)");
 
@@ -319,7 +321,9 @@ export function App() {
 
   const logout = useCallback(() => {
     setToken(null);
-    setAdminToken(null);
+    setAdminOpen(false);
+    setActiveOverlay(null);
+    setLeaveConfirmOpen(false);
     localStorage.removeItem(TOKEN_STORAGE_KEY);
     // Keep roomId:{user_id} so the same account can resume its room after logging in again.
     setRoomIdState(null);
@@ -331,8 +335,8 @@ export function App() {
     if (meQuery.error instanceof ApiError && meQuery.error.status === 401) logout();
   }, [logout, meQuery.error]);
 
-  if (adminToken) {
-    return <AdminView token={adminToken} onExit={() => setAdminToken(null)} />;
+  if (adminOpen && token) {
+    return <AdminView token={token} onExit={() => setAdminOpen(false)} />;
   }
 
   if (!token) {
@@ -351,25 +355,41 @@ export function App() {
           writeRoomIdForUser(nextRoomId, out.user.id);
           queryClient.removeQueries({ queryKey: ["me"] });
         }}
-        onAdminLogin={(out) => setAdminToken(out.token)}
       />
     );
   }
 
   if (!roomId) {
     return (
-      <RoomView
-        token={token}
-        me={meQuery.data}
-        rooms={roomsQuery.data || []}
-        loading={roomsQuery.isLoading}
-        onLogout={logout}
-        onEnter={(id) => {
-          resetMobileViewport();
-          if (audio.playEnabled) audio.unlockAudio();
-          setRoomId(id);
-        }}
-      />
+      <>
+        <RoomView
+          token={token}
+          me={meQuery.data}
+          rooms={roomsQuery.data || []}
+          loading={roomsQuery.isLoading}
+          accountOpen={activeOverlay === "account"}
+          accountButtonRef={roomListAccountButtonRef}
+          onOpenAccount={() => setActiveOverlay("account")}
+          onOpenAdmin={() => setAdminOpen(true)}
+          onLogout={logout}
+          onEnter={(id) => {
+            resetMobileViewport();
+            setActiveOverlay(null);
+            if (audio.playEnabled) audio.unlockAudio();
+            setRoomId(id);
+          }}
+        />
+        {activeOverlay === "account" && (
+          <UserMenu
+            token={token}
+            user={meQuery.data}
+            anchorRef={roomListAccountButtonRef}
+            onClose={() => setActiveOverlay(null)}
+            onLogout={logout}
+            onUpdated={() => queryClient.invalidateQueries({ queryKey: ["me", token] })}
+          />
+        )}
+      </>
     );
   }
 
@@ -383,6 +403,7 @@ export function App() {
         roomMenuOpen={activeOverlay === "roomMenu"}
         membersOpen={activeOverlay === "members"}
         searchOpen={activeOverlay === "search"}
+        roomMenuButtonRef={roomMenuButtonRef}
         onToggleUserMenu={() => {
           setActiveOverlay("account");
         }}
@@ -396,6 +417,7 @@ export function App() {
         <UserMenu
           token={token}
           user={meQuery.data}
+          anchorRef={roomMenuButtonRef}
           onClose={() => setActiveOverlay(null)}
           onLogout={logout}
           onUpdated={() => queryClient.invalidateQueries({ queryKey: ["me", token] })}

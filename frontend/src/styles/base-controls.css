@@ -315,6 +315,7 @@ svg {
 
 .smallButton.active,
 .pillButton.active,
+.iconTextButton.active,
 .segmented button.active {
   color: white;
   background: linear-gradient(145deg, rgba(13, 124, 134, 0.94), rgba(85, 107, 47, 0.92));

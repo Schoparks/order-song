@@ -4,6 +4,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, delete, select
 
+from app.core.security import hash_password
 from app.deps import get_current_user, get_db
 from app.db import engine
 from app.models import QueueStatus, Room, RoomMember, RoomPlaybackState, RoomQueueItem, User, UserPlaylist, UserPlaylistItem
@@ -14,6 +15,7 @@ from app.ws import hub
 
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+DEFAULT_RESET_PASSWORD = "123456"
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
@@ -47,6 +49,17 @@ def update_user(user_id: int, payload: AdminUserUpdateIn, db: Session = Depends(
     db.commit()
     db.refresh(user)
     return {"id": user.id, "username": user.username, "is_admin": user.is_admin}
+
+
+@router.post("/users/{user_id}/reset-password")
+def reset_user_password(user_id: int, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="user not found")
+    user.password_hash = hash_password(DEFAULT_RESET_PASSWORD)
+    db.add(user)
+    db.commit()
+    return {"ok": True}
 
 
 def _stage_user_deletion(db: Session, user: User) -> tuple[set[int], set[int], set[int], set[int]]:

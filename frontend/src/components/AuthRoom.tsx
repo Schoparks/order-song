@@ -1,7 +1,7 @@
-import { useRef, useState } from "react";
+import { useState, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { LogOut, MoreHorizontal, Music2, Plus, Search, Settings, UsersRound } from "lucide-react";
+import { LogOut, MoreHorizontal, Music2, Plus, Search, Settings, ShieldCheck, UsersRound } from "lucide-react";
 import { api } from "../lib/api";
 import { beginMobileKeyboardDismissal, settleMobileViewportBeforeRouteChange } from "../hooks/useStableViewportHeight";
 import { useAnchoredPopover } from "../hooks/useRoomChrome";
@@ -20,18 +20,16 @@ export function AuthView({
   hint,
   onHint,
   onLogin,
-  onAdminLogin,
 }: {
   hint: string;
   onHint: (message: string) => void;
   onLogin: (out: LoginOut) => void;
-  onAdminLogin: (out: LoginOut) => void;
 }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [busy, setBusy] = useState<"login" | "register" | "admin" | null>(null);
+  const [busy, setBusy] = useState<"login" | "register" | null>(null);
 
-  async function submit(kind: "login" | "register" | "admin") {
+  async function submit(kind: "login" | "register") {
     if (!username.trim() || !password) return;
     beginMobileKeyboardDismissal();
     setBusy(kind);
@@ -42,13 +40,12 @@ export function AuthView({
         onHint("注册成功，请登录");
         return;
       }
-      const out = await api<LoginOut>(kind === "admin" ? "/api/auth/admin-login" : "/api/auth/login", {
+      const out = await api<LoginOut>("/api/auth/login", {
         method: "POST",
         json: { username: username.trim(), password },
       });
       await settleMobileViewportBeforeRouteChange();
-      if (kind === "admin") onAdminLogin(out);
-      else onLogin(out);
+      onLogin(out);
     } catch (error) {
       onHint(error instanceof Error ? error.message : "操作失败");
     } finally {
@@ -69,7 +66,6 @@ export function AuthView({
         <div className="buttonRow">
           <button className="primaryButton" disabled={!!busy} onClick={() => submit("login")}>{busy === "login" ? "登录中" : "登录"}</button>
           <button className="glassButton" disabled={!!busy} onClick={() => submit("register")}>{busy === "register" ? "注册中" : "注册"}</button>
-          <button className="ghostButton" disabled={!!busy} onClick={() => submit("admin")}>管理端</button>
         </div>
         {hint && <p className="hintText">{hint}</p>}
       </section>
@@ -82,6 +78,10 @@ export function RoomView({
   me,
   rooms,
   loading,
+  accountOpen,
+  accountButtonRef,
+  onOpenAccount,
+  onOpenAdmin,
   onLogout,
   onEnter,
 }: {
@@ -89,6 +89,10 @@ export function RoomView({
   me?: UserPublic;
   rooms: Room[];
   loading: boolean;
+  accountOpen: boolean;
+  accountButtonRef: RefObject<HTMLButtonElement>;
+  onOpenAccount: () => void;
+  onOpenAdmin: () => void;
   onLogout: () => void;
   onEnter: (roomId: number) => void;
 }) {
@@ -108,7 +112,18 @@ export function RoomView({
           <span className="eyebrow">欢迎回来</span>
           <h1>{me?.username || "order-song"}</h1>
         </div>
-        <button className="iconTextButton" onClick={onLogout}><LogOut />退出</button>
+        <div className="roomHeaderActions">
+          <button
+            ref={accountButtonRef}
+            className={`iconTextButton ${accountOpen ? "active" : ""}`}
+            aria-haspopup="dialog"
+            aria-expanded={accountOpen}
+            aria-controls="account-popover"
+            onClick={onOpenAccount}
+          ><Settings />账户设置</button>
+          {me?.is_admin && <button className="iconTextButton" onClick={onOpenAdmin}><ShieldCheck />管理端</button>}
+          <button className="iconTextButton" onClick={onLogout}><LogOut />退出</button>
+        </div>
       </header>
       <section className="roomComposer glassPanel">
         <label className="fieldLabel"><span>房间名称（可为空）</span><input className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：周末歌房" /></label>
@@ -168,6 +183,7 @@ export function TopBar({
   roomMenuOpen,
   membersOpen,
   searchOpen,
+  roomMenuButtonRef,
   onToggleUserMenu,
   onToggleMembers,
   onSearch,
@@ -181,13 +197,13 @@ export function TopBar({
   roomMenuOpen: boolean;
   membersOpen: boolean;
   searchOpen: boolean;
+  roomMenuButtonRef: RefObject<HTMLButtonElement>;
   onToggleUserMenu: () => void;
   onToggleMembers: () => void;
   onSearch: () => void;
   onToggleRoomMenu: () => void;
   onLeaveRequest: () => void;
 }) {
-  const roomMenuButtonRef = useRef<HTMLButtonElement | null>(null);
   const roomMenuPosition = useAnchoredPopover(roomMenuOpen, roomMenuButtonRef, "below");
   return (
     <header className="topBar glassPanel">
