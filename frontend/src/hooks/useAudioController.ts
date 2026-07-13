@@ -3,6 +3,12 @@ import { api, withBase } from "../lib/api";
 import { clamp, formatTime, parsePlaybackTime } from "../lib/time";
 import { readStoredBoolean, readStoredNumber, writeStoredBoolean } from "../lib/storage";
 import { playableAudioUrl } from "./audioSource";
+import {
+  blockAudioForLoudnessWait as applyLoudnessWaitBlock,
+  hasUsableBackendLoudness,
+  needsBackendLoudness,
+  usesBackendLoudness,
+} from "./loudnessPolicy";
 import { useDynamicAudioNormalizer } from "./useDynamicAudioNormalizer";
 import type { PlaybackEnvelope, PlaybackState, QueueItem, Track } from "../types";
 
@@ -40,17 +46,9 @@ function roomPositionFromState(pb: PlaybackState | null, anchor: SyncAnchor | nu
 }
 
 function metadataGainFromTrack(track: Track | null): number | null {
-  if (track?.loudness_gain_db == null || !track.loudness_source) return null;
-  if (track.source === "netease" && track.loudness_source === "netease:player-url") return null;
+  if (!hasUsableBackendLoudness(track) || track?.loudness_gain_db == null) return null;
   const gainDb = Number(track.loudness_gain_db);
-  if (!Number.isFinite(gainDb)) return null;
   return clamp(10 ** (gainDb / 20), METADATA_MIN_GAIN, METADATA_MAX_GAIN);
-}
-
-function needsBackendLoudness(track: Track | null): boolean {
-  if (!track || track.source !== "netease") return false;
-  if (track.loudness_source === "netease:player-url") return true;
-  return track.loudness_gain_db == null && track.loudness_peak == null;
 }
 
 export function useAudioController(roomId: number | null, token: string | null, fallbackQueue: QueueItem[] = [], backendLoudnessAvailable = false) {
@@ -90,6 +88,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const lastAudioTimeRef = useRef(0);
   const lastStreamReloadAtRef = useRef(0);
   const currentQueueItemRef = useRef<number | null>(null);
+  const loudnessWaitingRef = useRef(false);
   const syncAudioToRoomRef = useRef<(force?: boolean, shouldPlay?: boolean) => void>(() => {});
   const {
     applyOutputVolume: applyDynamicOutputVolume,
@@ -116,6 +115,12 @@ export function useAudioController(roomId: number | null, token: string | null, 
   );
 
   const applyOutputVolume = useCallback((enabled = normalizerEnabled, nextVolume = volume, sourceUrl = normalizerAudioUrl) => {
+    if (enabled && usesBackendLoudness(track)) {
+      const metadataGain = sourceUrl && !needsBackendLoudness(track) ? metadataGainFromTrack(track) : null;
+      applyDynamicOutputVolume(false, metadataGain == null ? nextVolume : clamp(nextVolume * metadataGain, 0, 100), sourceUrl);
+      setNormalizerState(metadataGain == null ? "bypassed" : "metadata");
+      return metadataGain != null;
+    }
     const active = applyDynamicOutputVolume(enabled, nextVolume, sourceUrl);
     if (!enabled) {
       setNormalizerState("off");
@@ -158,6 +163,14 @@ export function useAudioController(roomId: number | null, token: string | null, 
     pendingServerAdvanceRef.current = null;
   }, []);
 
+  const blockAudioForLoudnessWait = useCallback(() => {
+    return applyLoudnessWaitBlock(loudnessWaitingRef.current, {
+      clearPlayRetry,
+      clearStreamRetry,
+      pause: () => audio.pause(),
+    });
+  }, [audio, clearPlayRetry, clearStreamRetry]);
+
   const stopLocalAudio = useCallback(() => {
     clearPlayRetry();
     clearStreamRetry();
@@ -181,6 +194,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, [audio, cleanupAudioGraph, clearPlayRetry, clearStreamRetry]);
 
   const seekAudioTo = useCallback((seconds: number) => {
+    if (blockAudioForLoudnessWait()) return;
     if (!audio.src) {
       pendingSeekSecondsRef.current = null;
       return;
@@ -193,9 +207,10 @@ export function useAudioController(roomId: number | null, token: string | null, 
     } catch {
       // Some streams reject seeks until metadata/canplay fires.
     }
-  }, [audio]);
+  }, [audio, blockAudioForLoudnessWait]);
 
   const applyPendingSeek = useCallback(() => {
+    if (blockAudioForLoudnessWait()) return;
     const seconds = pendingSeekSecondsRef.current;
     if (seconds == null) return;
     try {
@@ -204,13 +219,15 @@ export function useAudioController(roomId: number | null, token: string | null, 
     } catch {
       // Keep the pending seek for the next media readiness event.
     }
-  }, [audio]);
+  }, [audio, blockAudioForLoudnessWait]);
 
   const requestAudioPlay = useCallback((retries = 2) => {
+    if (blockAudioForLoudnessWait()) return;
     if (!audio.src) return;
     clearPlayRetry();
     const requestId = playRequestIdRef.current;
     const attempt = (remaining: number) => {
+      if (requestId !== playRequestIdRef.current || blockAudioForLoudnessWait()) return;
       audio.play()
         .then(() => {
           if (requestId !== playRequestIdRef.current) return;
@@ -223,9 +240,10 @@ export function useAudioController(roomId: number | null, token: string | null, 
         });
     };
     attempt(retries);
-  }, [audio, clearPlayRetry]);
+  }, [audio, blockAudioForLoudnessWait, clearPlayRetry]);
 
   const reloadCurrentStream = useCallback((retries = 1, ignoreCooldown = false) => {
+    if (blockAudioForLoudnessWait()) return;
     if (!playEnabled || !audio.src) return;
     const now = Date.now();
     if (!ignoreCooldown && now - lastStreamReloadAtRef.current < STREAM_RELOAD_COOLDOWN_MS) return;
@@ -240,7 +258,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       // Reload is best-effort; play retries below will handle the recoverable cases.
     }
     requestAudioPlay(retries);
-  }, [audio, clearStreamRetry, getRoomPositionMs, playEnabled, requestAudioPlay]);
+  }, [audio, blockAudioForLoudnessWait, clearStreamRetry, getRoomPositionMs, playEnabled, requestAudioPlay]);
 
   const unlockAudio = useCallback((force = false) => {
     if (!force && !playEnabled) return;
@@ -254,11 +272,11 @@ export function useAudioController(roomId: number | null, token: string | null, 
     if (value) {
       unlockAudio(true);
       syncAudioToRoomRef.current(true, true);
-      if (playback?.is_playing) requestAudioPlay(3);
+      if (playback?.is_playing && !loudnessWaiting) requestAudioPlay(3);
     } else {
       stopLocalAudio();
     }
-  }, [playback?.is_playing, requestAudioPlay, stopLocalAudio, unlockAudio]);
+  }, [loudnessWaiting, playback?.is_playing, requestAudioPlay, stopLocalAudio, unlockAudio]);
 
   const setNormalizerEnabled = useCallback((value: boolean) => {
     setNormalizerEnabledState(value);
@@ -292,7 +310,8 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const syncAudioToRoom = useCallback((force = false, shouldPlay = playEnabled) => {
     const audioUrl = normalizerAudioUrl;
     const localPlaybackEnabled = playEnabled || shouldPlay;
-    const allowLocalPlay = localPlaybackEnabled && shouldPlay && !loudnessWaiting;
+    if (blockAudioForLoudnessWait()) return;
+    const allowLocalPlay = localPlaybackEnabled && shouldPlay;
     if (!localPlaybackEnabled) {
       stopLocalAudio();
       return;
@@ -332,6 +351,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
 
     if (!allowLocalPlay) {
       clearPlayRetry();
+      clearStreamRetry();
       audio.pause();
       return;
     }
@@ -342,7 +362,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       clearPlayRetry();
       audio.pause();
     }
-  }, [applyOutputVolume, audio, clearPlayRetry, clearStreamRetry, getDurationMs, loudnessWaiting, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, stopLocalAudio, track]);
+  }, [applyOutputVolume, audio, blockAudioForLoudnessWait, clearPlayRetry, clearStreamRetry, getDurationMs, loudnessWaiting, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, stopLocalAudio, track]);
 
   syncAudioToRoomRef.current = syncAudioToRoom;
 
@@ -422,6 +442,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       if (nextUrl) {
         setAudioError(null);
       } else if (hasAudioUpdate) {
+        if (blockAudioForLoudnessWait()) return nextUrl;
         clearStreamRetry();
         audio.pause();
         audio.removeAttribute("src");
@@ -434,7 +455,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       }
     }
     return nextUrl;
-  }, [audio, clearStreamRetry, playEnabled, token, track?.id, track?.source]);
+  }, [audio, blockAudioForLoudnessWait, clearStreamRetry, playEnabled, token, track?.id, track?.source]);
 
   const fallbackNextQueueItem = useCallback((currentQueueItemId: number | null) => {
     const queue = fallbackQueueRef.current;
@@ -476,6 +497,12 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, [applyLocalQueueItem, fallbackNextQueueItem]);
 
   const applyPlaybackEnvelope = useCallback((envelope: PlaybackEnvelope) => {
+    const waiting = Boolean(envelope.loudness_waiting);
+    if (waiting) {
+      loudnessWaitingRef.current = true;
+      blockAudioForLoudnessWait();
+      setLoudnessWaiting(true);
+    }
     const pending = pendingServerAdvanceRef.current;
     if (
       pending &&
@@ -491,17 +518,18 @@ export function useAudioController(roomId: number | null, token: string | null, 
     if (envelope.playback_state.current_queue_item_id !== playback?.current_queue_item_id) {
       setAudioError(null);
     }
+    loudnessWaitingRef.current = waiting;
     setPlayback(envelope.playback_state);
     setTrack((previous) => envelope.current_track || (envelope.playback_state.current_queue_item_id ? previous : null));
     setOrderedBy((previous) => envelope.ordered_by ?? (envelope.playback_state.current_queue_item_id ? previous : null));
-    setLoudnessWaiting(Boolean(envelope.loudness_waiting));
+    setLoudnessWaiting(waiting);
     anchorRef.current = {
       clientTsMs: Date.now(),
       effectivePositionMs:
         envelope.effective_position_ms ??
         roomPositionFromState(envelope.playback_state, null),
     };
-  }, [clearOptimisticNext, playback?.current_queue_item_id]);
+  }, [blockAudioForLoudnessWait, clearOptimisticNext, playback?.current_queue_item_id]);
 
   const next = useCallback(async () => {
     if (!roomId || !token) return;
@@ -580,14 +608,12 @@ export function useAudioController(roomId: number | null, token: string | null, 
     const key = `${playback?.current_queue_item_id ?? "none"}:${track.id}:${track.source}:${track.source_track_id}`;
     if (refreshedAudioTrackRef.current === key) return;
     const needsUrl = !playableAudioUrl(track);
-    const needsLoudness = normalizerEnabled && needsBackendLoudness(track);
-    const shouldRefresh = needsUrl || track.source === "bilibili" || track.source === "qq" || needsLoudness;
-    if (!shouldRefresh) return;
+    if (!needsUrl) return;
     refreshedAudioTrackRef.current = key;
-    refreshDirectAudioUrl(track.source === "bilibili" || track.source === "qq" || needsLoudness).catch(() => {
+    refreshDirectAudioUrl().catch(() => {
       refreshedAudioTrackRef.current = null;
     });
-  }, [normalizerEnabled, playEnabled, playback?.current_queue_item_id, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.loudness_gain_db, track?.loudness_peak, track?.loudness_source, track?.source, track?.source_track_id]);
+  }, [playEnabled, playback?.current_queue_item_id, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.source, track?.source_track_id]);
 
   useEffect(() => {
     const onCanPlay = () => {
@@ -674,12 +700,14 @@ export function useAudioController(roomId: number | null, token: string | null, 
       lastAudioTimeRef.current = audio.currentTime || 0;
     };
     const onError = () => {
+      if (blockAudioForLoudnessWait()) return;
       if (!playEnabled || !playback?.is_playing || !audio.src || streamRetryCountRef.current >= STREAM_RETRY_LIMIT) return;
       streamRetryCountRef.current += 1;
       clearStreamRetry();
       streamRetryTimerRef.current = window.setTimeout(() => {
         refreshDirectAudioUrl(true)
           .then((nextUrl) => {
+            if (blockAudioForLoudnessWait()) return;
             if (nextUrl) {
               const nextSrc = withBase(nextUrl);
               audio.src = nextSrc;
@@ -701,7 +729,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       audio.removeEventListener("timeupdate", onTime);
       audio.removeEventListener("error", onError);
     };
-  }, [applyPendingSeek, audio, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, loudnessWaiting, next, playback?.is_playing, playEnabled, refreshDirectAudioUrl, reloadCurrentStream, track]);
+  }, [applyPendingSeek, audio, blockAudioForLoudnessWait, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, loudnessWaiting, next, playback?.is_playing, playEnabled, refreshDirectAudioUrl, reloadCurrentStream, track]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {

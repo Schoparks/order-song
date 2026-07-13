@@ -41,45 +41,10 @@ def _is_bilibili_browser_direct_url(audio_url: str | None) -> bool:
     return path.endswith(".mp4")
 
 
-def _finite_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not (number == number and number not in (float("inf"), float("-inf"))):
-        return None
-    return number
-
-
 def _clamp_loudness_gain_db(value: float | None) -> float | None:
     if value is None:
         return None
     return max(-12.0, min(12.0, value))
-
-
-def _bilibili_loudness_from_playurl(data: dict[str, Any] | None) -> AudioResolveResult:
-    volume = (data or {}).get("volume")
-    if not isinstance(volume, dict):
-        return AudioResolveResult()
-    measured_i = _finite_float(volume.get("measured_i"))
-    target_i = _finite_float(volume.get("target_i"))
-    target_offset = _finite_float(volume.get("target_offset"))
-    measured_tp = _finite_float(volume.get("measured_tp"))
-    gain_db = None
-    if measured_i is not None and target_i is not None:
-        gain_db = target_i - measured_i
-    elif target_offset is not None:
-        gain_db = target_offset
-    peak = None
-    if measured_tp is not None:
-        # true peak is normally reported in dBTP.
-        peak = 10 ** (measured_tp / 20)
-    return AudioResolveResult(
-        loudness_gain_db=_clamp_loudness_gain_db(gain_db),
-        loudness_peak=peak,
-        loudness_source="bilibili:playurl-volume",
-    )
-
 
 async def _fetch_bilibili_video_metadata(source_track_id: str) -> dict[str, Any] | None:
     ref = parse_bilibili_source_track_id(source_track_id)
@@ -196,7 +161,7 @@ async def _resolve_netease_audio(source_track_id: str) -> AudioResolveResult:
 async def _resolve_qq_audio(source_track_id: str, *, force: bool = False) -> AudioResolveResult:
     try:
         audio_url = await qq_music.resolve_audio_url(source_track_id, force=force)
-        return AudioResolveResult(audio_url=audio_url)
+        return AudioResolveResult(audio_url=audio_url, analysis_audio_url=audio_url)
     except QQMusicUnavailable:
         return AudioResolveResult()
     except Exception:
@@ -248,7 +213,7 @@ async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str,
                     "high_quality": 1,
                 }
             )
-            loudness = _bilibili_loudness_from_playurl(html5)
+            result = AudioResolveResult()
             playback_url = None
             durl = (html5 or {}).get("durl") or []
             for item in durl:
@@ -256,32 +221,28 @@ async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str,
                 if direct_url:
                     playback_url = direct_url
                     break
-            if playback_url and (loudness.loudness_gain_db is not None or loudness.loudness_peak is not None):
-                loudness.audio_url = playback_url
-                return loudness
-
             dash_data = await _playurl({"bvid": ref.bvid, "cid": cid, "fnval": 16, "fnver": 0, "fourk": 1})
-            if loudness.loudness_gain_db is None and loudness.loudness_peak is None:
-                loudness = _bilibili_loudness_from_playurl(dash_data)
             dash = (dash_data or {}).get("dash")
             if not dash:
                 if playback_url:
-                    loudness.audio_url = playback_url
-                    return loudness
+                    result.audio_url = playback_url
+                    result.analysis_audio_url = playback_url
+                    return result
                 return AudioResolveResult()
             audio_list = dash.get("audio") or []
             if not audio_list:
                 if playback_url:
-                    loudness.audio_url = playback_url
-                    return loudness
+                    result.audio_url = playback_url
+                    result.analysis_audio_url = playback_url
+                    return result
                 return AudioResolveResult()
             aac = [a for a in audio_list if "mp4a" in (a.get("codecs") or "")]
             candidates = aac if aac else audio_list
             candidates.sort(key=lambda x: x.get("bandwidth", 0), reverse=True)
-            loudness.analysis_audio_url = candidates[0].get("baseUrl") or candidates[0].get("base_url")
+            result.analysis_audio_url = candidates[0].get("baseUrl") or candidates[0].get("base_url")
             # DASH audio-only URLs are for backend analysis. They commonly return 403
             # to browsers, so never promote them to the browser playback field.
-            loudness.audio_url = playback_url
-            return loudness
+            result.audio_url = playback_url
+            return result
     except Exception:
         return AudioResolveResult()

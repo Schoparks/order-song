@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 _EXPECTED_URL_UNSET = object()
 _QQ_AUDIO_CDN = "https://isure.stream.qqmusic.qq.com/"
-_QQ_AUDIO_HOST_SUFFIX = "stream.qqmusic.qq.com"
+_QQ_AUDIO_HOST = "isure.stream.qqmusic.qq.com"
 
 
 class QQMusicUnavailable(RuntimeError):
@@ -41,6 +41,7 @@ class QQMusicService:
         self._login_task: asyncio.Task[None] | None = None
         self._refresh_task: asyncio.Task[None] | None = None
         self._audio_urls: dict[str, tuple[str, float]] = {}
+        self._audio_url_tasks: dict[str, asyncio.Task[str | None]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -188,6 +189,11 @@ class QQMusicService:
         if self._client is not None and self._credential_type is not None:
             self._client.credential = self._credential_type()
         self._audio_urls.clear()
+        current_task = asyncio.current_task()
+        for task in self._audio_url_tasks.values():
+            if task is not current_task:
+                task.cancel()
+        self._audio_url_tasks.clear()
         with suppress(OSError):
             self._session_path.unlink()
         if schedule_login:
@@ -259,6 +265,7 @@ class QQMusicService:
 
     async def close(self) -> None:
         tasks = [task for task in (self._login_task, self._refresh_task) if task]
+        tasks.extend(self._audio_url_tasks.values())
         for task in tasks:
             task.cancel()
         for task in tasks:
@@ -273,6 +280,7 @@ class QQMusicService:
             self._login_task = None
             self._refresh_task = None
             self._audio_urls.clear()
+            self._audio_url_tasks.clear()
 
     async def _create_qr_session(self) -> Any:
         session = self._qr_session_type(
@@ -435,7 +443,7 @@ class QQMusicService:
             or parsed.username is not None
             or parsed.password is not None
             or port not in (None, 443)
-            or not (host == _QQ_AUDIO_HOST_SUFFIX or host.endswith(f".{_QQ_AUDIO_HOST_SUFFIX}"))
+            or host != _QQ_AUDIO_HOST
         ):
             return False
         query = parse_qs(parsed.query)
@@ -509,6 +517,10 @@ class QQMusicService:
         return await self._authenticated(operation)
 
     async def resolve_audio_url(self, source_track_id: str, *, force: bool = False) -> str | None:
+        existing = self._audio_url_tasks.get(source_track_id)
+        if existing and not existing.done():
+            return await asyncio.shield(existing)
+
         if force:
             self._audio_urls.pop(source_track_id, None)
         else:
@@ -523,7 +535,18 @@ class QQMusicService:
             urls = await self._playable_urls(response.tracks[:1])
             return urls.get(source_track_id)
 
-        return await self._authenticated(operation)
+        task = asyncio.create_task(
+            self._authenticated(operation),
+            name=f"qq-audio-url-{source_track_id}",
+        )
+        self._audio_url_tasks[source_track_id] = task
+
+        def discard(completed: asyncio.Task[str | None]) -> None:
+            if self._audio_url_tasks.get(source_track_id) is completed:
+                self._audio_url_tasks.pop(source_track_id, None)
+
+        task.add_done_callback(discard)
+        return await asyncio.shield(task)
 
 
 qq_music = QQMusicService()

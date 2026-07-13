@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -38,8 +39,7 @@ _LOUDNESS_PREFETCH_LAST_AT = 0.0
 _ROOM_NORMALIZER_PREFS: dict[tuple[int, int], float] = {}
 _ROOM_NORMALIZER_PREF_TTL_SECONDS = 600
 _ROOM_LOUDNESS_WAITING: dict[int, int] = {}
-_BACKEND_LOUDNESS_SOURCES = {TrackSource.netease, TrackSource.bilibili}
-_UNTRUSTED_LOUDNESS_SOURCES = {"netease:player-url"}
+_BACKEND_LOUDNESS_SOURCES = {TrackSource.netease, TrackSource.bilibili, TrackSource.qq}
 logger = logging.getLogger(__name__)
 
 
@@ -92,23 +92,9 @@ def _stale_control_response(pb: RoomPlaybackState) -> dict[str, Any]:
     }
 
 
-def _store_loudness_metadata(track: Track, result: AudioResolveResult) -> None:
-    if result.loudness_gain_db is None and result.loudness_peak is None:
-        return
-    track.loudness_gain_db = _clamp_loudness_gain_db(result.loudness_gain_db)
-    track.loudness_peak = result.loudness_peak
-    track.loudness_source = result.loudness_source
-    track.loudness_fetched_at = datetime.utcnow()
-    track.loudness_error = None
-
-
 def _store_loudness_error(track: Track, error: str) -> None:
     track.loudness_error = error[:240]
     track.loudness_fetched_at = datetime.utcnow()
-
-
-def _result_has_loudness(result: AudioResolveResult) -> bool:
-    return result.loudness_gain_db is not None or result.loudness_peak is not None
 
 
 def _recent_loudness_error(track: Track) -> bool:
@@ -119,13 +105,16 @@ def _recent_loudness_error(track: Track) -> bool:
 
 
 def _track_has_loudness(track: Track) -> bool:
-    if track.loudness_source in _UNTRUSTED_LOUDNESS_SOURCES:
+    expected_source = f"{track.source.value}:ffmpeg-ebur128"
+    try:
+        gain_db = float(track.loudness_gain_db)
+    except (TypeError, ValueError):
         return False
-    return track.loudness_gain_db is not None or track.loudness_peak is not None or bool(track.loudness_source)
+    return track.loudness_source == expected_source and math.isfinite(gain_db)
 
 
-def _clear_untrusted_loudness_metadata(track: Track) -> bool:
-    if track.loudness_source not in _UNTRUSTED_LOUDNESS_SOURCES:
+def _clear_invalid_loudness_metadata(track: Track) -> bool:
+    if not track.loudness_source or _track_has_loudness(track):
         return False
     track.loudness_gain_db = None
     track.loudness_peak = None
@@ -169,6 +158,8 @@ def _loudness_analysis_headers(source: TrackSource) -> dict[str, str]:
         headers["Referer"] = "https://www.bilibili.com/"
     elif source == TrackSource.netease:
         headers["Referer"] = "https://music.163.com/"
+    elif source == TrackSource.qq:
+        headers["Referer"] = "https://y.qq.com/"
     return headers
 
 
@@ -205,12 +196,18 @@ def _schedule_loudness_analysis(track_id: int | None, source: TrackSource, analy
             logger.info("loudness analysis cancelled for track %s", track_id)
             raise
         except Exception as exc:
-            logger.exception("loudness analysis failed unexpectedly for track %s", track_id)
+            # Resolver URLs can contain bearer-like credentials. Never include
+            # exception text because upstream errors may echo the full URL.
+            logger.error(
+                "loudness analysis failed unexpectedly for track %s (%s)",
+                track_id,
+                type(exc).__name__,
+            )
             try:
                 await asyncio.to_thread(
                     _persist_loudness_exception_transaction,
                     track_id,
-                    f"unexpected analysis failure: {exc}",
+                    f"unexpected analysis failure ({type(exc).__name__})",
                 )
             except Exception:
                 logger.exception("failed to persist loudness error for track %s", track_id)
@@ -237,7 +234,8 @@ def _persist_loudness_result_transaction(
         track = write_db.get(Track, track_id)
         if not track:
             return
-        if source is not None:
+        expected_source = f"{track.source.value}:ffmpeg-ebur128"
+        if source == expected_source:
             track.loudness_gain_db = _clamp_loudness_gain_db(gain_db)
             track.loudness_peak = peak
             track.loudness_source = source
@@ -261,18 +259,18 @@ def _persist_loudness_exception_transaction(track_id: int, error: str) -> None:
         write_db.commit()
 
 
-def _clear_untrusted_loudness_transaction(track_id: int) -> None:
+def _clear_invalid_loudness_transaction(track_id: int) -> None:
     with Session(engine) as write_db:
         track = write_db.get(Track, track_id)
-        if track and _clear_untrusted_loudness_metadata(track):
+        if track and _clear_invalid_loudness_metadata(track):
             write_db.add(track)
             write_db.commit()
 
 
 async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
-    if track.id and track.loudness_source in _UNTRUSTED_LOUDNESS_SOURCES:
+    if track.id and track.loudness_source and not _track_has_loudness(track):
         db.rollback()
-        await asyncio.to_thread(_clear_untrusted_loudness_transaction, track.id)
+        await asyncio.to_thread(_clear_invalid_loudness_transaction, track.id)
         db.expire_all()
         db.refresh(track)
 
@@ -283,17 +281,18 @@ async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
         ):
             await _resolve_audio_url(db, track, force=True)
             return
-        if track.source == TrackSource.bilibili and track.loudness_source is None and not _recent_loudness_error(track):
-            await _resolve_audio_url(db, track, force=True)
-            return
         if track.source == TrackSource.netease and _direct_playback_audio_url(track) != track.audio_url:
             await _resolve_audio_url(db, track, force=True)
             return
         if track.source == TrackSource.qq and _direct_playback_audio_url(track) != track.audio_url:
-            await _resolve_audio_url(db, track, force=True)
+            await _resolve_audio_url(db, track)
             return
-        if track.source == TrackSource.netease and _track_needs_backend_loudness(track):
-            _schedule_loudness_analysis(track.id, track.source, track.audio_url, force=True)
+        if _track_needs_backend_loudness(track):
+            if track.source == TrackSource.bilibili:
+                # Refresh resolver metadata to prefer the audio-only DASH input.
+                await _resolve_audio_url(db, track, force=True)
+                return
+            _schedule_loudness_analysis(track.id, track.source, track.audio_url)
             return
         if track.id:
             _AUDIO_URL_RESOLVE_ERRORS.pop(track.id, None)
@@ -326,7 +325,13 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     if track.source == TrackSource.bilibili and not track.cover_url:
         video = await _ensure_bilibili_metadata(db, track)
 
-    if track.audio_url and not force:
+    cached_audio_is_current = not (
+        track.source == TrackSource.qq
+        and _direct_playback_audio_url(track) != track.audio_url
+    )
+    if track.audio_url and not force and cached_audio_is_current:
+        if _track_needs_backend_loudness(track):
+            _schedule_loudness_analysis(track.id, track.source, track.audio_url)
         return track.audio_url
 
     if track.source == TrackSource.netease:
@@ -338,7 +343,12 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         db.expire_all()
         db.refresh(track)
         if _track_needs_backend_loudness(track):
-            _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url or track.audio_url, force=force)
+            _schedule_loudness_analysis(
+                track.id,
+                track.source,
+                result.analysis_audio_url or track.audio_url,
+                force=force,
+            )
         return track.audio_url
 
     if track.source == TrackSource.qq:
@@ -349,6 +359,13 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
         db.expire_all()
         db.refresh(track)
+        if _track_needs_backend_loudness(track) and result.analysis_audio_url:
+            _schedule_loudness_analysis(
+                track.id,
+                track.source,
+                result.analysis_audio_url,
+                force=force,
+            )
         return track.audio_url
 
     if track.source == TrackSource.bilibili:
@@ -361,8 +378,8 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
         db.expire_all()
         db.refresh(track)
-        if not _result_has_loudness(result) and (force or not _recent_loudness_error(track)):
-            _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url, force=force)
+        if _track_needs_backend_loudness(track):
+            _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url or track.audio_url, force=force)
         return track.audio_url
 
     return None
@@ -379,25 +396,15 @@ def _persist_audio_resolution_transaction(
         track = write_db.get(Track, track_id)
         if not track:
             return
-        if track.source in (TrackSource.netease, TrackSource.qq):
-            if track.source == TrackSource.qq:
-                if force or result.audio_url:
-                    track.audio_url = result.audio_url
-                    write_db.add(track)
-                    write_db.commit()
-                return
+        if track.source not in _BACKEND_LOUDNESS_SOURCES:
+            return
+        if track.source == TrackSource.netease:
             track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
-            _clear_untrusted_loudness_metadata(track)
-            write_db.add(track)
-            write_db.commit()
-            return
-        if track.source != TrackSource.bilibili:
-            return
-        if force or result.audio_url or _result_has_loudness(result):
+        elif force or result.audio_url:
             track.audio_url = result.audio_url
-            _store_loudness_metadata(track, result)
-            write_db.add(track)
-            write_db.commit()
+        _clear_invalid_loudness_metadata(track)
+        write_db.add(track)
+        write_db.commit()
 
 
 def _schedule_track_loudness_prefetch(track_id: int | None) -> None:
@@ -420,7 +427,11 @@ def _schedule_track_loudness_prefetch(track_id: int | None) -> None:
                 with Session(engine) as prefetch_db:
                     track = prefetch_db.get(Track, track_id)
                     if track and _track_needs_backend_loudness(track):
-                        await _resolve_audio_url(prefetch_db, track, force=True)
+                        await _resolve_audio_url(
+                            prefetch_db,
+                            track,
+                            force=track.source == TrackSource.bilibili,
+                        )
         finally:
             _LOUDNESS_PREFETCH_TASKS.pop(track_id, None)
 

@@ -7,6 +7,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,11 @@ _TRUSTED_AUDIO_HOST_SUFFIXES = {
         "music.126.net",
         "music.163.com",
     ),
+}
+_TRUSTED_AUDIO_HOSTS = {
+    # QQ purl/vkey URLs are bearer-like temporary credentials. Keep this exact
+    # instead of accepting every host below qq.com or qqmusic.qq.com.
+    "qq": frozenset({"isure.stream.qqmusic.qq.com"}),
 }
 
 
@@ -127,12 +133,20 @@ def validate_trusted_audio_url(audio_url: str, trusted_source: str) -> str | Non
         return "unsupported audio analysis url scheme"
     if not parsed.hostname or parsed.username or parsed.password:
         return "invalid audio analysis url host"
-    if port is not None and port not in {80, 443}:
+    source_key = _trusted_source_key(trusted_source)
+    if source_key == "qq" and parsed.scheme != "https":
+        return "unsupported audio analysis url scheme"
+    allowed_ports = {443} if source_key == "qq" else {80, 443}
+    if port is not None and port not in allowed_ports:
         return "unsupported audio analysis url port"
 
     host = parsed.hostname.rstrip(".").lower()
-    suffixes = _TRUSTED_AUDIO_HOST_SUFFIXES.get(_trusted_source_key(trusted_source), ())
-    if not suffixes or not any(_host_matches_suffix(host, suffix) for suffix in suffixes):
+    exact_hosts = _TRUSTED_AUDIO_HOSTS.get(source_key)
+    suffixes = _TRUSTED_AUDIO_HOST_SUFFIXES.get(source_key, ())
+    trusted = host in exact_hosts if exact_hosts is not None else any(
+        _host_matches_suffix(host, suffix) for suffix in suffixes
+    )
+    if not trusted:
         return "untrusted audio analysis url host"
     return None
 
@@ -157,6 +171,24 @@ def _validate_public_dns(audio_url: str) -> str | None:
         except ValueError:
             return "audio analysis host resolution invalid"
     return None
+
+
+def _validate_public_dns_before_deadline(audio_url: str, deadline: float) -> str | None:
+    """Bound synchronous getaddrinfo without letting it hold the analysis worker."""
+    result: list[str | None] = []
+    completed = threading.Event()
+
+    def resolve() -> None:
+        try:
+            result.append(_validate_public_dns(audio_url))
+        finally:
+            completed.set()
+
+    threading.Thread(target=resolve, name="audio-analysis-dns", daemon=True).start()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not completed.wait(remaining):
+        return "ffmpeg loudness analysis timeout"
+    return result[0] if result else "audio analysis host resolution failed"
 
 
 async def analyze_remote_audio_loudness(
@@ -204,11 +236,25 @@ async def analyze_remote_audio_loudness(
                 current_url = audio_url
                 response_context = None
                 for redirect_count in range(_MAX_REDIRECTS + 1):
-                    unsafe = validate_trusted_audio_url(current_url, trusted_source) or _validate_public_dns(current_url)
+                    unsafe = validate_trusted_audio_url(
+                        current_url, trusted_source
+                    ) or _validate_public_dns_before_deadline(current_url, deadline)
                     if unsafe:
                         return LoudnessAnalysisResult(error=unsafe)
-                    response_context = client.stream("GET", current_url, headers=request_headers)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return LoudnessAnalysisResult(error="ffmpeg loudness analysis timeout")
+                    response_context = client.stream(
+                        "GET",
+                        current_url,
+                        headers=request_headers,
+                        timeout=max(0.001, remaining),
+                    )
                     response = response_context.__enter__()
+                    if time.monotonic() >= deadline:
+                        response_context.__exit__(None, None, None)
+                        response_context = None
+                        return LoudnessAnalysisResult(error="ffmpeg loudness analysis timeout")
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location")
                         response_context.__exit__(None, None, None)
@@ -269,10 +315,23 @@ async def analyze_remote_audio_loudness(
             return LoudnessAnalysisResult(error="ffmpeg not found")
         except subprocess.TimeoutExpired:
             return LoudnessAnalysisResult(error="ffmpeg loudness analysis timeout")
+        except httpx.TimeoutException:
+            return LoudnessAnalysisResult(error="ffmpeg loudness analysis timeout")
         except httpx.HTTPError as exc:
-            return LoudnessAnalysisResult(error=f"audio analysis fetch failed: {exc}")
+            # HTTP exception strings may include the complete QQ purl/vkey.
+            return LoudnessAnalysisResult(
+                error=f"audio analysis fetch failed ({type(exc).__name__})"
+            )
+        except ValueError as exc:
+            if str(exc) == "audio analysis download exceeded byte limit":
+                return LoudnessAnalysisResult(error=str(exc))
+            return LoudnessAnalysisResult(
+                error=f"ffmpeg loudness analysis failed ({type(exc).__name__})"
+            )
         except Exception as exc:
-            return LoudnessAnalysisResult(error=f"ffmpeg loudness analysis failed: {exc}")
+            return LoudnessAnalysisResult(
+                error=f"ffmpeg loudness analysis failed ({type(exc).__name__})"
+            )
 
         parsed = _parse_ebur128(stderr, source=source)
         if parsed.analysis:

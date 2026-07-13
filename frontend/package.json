@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc --noEmit -p tsconfig.json && node scripts/build.mjs",
+    "test:loudness": "node scripts/test-loudness-policy.mjs",
     "preview": "vite preview --host 0.0.0.0"
   },
   "dependencies": {

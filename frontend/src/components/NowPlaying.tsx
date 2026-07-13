@@ -68,7 +68,13 @@ function Transport({ audio }: { audio: AudioController }) {
 
 function SoundControls({ audio }: { audio: AudioController }) {
   const normalizerTitle = audio.normalizerEnabled
-    ? audio.normalizerState === "active" ? "音量均衡已应用" : audio.normalizerState === "pending" ? "正在分析响度" : "已启用音量均衡"
+    ? audio.normalizerState === "active"
+      ? "本机动态音量均衡已应用"
+      : audio.normalizerState === "metadata"
+        ? "服务端响度均衡已应用"
+        : audio.normalizerState === "pending"
+          ? "正在等待服务端分析响度"
+          : "服务端响度均衡不可用"
     : "音量均衡";
   return (
     <div className="npSound">
