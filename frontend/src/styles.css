@@ -4,4 +4,7 @@
 @import "./styles/popovers-admin.css";
 @import "./styles/responsive.css";
 @import "./styles/music-room.css";
-@import "./styles/liquid-materials.css";
+@import "./styles/liquid-tokens.css";
+@import "./styles/liquid-surfaces.css";
+@import "./styles/liquid-controls.css";
+@import "./styles/liquid-motion.css";

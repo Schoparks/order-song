@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Check, ChevronLeft, CloudDownload, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "../lib/api";
@@ -53,6 +53,14 @@ export function SearchOverlay({
   const [historyVisible, setHistoryVisible] = useState(false);
   const historyScopeRef = useRef<HTMLDivElement | null>(null);
   const searchRequestRef = useRef<{ id: number; controller: AbortController } | null>(null);
+  const sourceSegmentCount = qqMusicEnabled ? 4 : 3;
+  const sourceSegmentIndex = Math.min(sourceSegmentCount - 1, Math.max(0, ["all", "bilibili", "netease", "qq"].indexOf(source)));
+  const sourceSegmentStyle = {
+    "--segment-count": sourceSegmentCount,
+    "--segment-index": sourceSegmentIndex,
+    "--segment-width": `${100 / sourceSegmentCount}%`,
+    "--segment-shift": `${sourceSegmentIndex * 100}%`,
+  } as CSSProperties;
 
   useEffect(() => () => searchRequestRef.current?.controller.abort(), []);
 
@@ -144,7 +152,7 @@ export function SearchOverlay({
             )}
           </div>
           {error && <p className="actionError" role="alert">{error}</p>}
-          <div className="sourceFilters" role="radiogroup" aria-label="搜索来源">
+          <div className="sourceFilters" role="radiogroup" aria-label="搜索来源" style={sourceSegmentStyle}>
             {([['all', '全部'], ['bilibili', 'B站'], ['netease', '网易云'], ...(qqMusicEnabled ? [['qq', 'QQ音乐'] as const] : [])] as const).map(([value, label]) => (
               <button key={value} role="radio" className={source === value ? "active" : ""} aria-checked={source === value} onClick={() => changeSource(value)}>{label}</button>
             ))}

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Heart, History, ListMusic, WandSparkles } from "lucide-react";
 import { api, ApiError, defaultConfig, mergeConfig, withBase } from "./lib/api";
@@ -393,6 +393,14 @@ export function App() {
     );
   }
 
+  const mobileTabIndex = Math.max(0, libraryTabs.findIndex((item) => item.value === tab));
+  const mobileSegmentStyle = {
+    "--segment-count": libraryTabs.length,
+    "--segment-index": mobileTabIndex,
+    "--segment-width": `${100 / libraryTabs.length}%`,
+    "--segment-shift": `${mobileTabIndex * 100}%`,
+  } as CSSProperties;
+
   return (
     <div className="appFrame">
       <TopBar
@@ -509,7 +517,7 @@ export function App() {
 
       {isMobile ? <MiniPlayer audio={audio} onOpen={() => setActiveOverlay("player")} /> : <NowPlayingDock audio={audio} />}
 
-      {isMobile && <nav className="mobileNav glassPanel" aria-label="主要内容">
+      {isMobile && <nav className="mobileNav glassPanel" aria-label="主要内容" style={mobileSegmentStyle}>
         {libraryTabs.map((item) => <button key={item.value} className={tab === item.value ? "active" : ""} onClick={() => setTab(item.value as Tab)}>{item.icon}<span>{item.value === "queue" ? "队列" : item.label}</span></button>)}
       </nav>}
 

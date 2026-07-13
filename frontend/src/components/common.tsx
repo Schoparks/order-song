@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ArrowUp, Music2, X } from "lucide-react";
 import { blurActiveElement, useDialogViewportLock } from "../hooks/useStableViewportHeight";
@@ -227,8 +227,18 @@ export function SegmentedTabs({
   className?: string;
   label?: string;
 }) {
+  const segmentCount = Math.max(1, items.length);
+  const segmentIndex = Math.max(0, items.findIndex((item) => item.value === value));
+  const segmentStyle = {
+    "--segment-count": segmentCount,
+    "--segment-index": segmentIndex,
+    "--segment-width": `${100 / segmentCount}%`,
+    "--segment-shift": `${segmentIndex * 100}%`,
+    "--segment-shell-width": `${segmentCount * 132}px`,
+  } as CSSProperties;
+
   return (
-    <div className={`segmented ${className}`} role="group" aria-label={label}>
+    <div className={`segmented ${className}`} role="group" aria-label={label} style={segmentStyle}>
       {items.map((item) => (
         <button
           key={item.value}

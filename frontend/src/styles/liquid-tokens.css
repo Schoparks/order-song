@@ -1,0 +1,71 @@
+/* Shared liquid-glass palette and optical system. */
+:root {
+  --glass-edge: rgba(255, 255, 255, 0.88);
+  --glass-edge-soft: rgba(255, 255, 255, 0.56);
+  --glass-edge-dark: rgba(29, 55, 70, 0.1);
+  --glass-highlight: rgba(255, 255, 255, 0.92);
+  --glass-thin: rgba(250, 253, 253, 0.5);
+  --glass-regular: rgba(247, 252, 251, 0.6);
+  --glass-thick: rgba(248, 252, 251, 0.74);
+  --glass-float: rgba(250, 253, 252, 0.92);
+  --glass-control: rgba(255, 255, 255, 0.56);
+  --glass-control-hover: rgba(255, 255, 255, 0.74);
+  --glass-tint: rgba(177, 228, 222, 0.18);
+  --glass-tint-warm: rgba(213, 227, 178, 0.16);
+  --glass-blur-thin: blur(18px) saturate(155%);
+  --glass-blur-regular: blur(28px) saturate(175%);
+  --glass-blur-thick: blur(40px) saturate(190%);
+  --glass-shadow-low: 0 8px 24px rgba(28, 50, 64, 0.09);
+  --glass-shadow-medium: 0 20px 56px rgba(28, 50, 64, 0.14);
+  --glass-shadow-high: 0 30px 84px rgba(20, 42, 56, 0.2);
+  --glass-inset:
+    inset 0 1px 0 var(--glass-highlight),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(24, 49, 65, 0.06);
+  --motion-response: 360ms;
+  --motion-snappy: 140ms;
+  --motion-materialize: 420ms;
+  --ease-fluid: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-press: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --surface: var(--glass-regular);
+  --surface-strong: var(--glass-thick);
+  --surface-bg: rgba(246, 251, 250, 0.62);
+  --surface-panel: var(--glass-regular);
+  --surface-float: var(--glass-float);
+  --surface-hero: rgba(231, 248, 244, 0.64);
+  --hairline: var(--glass-edge);
+  --hairline-dark: var(--glass-edge-dark);
+  --shadow: var(--glass-shadow-medium);
+  --blur: var(--glass-blur-regular);
+  font-optical-sizing: auto;
+}
+
+body {
+  background:
+    radial-gradient(circle at 8% 12%, rgba(131, 214, 215, 0.3), transparent 34%),
+    radial-gradient(circle at 92% 8%, rgba(194, 214, 135, 0.3), transparent 30%),
+    radial-gradient(circle at 68% 92%, rgba(143, 173, 218, 0.22), transparent 36%),
+    linear-gradient(132deg, #f5fafb 0%, #e8f2f2 42%, #f0f4e9 72%, #ebf0f7 100%);
+}
+
+.authCard h1,
+.roomHeader h1,
+.adminPanel h1 {
+  letter-spacing: -0.035em;
+  line-height: 0.98;
+}
+
+.songInfo strong,
+.playlistRow strong,
+.roomTile strong,
+.npText strong {
+  letter-spacing: -0.012em;
+}
+
+.eyebrow,
+.fieldLabel,
+.memberCount,
+.npText span,
+.npText em {
+  letter-spacing: 0.012em;
+}

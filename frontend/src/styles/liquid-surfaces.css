@@ -1,0 +1,176 @@
+/* Material weight, bright edges, inner reflection, and non-nested depth. */
+.glassPanel,
+.authCard {
+  border-color: var(--glass-edge);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.72), transparent 42%),
+    linear-gradient(320deg, var(--glass-tint), var(--glass-tint-warm)),
+    var(--glass-regular);
+  box-shadow: var(--glass-inset), var(--glass-shadow-medium);
+  backdrop-filter: var(--glass-blur-regular);
+  -webkit-backdrop-filter: var(--glass-blur-regular);
+  isolation: isolate;
+}
+
+.glassPanel::before,
+.authCard::before {
+  inset: 1px;
+  border-radius: inherit;
+  background:
+    linear-gradient(118deg, rgba(255, 255, 255, 0.86), transparent 28%),
+    radial-gradient(circle at 82% 8%, rgba(255, 255, 255, 0.58), transparent 24%);
+  opacity: 0.76;
+}
+
+.authCard,
+.adminPanel,
+.searchSheet,
+.dialogCard,
+.playerSheet {
+  border-color: rgba(255, 255, 255, 0.9);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.82), transparent 38%),
+    linear-gradient(330deg, rgba(175, 224, 218, 0.18), rgba(220, 230, 188, 0.12)),
+    var(--glass-thick);
+  box-shadow: var(--glass-inset), var(--glass-shadow-high);
+  backdrop-filter: var(--glass-blur-thick);
+  -webkit-backdrop-filter: var(--glass-blur-thick);
+}
+
+.topBar,
+.nowPlayingDock,
+.miniPlayer,
+.mobileNav {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.68), transparent 48%),
+    var(--glass-thin);
+  box-shadow: var(--glass-inset), var(--glass-shadow-low);
+  backdrop-filter: var(--glass-blur-thin);
+  -webkit-backdrop-filter: var(--glass-blur-thin);
+}
+
+.popover,
+.roomMenu {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.86), transparent 44%),
+    var(--glass-float);
+  box-shadow: var(--glass-inset), var(--glass-shadow-high);
+  backdrop-filter: var(--glass-blur-thick);
+  -webkit-backdrop-filter: var(--glass-blur-thick);
+}
+
+.libraryPanel,
+.sideColumn {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.62), transparent 38%),
+    rgba(244, 250, 249, 0.64);
+  backdrop-filter: var(--glass-blur-regular);
+  -webkit-backdrop-filter: var(--glass-blur-regular);
+}
+
+.playlistDetail .sectionToolbar,
+.roomPlaybackState,
+.localSoundCard,
+.searchInputWrap {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.searchInputWrap,
+.localSoundCard {
+  border: 1px solid var(--glass-edge-soft);
+  background: rgba(255, 255, 255, 0.36);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72), inset 0 -1px 0 rgba(29, 55, 70, 0.05);
+}
+
+.playlistDetail .sectionToolbar {
+  border-bottom-color: transparent;
+  background: linear-gradient(180deg, rgba(243, 250, 249, 0.94), rgba(243, 250, 249, 0.78) 72%, transparent);
+}
+
+.songRow,
+.playlistRow,
+.adminRow,
+.memberRow,
+.checkRow,
+.songPartsCard,
+.songPartsCard .songRow {
+  border-color: rgba(255, 255, 255, 0.74);
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.68), rgba(255, 255, 255, 0.32)),
+    rgba(239, 247, 246, 0.6);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.78), 0 6px 18px rgba(37, 61, 74, 0.06);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.roomTile {
+  background:
+    linear-gradient(145deg, rgba(255, 255, 255, 0.68), transparent 46%),
+    rgba(244, 250, 249, 0.56);
+}
+
+.queueCurrent {
+  border-color: rgba(13, 124, 134, 0.3);
+  background: linear-gradient(115deg, rgba(52, 172, 170, 0.16), rgba(255, 255, 255, 0.58));
+  box-shadow: inset 3px 0 0 rgba(13, 124, 134, 0.52), inset 0 1px 0 rgba(255, 255, 255, 0.82);
+}
+
+.cover,
+.brandMark,
+.roomTileCover,
+.initialAvatar {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.46), 0 10px 28px rgba(31, 56, 70, 0.14);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .songRow:hover,
+  .playlistRow:hover,
+  .roomTile:hover {
+    background:
+      linear-gradient(145deg, rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.42)),
+      rgba(239, 248, 246, 0.7);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86), 0 10px 26px rgba(37, 61, 74, 0.09);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .glassPanel,
+  .authCard,
+  .topBar,
+  .nowPlayingDock,
+  .miniPlayer,
+  .mobileNav,
+  .popover,
+  .roomMenu,
+  .libraryPanel,
+  .sideColumn,
+  .adminPanel,
+  .searchSheet,
+  .dialogCard,
+  .playerSheet {
+    background: rgba(247, 251, 250, 0.97);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root { --muted: rgba(16, 32, 45, 0.78); }
+
+  .glassPanel,
+  .authCard,
+  .popover,
+  .roomMenu,
+  .songRow,
+  .playlistRow,
+  .adminRow,
+  .memberRow,
+  .checkRow {
+    border-color: rgba(16, 32, 45, 0.48);
+    background: rgba(250, 253, 252, 0.96);
+  }
+
+  .glassPanel::before,
+  .authCard::before { opacity: 0.18; }
+}
