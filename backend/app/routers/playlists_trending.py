@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 from datetime import datetime
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,10 +14,47 @@ from app.core.config import settings
 from app.db import engine
 from app.deps import get_current_user, get_db
 from app.models import Track, TrackOrderStats, TrackSource, User, UserPlaylist, UserPlaylistItem
+from app.qq_music import QQMusicUnavailable, qq_music
 from app.routers.queue_playback import _ensure_bilibili_metadata, _get_or_create_track
 
 
 router = APIRouter(prefix="/api", tags=["playlists", "trending"])
+
+
+def _parse_playlist_link(value: str) -> tuple[TrackSource, str]:
+    raw = value.strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="请输入歌单链接")
+    candidate = raw if "://" in raw else f"https://{raw}"
+    parsed = urlparse(candidate)
+    host = (parsed.hostname or "").rstrip(".").lower()
+
+    if host == "music.163.com" or host.endswith(".music.163.com"):
+        fragment = urlparse(parsed.fragment if parsed.fragment.startswith("/") else f"/{parsed.fragment}")
+        path = fragment.path if "playlist" in fragment.path else parsed.path
+        query = parse_qs(fragment.query if "playlist" in fragment.path else parsed.query)
+        match = re.search(r"/playlist(?:/|$)(\d+)?", path, re.IGNORECASE)
+        playlist_id = (query.get("id") or [None])[0] or (match.group(1) if match else None)
+        if not match or not playlist_id or not str(playlist_id).isdigit():
+            raise HTTPException(status_code=400, detail="该网易云链接不是有效的歌单链接")
+        return TrackSource.netease, str(playlist_id)
+
+    if host == "y.qq.com" or host.endswith(".y.qq.com"):
+        query = parse_qs(parsed.query)
+        path_match = re.search(r"/playlist/(\d+)(?:/|$)", parsed.path, re.IGNORECASE)
+        looks_like_playlist = bool(path_match or "taoge" in parsed.path.lower() or "playlist" in parsed.path.lower())
+        playlist_id = (query.get("id") or query.get("disstid") or [None])[0]
+        if path_match:
+            playlist_id = path_match.group(1)
+        if not looks_like_playlist or not playlist_id or not str(playlist_id).isdigit():
+            raise HTTPException(status_code=400, detail="该 QQ 音乐链接不是有效的歌单链接")
+        return TrackSource.qq, str(playlist_id)
+
+    if host.endswith("qq.com"):
+        raise HTTPException(status_code=400, detail="该 QQ 音乐链接不是有效的歌单链接")
+    if host.endswith("163.com"):
+        raise HTTPException(status_code=400, detail="该网易云链接不是有效的歌单链接")
+    raise HTTPException(status_code=400, detail="仅支持网易云音乐或 QQ 音乐的歌单链接")
 
 
 def _validate_track_payload(payload: dict) -> tuple[TrackSource, str, str]:
@@ -160,11 +198,12 @@ def _import_bilibili_collection_transaction(
         }
 
 
-def _import_netease_tracks_transaction(
+def _import_tracks_transaction(
     user_id: int,
     playlist_name: str,
     tracks: list[dict],
     skipped: int,
+    source: TrackSource,
 ) -> dict:
     with Session(engine) as write_db:
         playlist = UserPlaylist(user_id=user_id, name=playlist_name)
@@ -175,7 +214,7 @@ def _import_netease_tracks_transaction(
             for payload in tracks:
                 track = _get_or_create_track(
                     write_db,
-                    source=TrackSource.netease,
+                    source=source,
                     source_track_id=payload["source_track_id"],
                     title=payload["title"],
                     artist=payload["artist"],
@@ -203,6 +242,21 @@ def _import_netease_tracks_transaction(
             "skipped": skipped,
             "total": len(tracks) + skipped,
         }
+
+
+def _import_netease_tracks_transaction(
+    user_id: int,
+    playlist_name: str,
+    tracks: list[dict],
+    skipped: int,
+) -> dict:
+    return _import_tracks_transaction(
+        user_id,
+        playlist_name,
+        tracks,
+        skipped,
+        TrackSource.netease,
+    )
 
 
 @router.get("/playlists")
@@ -405,6 +459,45 @@ async def import_bilibili_collection(payload: dict, db: Session = Depends(get_db
         tracks=tracks,
         user_id=user.id,
     )
+
+
+@router.post("/playlists/import")
+async def import_playlist(payload: dict, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Import a supported playlist link after identifying its upstream source."""
+    source, playlist_id = _parse_playlist_link(str(payload.get("url") or ""))
+    requested_name = (payload.get("name") or "").strip() or None
+
+    if source == TrackSource.netease:
+        return await import_netease_playlist(
+            {"id": playlist_id, "name": requested_name}, db=db, user=user
+        )
+
+    if not settings.qq_music.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="QQ 音乐解析未开启，请先在 config.toml 中启用 qq_music.enabled",
+        )
+    try:
+        upstream = await qq_music.playlist_tracks(int(playlist_id))
+    except QQMusicUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="请求 QQ 音乐歌单失败") from exc
+
+    tracks = upstream.get("tracks") or []
+    total = max(int(upstream.get("total") or 0), len(tracks))
+    playlist_name = requested_name or str(upstream.get("name") or f"QQ 音乐歌单 {playlist_id}")
+    db.rollback()
+    result = await asyncio.to_thread(
+        _import_tracks_transaction,
+        user.id,
+        playlist_name,
+        tracks,
+        max(0, total - len(tracks)),
+        TrackSource.qq,
+    )
+    result["total"] = total
+    return result
 
 
 @router.post("/playlists/import-netease")

@@ -57,6 +57,25 @@ api_limit = 50
 # 网易云可用歌曲最多保留多少条。
 result_limit = 24
 
+[qq_music]
+# 是否启用 QQ 音乐搜索、歌单导入和直连播放解析。关闭时不会加载 QQ 音乐依赖或发起相关请求。
+enabled = false
+# 登录凭证和设备信息仅保存在本机，路径相对项目根目录；不要提交这两个文件。
+session_path = "backend/qq_music_session.json"
+device_path = "backend/qq_music_device.json"
+# 未登录时同步保存上游原始二维码 PNG，扫码成功、过期或停服后自动删除。
+qr_path = "backend/qq_music_login_qr.png"
+# QQ 音乐搜索最多返回多少首已确认可播放的免费歌曲。
+search_limit = 24
+# QQ 音乐歌单分页拉取数量。
+playlist_page_size = 100
+# 单张登录二维码等待扫码的最长时间，单位秒；超时后会在控制台自动生成新二维码。
+login_timeout_s = 180
+# 已登录时后台检查并刷新凭证的间隔，单位秒。
+refresh_interval_s = 21600
+# 单次 QQ 音乐上游请求的硬超时，单位秒。
+request_timeout_s = 20.0
+
 [trending]
 # 热门歌曲数量。前端会请求这个数量，后端未传 limit 时也使用这个数量。
 limit = 50

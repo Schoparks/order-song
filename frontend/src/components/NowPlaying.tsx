@@ -48,6 +48,7 @@ function TrackIdentity({ audio, large = false }: { audio: AudioController; large
       <div className="npText">
         <strong>{audio.track?.title || "等待第一首歌"}</strong>
         <span>{audio.track ? `${audio.track.artist || "未知歌手"} · ${audio.track.source}` : "搜索并点一首喜欢的歌"}</span>
+        {audio.audioError && <em role="alert">{audio.audioError}</em>}
         {audio.orderedBy?.username && <em>{audio.orderedBy.username} 点播</em>}
       </div>
     </div>

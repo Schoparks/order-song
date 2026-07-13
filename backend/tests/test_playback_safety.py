@@ -504,6 +504,21 @@ class PlaybackSafetyTests(unittest.TestCase):
         self.assertIsNone(_direct_playback_audio_url(dash))
         self.assertEqual(_direct_playback_audio_url(mp4), mp4.audio_url)
 
+    def test_qq_cached_url_is_only_exposed_while_service_marks_it_current(self) -> None:
+        qq = Track(
+            source=TrackSource.qq,
+            source_track_id="003abc",
+            title="qq",
+            audio_url="https://isure.stream.qqmusic.qq.com/M500003abc.mp3?vkey=key",
+        )
+        with patch("app.routers.playback_audio.qq_music.current_audio_url", return_value=None):
+            self.assertIsNone(_direct_playback_audio_url(qq))
+        with patch(
+            "app.routers.playback_audio.qq_music.current_audio_url",
+            return_value=qq.audio_url,
+        ):
+            self.assertEqual(_direct_playback_audio_url(qq), qq.audio_url)
+
     def test_analysis_url_allowlist_rejects_credentials_and_broad_suffixes(self) -> None:
         self.assertIsNone(
             audio_loudness.validate_trusted_audio_url(

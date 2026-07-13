@@ -16,6 +16,7 @@ from app.core.config import settings, validate_auth_configuration
 from app.core.security import decode_token
 from app.db import engine, init_db
 from app.models import RoomMember
+from app.qq_music import qq_music
 from app.routers.auth import router as auth_router
 from app.routers.rooms import router as rooms_router, remove_member_from_room
 from app.routers.search import router as search_router
@@ -57,13 +58,17 @@ async def _cleanup_stale_members() -> None:
 async def _lifespan(_app: FastAPI):
     validate_auth_configuration(settings)
     init_db()
-    cleanup_task = asyncio.create_task(_cleanup_stale_members(), name="stale-room-member-cleanup")
+    cleanup_task: asyncio.Task[None] | None = None
     try:
+        await qq_music.start()
+        cleanup_task = asyncio.create_task(_cleanup_stale_members(), name="stale-room-member-cleanup")
         yield
     finally:
-        cleanup_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await cleanup_task
+        if cleanup_task is not None:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
+        await qq_music.close()
 
 
 app = FastAPI(title=settings.app_name, lifespan=_lifespan)

@@ -20,6 +20,12 @@ backend/.venv/
 .env.*
 !.env.example
 config.toml
+backend/qq_music_session.json
+backend/qq_music_device.json
+backend/qq_music_login_qr.png
+backend/.qq_music_session.json.*.tmp
+backend/.qq_music_device.json.*.tmp
+backend/.qq_music_login_qr.png.*.tmp
 
 # Databases
 *.sqlite

@@ -71,6 +71,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const [isSeeking, setIsSeeking] = useState(false);
   const [normalizerState, setNormalizerState] = useState<NormalizerState>("off");
   const [loudnessWaiting, setLoudnessWaiting] = useState(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
   const hasTrack = track != null;
 
   const volumeRef = useRef(volume);
@@ -383,25 +384,32 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const refreshDirectAudioUrl = useCallback(async (force = false) => {
     if (!playEnabled || !token || !track?.id) return null;
     const query = force ? "?force=true" : "";
-    const result = await api<{
-      track_id: number;
-      audio_url?: string | null;
-      loudness_gain_db?: number | null;
-      loudness_peak?: number | null;
-      loudness_source?: string | null;
-      loudness_error?: string | null;
-    }>(`/api/tracks/${track.id}/audio-url${query}`, { token });
+    let result: {
+        track_id: number;
+        audio_url?: string | null;
+        loudness_gain_db?: number | null;
+        loudness_peak?: number | null;
+        loudness_source?: string | null;
+        loudness_error?: string | null;
+      };
+    try {
+      result = await api(`/api/tracks/${track.id}/audio-url${query}`, { token });
+    } catch (error) {
+      if (track.source === "qq") setAudioError("QQ 音乐播放地址刷新失败，请稍后重试");
+      throw error;
+    }
     const nextUrl = result.audio_url || null;
+    const hasAudioUpdate = Object.prototype.hasOwnProperty.call(result, "audio_url");
     const hasLoudnessUpdate = Object.prototype.hasOwnProperty.call(result, "loudness_gain_db")
       || Object.prototype.hasOwnProperty.call(result, "loudness_peak")
       || Object.prototype.hasOwnProperty.call(result, "loudness_source")
       || Object.prototype.hasOwnProperty.call(result, "loudness_error");
-    if (nextUrl || hasLoudnessUpdate) {
+    if (hasAudioUpdate || hasLoudnessUpdate) {
       setTrack((previous) => (
         previous && previous.id === track.id
           ? {
               ...previous,
-              audio_url: nextUrl || previous.audio_url,
+              audio_url: hasAudioUpdate ? nextUrl : previous.audio_url,
               loudness_gain_db: hasLoudnessUpdate ? (result.loudness_gain_db ?? null) : previous.loudness_gain_db,
               loudness_peak: hasLoudnessUpdate ? (result.loudness_peak ?? null) : previous.loudness_peak,
               loudness_source: hasLoudnessUpdate ? (result.loudness_source ?? null) : previous.loudness_source,
@@ -410,8 +418,23 @@ export function useAudioController(roomId: number | null, token: string | null, 
           : previous
       ));
     }
+    if (track.source === "qq") {
+      if (nextUrl) {
+        setAudioError(null);
+      } else if (hasAudioUpdate) {
+        clearStreamRetry();
+        audio.pause();
+        audio.removeAttribute("src");
+        try {
+          audio.load();
+        } catch {
+          // Removing src is enough to stop retrying the expired QQ URL.
+        }
+        setAudioError("QQ 音乐当前歌曲暂无可用的完整播放地址");
+      }
+    }
     return nextUrl;
-  }, [playEnabled, token, track?.id]);
+  }, [audio, clearStreamRetry, playEnabled, token, track?.id, track?.source]);
 
   const fallbackNextQueueItem = useCallback((currentQueueItemId: number | null) => {
     const queue = fallbackQueueRef.current;
@@ -434,6 +457,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       updated_at: new Date(now).toISOString(),
     }));
     setTrack(item.track);
+    setAudioError(null);
     setOrderedBy(item.ordered_by);
     setPositionMs(0);
     setDurationMs(Number(item.track.duration_ms || 0));
@@ -464,6 +488,9 @@ export function useAudioController(roomId: number | null, token: string | null, 
     if (pending && envelope.playback_state.current_queue_item_id !== pending.expectedQueueItemId) {
       clearOptimisticNext();
     }
+    if (envelope.playback_state.current_queue_item_id !== playback?.current_queue_item_id) {
+      setAudioError(null);
+    }
     setPlayback(envelope.playback_state);
     setTrack((previous) => envelope.current_track || (envelope.playback_state.current_queue_item_id ? previous : null));
     setOrderedBy((previous) => envelope.ordered_by ?? (envelope.playback_state.current_queue_item_id ? previous : null));
@@ -474,7 +501,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
         envelope.effective_position_ms ??
         roomPositionFromState(envelope.playback_state, null),
     };
-  }, [clearOptimisticNext]);
+  }, [clearOptimisticNext, playback?.current_queue_item_id]);
 
   const next = useCallback(async () => {
     if (!roomId || !token) return;
@@ -550,17 +577,17 @@ export function useAudioController(roomId: number | null, token: string | null, 
       return;
     }
     if (!track?.id || !token) return;
-    const key = `${track.id}:${track.source}:${track.source_track_id}`;
+    const key = `${playback?.current_queue_item_id ?? "none"}:${track.id}:${track.source}:${track.source_track_id}`;
     if (refreshedAudioTrackRef.current === key) return;
     const needsUrl = !playableAudioUrl(track);
     const needsLoudness = normalizerEnabled && needsBackendLoudness(track);
-    const shouldRefresh = needsUrl || track.source === "bilibili" || needsLoudness;
+    const shouldRefresh = needsUrl || track.source === "bilibili" || track.source === "qq" || needsLoudness;
     if (!shouldRefresh) return;
     refreshedAudioTrackRef.current = key;
-    refreshDirectAudioUrl(track.source === "bilibili" || needsLoudness).catch(() => {
+    refreshDirectAudioUrl(track.source === "bilibili" || track.source === "qq" || needsLoudness).catch(() => {
       refreshedAudioTrackRef.current = null;
     });
-  }, [normalizerEnabled, playEnabled, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.loudness_gain_db, track?.loudness_peak, track?.loudness_source, track?.source, track?.source_track_id]);
+  }, [normalizerEnabled, playEnabled, playback?.current_queue_item_id, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.loudness_gain_db, track?.loudness_peak, track?.loudness_source, track?.source, track?.source_track_id]);
 
   useEffect(() => {
     const onCanPlay = () => {
@@ -705,6 +732,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
     playEnabled,
     normalizerEnabled,
     loudnessWaiting,
+    audioError,
     normalizerState: effectiveNormalizerState,
     volume,
     positionMs,

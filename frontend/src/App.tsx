@@ -461,6 +461,7 @@ export function App() {
                   playlists={playlists}
                   playlistMap={playlistMap}
                   queuedKeys={queuedKeys}
+                  qqMusicEnabled={config.qq_music.enabled}
                   onChanged={refreshRoomData}
                 />
               )}
@@ -522,6 +523,7 @@ export function App() {
           playlistMap={playlistMap}
           playlists={playlists}
           historyLimit={config.client.search_history_limit}
+          qqMusicEnabled={config.qq_music.enabled}
           onClose={() => setActiveOverlay(null)}
           onChanged={refreshRoomData}
         />

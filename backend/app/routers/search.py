@@ -11,6 +11,7 @@ from app.bilibili import make_bilibili_source_track_id, normalize_bilibili_pic
 from app.core.config import settings
 from app.deps import get_current_user
 from app.models import TrackSource, User
+from app.qq_music import QQMusicUnavailable, qq_music
 from app.schemas import SearchTrackOut, SearchTrackPartOut
 
 
@@ -246,6 +247,15 @@ async def _run_netease(q: str) -> list[SearchTrackOut]:
     return filtered
 
 
+async def _run_qq(q: str) -> list[SearchTrackOut]:
+    if not settings.qq_music.enabled:
+        raise QQMusicUnavailable("QQ 音乐解析未开启")
+    return [
+        SearchTrackOut(source=TrackSource.qq, **track)
+        for track in await qq_music.search_tracks(q)
+    ]
+
+
 def _normalize_search_text(value: str | None) -> str:
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", (value or "").casefold()).strip()
 
@@ -339,7 +349,7 @@ def _rank_results(q: str, items: list[SearchTrackOut]) -> list[SearchTrackOut]:
 @router.get("/search", response_model=list[SearchTrackOut])
 async def search(
     q: str,
-    source: Literal["all", "bilibili", "netease"] = Query("all"),
+    source: Literal["all", "bilibili", "netease", "qq"] = Query("all"),
     user: User = Depends(get_current_user),
 ):
     del user
@@ -347,9 +357,15 @@ async def search(
     if not q:
         return []
     runners = {"bilibili": _run_bilibili, "netease": _run_netease}
+    if settings.qq_music.enabled:
+        runners["qq"] = _run_qq
     if source != "all":
+        if source == "qq" and not settings.qq_music.enabled:
+            raise HTTPException(status_code=400, detail="QQ 音乐解析未开启")
         try:
             items = await runners[source](q)
+        except QQMusicUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"{source} 搜索暂时不可用") from exc
         return _rank_results(q, items)

@@ -11,6 +11,7 @@ from app.bilibili import find_bilibili_page, normalize_bilibili_pic, parse_bilib
 from app.core.config import settings
 from app.db import engine
 from app.models import Track, TrackSource
+from app.qq_music import QQMusicUnavailable, qq_music
 
 
 @dataclass
@@ -23,6 +24,8 @@ class AudioResolveResult:
 
 
 def _direct_playback_audio_url(track: Track) -> str | None:
+    if track.source == TrackSource.qq:
+        return qq_music.current_audio_url(track.source_track_id, track.audio_url)
     if track.audio_url and validate_trusted_audio_url(track.audio_url, track.source.value) is None:
         if track.source != TrackSource.bilibili or _is_bilibili_browser_direct_url(track.audio_url):
             return track.audio_url
@@ -186,6 +189,16 @@ async def _resolve_netease_audio(source_track_id: str) -> AudioResolveResult:
                 audio_url=audio_url,
                 analysis_audio_url=audio_url,
             )
+    except Exception:
+        return AudioResolveResult()
+
+
+async def _resolve_qq_audio(source_track_id: str, *, force: bool = False) -> AudioResolveResult:
+    try:
+        audio_url = await qq_music.resolve_audio_url(source_track_id, force=force)
+        return AudioResolveResult(audio_url=audio_url)
+    except QQMusicUnavailable:
+        return AudioResolveResult()
     except Exception:
         return AudioResolveResult()
 

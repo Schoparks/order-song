@@ -112,6 +112,9 @@ export interface PublicConfig {
     enabled?: boolean;
     ffmpeg_available?: boolean;
   };
+  qq_music?: {
+    enabled?: boolean;
+  };
 }
 
 export type WsMessage =

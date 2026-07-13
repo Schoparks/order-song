@@ -97,6 +97,30 @@ class NeteaseSearchSettings(BaseModel):
     _valid_result_limit = field_validator("result_limit")(_positive_int)
 
 
+class QQMusicSettings(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+    session_path: str = "backend/qq_music_session.json"
+    device_path: str = "backend/qq_music_device.json"
+    qr_path: str = "backend/qq_music_login_qr.png"
+    search_limit: int = 24
+    playlist_page_size: int = 100
+    login_timeout_s: int = 180
+    refresh_interval_s: int = 21600
+    request_timeout_s: float = 20.0
+
+    _valid_search_limit = field_validator("search_limit")(_positive_int)
+    _valid_playlist_page_size = field_validator("playlist_page_size")(_positive_int)
+    _valid_login_timeout = field_validator("login_timeout_s")(_positive_int)
+    _valid_refresh_interval = field_validator("refresh_interval_s")(_positive_int)
+
+    @field_validator("request_timeout_s")
+    @classmethod
+    def _valid_request_timeout(cls, value: float) -> float:
+        return max(0.1, float(value))
+
+
 class SearchSettings(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -223,6 +247,7 @@ class Settings(BaseModel):
     client: ClientSettings = Field(default_factory=ClientSettings)
     audio_loudness: AudioLoudnessSettings = Field(default_factory=AudioLoudnessSettings)
     upstream: UpstreamSettings = Field(default_factory=UpstreamSettings)
+    qq_music: QQMusicSettings = Field(default_factory=QQMusicSettings)
 
     @property
     def app_name(self) -> str:
@@ -252,6 +277,7 @@ class Settings(BaseModel):
         return {
             "trending": {"limit": self.trending.limit},
             "client": self.client.model_dump(),
+            "qq_music": {"enabled": self.qq_music.enabled},
         }
 
 

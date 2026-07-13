@@ -9,7 +9,7 @@ import { CardDialog, ConfirmDialog, EmptyState, ScrollArea, useModalFocus } from
 import { RandomPlaylistOrderDialog } from "./RandomPlaylistOrderDialog";
 import { TrackList, type PlaylistMembership } from "./TrackList";
 
-type SearchSource = "all" | "bilibili" | "netease";
+type SearchSource = "all" | "bilibili" | "netease" | "qq";
 const searchCache = new Map<string, Track[]>();
 
 export function SearchOverlay({
@@ -19,6 +19,7 @@ export function SearchOverlay({
   playlistMap,
   playlists,
   historyLimit,
+  qqMusicEnabled,
   onClose,
   onChanged,
 }: {
@@ -28,6 +29,7 @@ export function SearchOverlay({
   playlistMap: Record<string, PlaylistMembership[]>;
   playlists: Playlist[];
   historyLimit: number;
+  qqMusicEnabled: boolean;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -143,7 +145,7 @@ export function SearchOverlay({
           </div>
           {error && <p className="actionError" role="alert">{error}</p>}
           <div className="sourceFilters" role="radiogroup" aria-label="搜索来源">
-            {([['all', '全部'], ['bilibili', 'B站'], ['netease', '网易云']] as const).map(([value, label]) => (
+            {([['all', '全部'], ['bilibili', 'B站'], ['netease', '网易云'], ...(qqMusicEnabled ? [['qq', 'QQ音乐'] as const] : [])] as const).map(([value, label]) => (
               <button key={value} role="radio" className={source === value ? "active" : ""} aria-checked={source === value} onClick={() => changeSource(value)}>{label}</button>
             ))}
           </div>
@@ -153,7 +155,7 @@ export function SearchOverlay({
             items={results.map((track) => ({
               track,
               meta: [
-                track.source === "bilibili" ? "B站" : track.source === "netease" ? "网易云" : track.source,
+                track.source === "bilibili" ? "B站" : track.source === "netease" ? "网易云" : track.source === "qq" ? "QQ音乐" : track.source,
                 track.artist || "未知歌手",
                 track.parts?.length ? `合集 · 可点 ${track.parts.length} P` : track.duration_ms ? formatTime(track.duration_ms) : null,
               ].filter(Boolean).join(" · "),
@@ -179,6 +181,7 @@ export function PlaylistsView({
   playlists,
   playlistMap,
   queuedKeys,
+  qqMusicEnabled,
   onChanged,
 }: {
   token: string;
@@ -186,6 +189,7 @@ export function PlaylistsView({
   playlists: Playlist[];
   playlistMap: Record<string, PlaylistMembership[]>;
   queuedKeys: Set<string>;
+  qqMusicEnabled: boolean;
   onChanged: () => void;
 }) {
   const [selected, setSelected] = useState<Playlist | null>(null);
@@ -196,8 +200,8 @@ export function PlaylistsView({
   const [renameName, setRenameName] = useState("");
   const [savingDialog, setSavingDialog] = useState<"create" | "rename" | null>(null);
   const [dialogError, setDialogError] = useState("");
-  const [neteaseUrl, setNeteaseUrl] = useState("");
-  const [neteaseName, setNeteaseName] = useState("");
+  const [playlistUrl, setPlaylistUrl] = useState("");
+  const [playlistName, setPlaylistName] = useState("");
   const [importMessage, setImportMessage] = useState("");
   const [importing, setImporting] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Playlist | null>(null);
@@ -246,19 +250,19 @@ export function PlaylistsView({
     }
   }
 
-  async function importNeteasePlaylist() {
-    const url = neteaseUrl.trim();
+  async function importPlaylist() {
+    const url = playlistUrl.trim();
     if (!url) return;
     setImporting(true);
     setImportMessage("");
     try {
-      const result = await api<{ playlist_name: string; added: number; skipped: number; total: number }>("/api/playlists/import-netease", {
+      const result = await api<{ playlist_name: string; added: number; skipped: number; total: number }>("/api/playlists/import", {
         method: "POST",
         token,
-        json: { url, name: neteaseName.trim() || undefined },
+        json: { url, name: playlistName.trim() || undefined },
       });
-      setNeteaseUrl("");
-      setNeteaseName("");
+      setPlaylistUrl("");
+      setPlaylistName("");
       setImportOpen(false);
       setImportMessage(`已导入「${result.playlist_name}」：${result.added} 首，跳过 ${result.skipped} 首。`);
       onChanged();
@@ -385,10 +389,10 @@ export function PlaylistsView({
         <h3>我的歌单</h3>
         <div className="toolbarActions">
           <button className="smallButton" onClick={() => { setDialogError(""); setCreateOpen(true); }}><Plus />新建歌单</button>
-          <button className="smallButton" onClick={() => setImportOpen(true)}><CloudDownload />导入网易云</button>
+          <button className="smallButton" onClick={() => { setImportMessage(""); setImportOpen(true); }}><CloudDownload />导入歌单</button>
         </div>
       </div>
-      {importMessage && <p className="hintText">{importMessage}</p>}
+      {!importOpen && importMessage && <p className="hintText">{importMessage}</p>}
       {!playlists.length && <EmptyState title="暂无歌单" meta="搜索后可将歌曲加入歌单。" />}
       {playlists.map((playlist) => (
         <article key={playlist.id} className="playlistRow">
@@ -448,19 +452,21 @@ export function PlaylistsView({
         </CardDialog>
       )}
       {importOpen && (
-        <CardDialog title="导入网易云歌单" onClose={() => setImportOpen(false)} busy={importing}>
+        <CardDialog title="导入歌单" onClose={() => setImportOpen(false)} busy={importing}>
           <form
             className="dialogForm"
             onSubmit={(event) => {
               event.preventDefault();
-              importNeteasePlaylist();
+              importPlaylist();
             }}
           >
-            <label className="fieldLabel"><span>网易云歌单链接或 ID</span><input value={neteaseUrl} onChange={(event) => setNeteaseUrl(event.target.value)} placeholder="粘贴链接或输入 ID" /></label>
-            <label className="fieldLabel"><span>导入后的歌单名（可留空）</span><input value={neteaseName} onChange={(event) => setNeteaseName(event.target.value)} placeholder="默认使用原歌单名" /></label>
+            <label className="fieldLabel"><span>歌单链接</span><input value={playlistUrl} onChange={(event) => setPlaylistUrl(event.target.value)} placeholder={qqMusicEnabled ? "粘贴网易云或 QQ 音乐歌单链接" : "粘贴网易云歌单链接"} /></label>
+            <p className="hintText">请粘贴包含歌单 ID 的完整详情链接，暂不支持需要跳转的分享短链。</p>
+            <label className="fieldLabel"><span>导入后的歌单名（可留空）</span><input value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="默认使用原歌单名" /></label>
+            {importMessage && <p className="actionError" role="alert">{importMessage}</p>}
             <div className="dialogActions">
               <button type="button" className="glassButton" onClick={() => setImportOpen(false)} disabled={importing}>取消</button>
-              <button className="primaryButton" disabled={importing || !neteaseUrl.trim()}>
+              <button className="primaryButton" disabled={importing || !playlistUrl.trim()}>
                 <CloudDownload />{importing ? "导入中" : "导入"}
               </button>
             </div>

@@ -15,6 +15,9 @@ export interface AppConfig {
     enabled: boolean;
     ffmpeg_available: boolean;
   };
+  qq_music: {
+    enabled: boolean;
+  };
 }
 
 export const BASE_PATH = (() => {
@@ -81,6 +84,9 @@ export const defaultConfig: AppConfig = {
     enabled: false,
     ffmpeg_available: false,
   },
+  qq_music: {
+    enabled: false,
+  },
 };
 
 export function mergeConfig(config?: PublicConfig): AppConfig {
@@ -95,6 +101,10 @@ export function mergeConfig(config?: PublicConfig): AppConfig {
     audio_loudness: {
       ...defaultConfig.audio_loudness,
       ...(config?.audio_loudness || {}),
+    },
+    qq_music: {
+      ...defaultConfig.qq_music,
+      ...(config?.qq_music || {}),
     },
   };
 }

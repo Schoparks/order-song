@@ -18,6 +18,7 @@ from app.routers.playback_audio import (
     _is_bilibili_browser_direct_url,
     _resolve_bilibili_audio,
     _resolve_netease_audio,
+    _resolve_qq_audio,
 )
 from app.schemas import PlaybackControlIn, PlaybackStateOut, TrackOut
 from app.ws import hub
@@ -288,13 +289,16 @@ async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
         if track.source == TrackSource.netease and _direct_playback_audio_url(track) != track.audio_url:
             await _resolve_audio_url(db, track, force=True)
             return
+        if track.source == TrackSource.qq and _direct_playback_audio_url(track) != track.audio_url:
+            await _resolve_audio_url(db, track, force=True)
+            return
         if track.source == TrackSource.netease and _track_needs_backend_loudness(track):
             _schedule_loudness_analysis(track.id, track.source, track.audio_url, force=True)
             return
         if track.id:
             _AUDIO_URL_RESOLVE_ERRORS.pop(track.id, None)
         return
-    if track.source in (TrackSource.netease, TrackSource.bilibili):
+    if track.source in (TrackSource.netease, TrackSource.bilibili, TrackSource.qq):
         if track.source == TrackSource.bilibili and track.id:
             last_error_at = _AUDIO_URL_RESOLVE_ERRORS.get(track.id)
             if last_error_at and time.monotonic() - last_error_at < _AUDIO_URL_ERROR_RETRY_SECONDS:
@@ -337,6 +341,16 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
             _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url or track.audio_url, force=force)
         return track.audio_url
 
+    if track.source == TrackSource.qq:
+        track_id = track.id
+        source_track_id = track.source_track_id
+        db.rollback()
+        result = await _resolve_qq_audio(source_track_id, force=force)
+        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
+        db.expire_all()
+        db.refresh(track)
+        return track.audio_url
+
     if track.source == TrackSource.bilibili:
         if video is None:
             video = await _ensure_bilibili_metadata(db, track)
@@ -365,7 +379,13 @@ def _persist_audio_resolution_transaction(
         track = write_db.get(Track, track_id)
         if not track:
             return
-        if track.source == TrackSource.netease:
+        if track.source in (TrackSource.netease, TrackSource.qq):
+            if track.source == TrackSource.qq:
+                if force or result.audio_url:
+                    track.audio_url = result.audio_url
+                    write_db.add(track)
+                    write_db.commit()
+                return
             track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
             _clear_untrusted_loudness_metadata(track)
             write_db.add(track)

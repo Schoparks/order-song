@@ -9,3 +9,5 @@ python-multipart>=0.0.9
 # optional helpers
 httpx>=0.27.0
 yt-dlp>=2025.1.0
+qqmusic-api-python>=0.6.8,<0.7
+Pillow>=10.0
