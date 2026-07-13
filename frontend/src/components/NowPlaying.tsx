@@ -1,40 +1,111 @@
 import { ChevronDown, Gauge, Music2, Pause, Play, SkipForward, Volume2, VolumeX, X } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
+import type { ChangeEvent, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { createPortal } from "react-dom";
 import { useAudioController } from "../hooks/useAudioController";
+import { createProgressSeekCoordinator, type ProgressSeekCoordinator } from "../hooks/progressSeek";
 import { useAnchoredPopover } from "../hooks/useRoomChrome";
 import { useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import { TrackCover, trackCoverSrc, useModalFocus } from "./common";
 
 type AudioController = ReturnType<typeof useAudioController>;
+const PROGRESS_KEY_CONTROLS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+
+function progressRatio(input: HTMLInputElement): number {
+  return Number(input.value) / 1000;
+}
+
+function useProgressSeek(audio: AudioController) {
+  const audioRef = useRef(audio);
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const coordinatorRef = useRef<ProgressSeekCoordinator | null>(null);
+  audioRef.current = audio;
+
+  useEffect(() => {
+    const coordinator = createProgressSeekCoordinator({
+      schedule: (callback) => {
+        const frame = window.requestAnimationFrame(callback);
+        return () => window.cancelAnimationFrame(frame);
+      },
+      onSeekingChange: (seeking) => audioRef.current.setIsSeeking(seeking),
+      onPreview: (ratio) => audioRef.current.setPositionMs(ratio * audioRef.current.durationMs),
+      onCommit: (ratio) => { void audioRef.current.commitSeek(ratio); },
+    });
+    coordinatorRef.current = coordinator;
+
+    const finishFromInput = () => {
+      const input = inputRef.current;
+      coordinator.finish(input ? progressRatio(input) : undefined);
+    };
+    const cancel = () => coordinator.cancel();
+    window.addEventListener("pointerup", finishFromInput);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("blur", finishFromInput);
+    return () => {
+      window.removeEventListener("pointerup", finishFromInput);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("blur", finishFromInput);
+      if (coordinatorRef.current === coordinator) coordinatorRef.current = null;
+      coordinator.dispose();
+    };
+  }, []);
+
+  const begin = (event: ReactPointerEvent<HTMLInputElement>) => {
+    const coordinator = coordinatorRef.current;
+    if (!coordinator) return;
+    coordinator.begin(progressRatio(event.currentTarget));
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // The window-level release listener remains the fallback.
+    }
+  };
+  const preview = (event: ChangeEvent<HTMLInputElement>) => {
+    const coordinator = coordinatorRef.current;
+    if (!coordinator) return;
+    const ratio = progressRatio(event.currentTarget);
+    const standaloneChange = !coordinator.isSeeking();
+    if (standaloneChange) coordinator.begin(ratio);
+    coordinator.preview(ratio);
+    if (standaloneChange) coordinator.finish();
+  };
+  const finish = (input: HTMLInputElement) => coordinatorRef.current?.finish(progressRatio(input));
+  const cancel = () => coordinatorRef.current?.cancel();
+  const onKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (PROGRESS_KEY_CONTROLS.has(event.key) && !coordinatorRef.current?.isSeeking()) {
+      coordinatorRef.current?.begin(progressRatio(event.currentTarget));
+    }
+  };
+  const onKeyUp = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (PROGRESS_KEY_CONTROLS.has(event.key)) finish(event.currentTarget);
+  };
+
+  return { inputRef, begin, preview, finish, cancel, onKeyDown, onKeyUp };
+}
 
 function Progress({ audio, compact = false }: { audio: AudioController; compact?: boolean }) {
+  const seek = useProgressSeek(audio);
   if (compact) {
     return <div className="npProgressCompact" role="progressbar" aria-label="播放进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(audio.progressRatio * 100)}><span style={{ width: `${audio.progressRatio * 100}%` }} /></div>;
   }
   return (
     <div className="npProgress">
       <input
+        ref={seek.inputRef}
         type="range"
         aria-label="播放进度"
         aria-valuetext={`${audio.currentTimeLabel} / ${audio.durationLabel}`}
         min={0}
         max={1000}
         value={Math.round(audio.progressRatio * 1000)}
-        onPointerDown={() => audio.setIsSeeking(true)}
-        onChange={(event) => {
-          const ratio = Number(event.target.value) / 1000;
-          audio.setIsSeeking(true);
-          audio.setPositionMs(ratio * audio.durationMs);
-        }}
-        onPointerUp={(event) => audio.commitSeek(Number((event.target as HTMLInputElement).value) / 1000)}
-        onPointerCancel={() => audio.setIsSeeking(false)}
-        onBlur={(event) => audio.isSeeking && void audio.commitSeek(Number(event.currentTarget.value) / 1000)}
-        onKeyUp={(event) => {
-          if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) {
-            void audio.commitSeek(Number(event.currentTarget.value) / 1000);
-          }
-        }}
+        onPointerDown={seek.begin}
+        onChange={seek.preview}
+        onPointerUp={(event) => seek.finish(event.currentTarget)}
+        onPointerCancel={seek.cancel}
+        onLostPointerCapture={(event) => seek.finish(event.currentTarget)}
+        onBlur={(event) => seek.finish(event.currentTarget)}
+        onKeyDown={seek.onKeyDown}
+        onKeyUp={seek.onKeyUp}
       />
       <span>{audio.currentTimeLabel} / {audio.durationLabel}</span>
     </div>

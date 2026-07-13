@@ -573,10 +573,10 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, [audio, clearPlayRetry, getRoomPositionMs, playEnabled, playback, roomId, token, unlockAudio]);
 
   const commitSeek = useCallback(async (ratio: number) => {
+    setIsSeeking(false);
     if (!roomId || !token) return;
     const duration = getDurationMs();
     const desired = Math.floor(clamp(ratio, 0, 1) * duration);
-    setIsSeeking(false);
     if (playEnabled) seekAudioTo(desired / 1000);
     setPositionMs(desired);
     await api(`/api/rooms/${roomId}/controls/position`, {
