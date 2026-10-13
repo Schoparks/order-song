@@ -6,11 +6,11 @@ import { formatTime } from "../lib/time";
 import { useDialogViewportLock } from "../hooks/useStableViewportHeight";
 import type { Playlist, PlaylistItem, Track } from "../types";
 import { CardDialog, ConfirmDialog, EmptyState, ScrollArea, useModalFocus } from "./common";
+import { UnavailableTracksDialog, type BatchOrderResult } from "./TrackAvailability";
 import { RandomPlaylistOrderDialog } from "./RandomPlaylistOrderDialog";
 import { TrackList, type PlaylistMembership } from "./TrackList";
 
 type SearchSource = "all" | "bilibili" | "netease" | "qq";
-const searchCache = new Map<string, Track[]>();
 
 export function SearchOverlay({
   token,
@@ -80,13 +80,7 @@ export function SearchOverlay({
     const request = { id: (searchRequestRef.current?.id || 0) + 1, controller: new AbortController() };
     searchRequestRef.current = request;
     try {
-      const cacheKey = `${token}:${q.toLocaleLowerCase()}:${nextSource}`;
-      const cached = searchCache.get(cacheKey);
-      const nextResults = cached || await api<Track[]>(`/api/search?q=${encodeURIComponent(q)}&source=${nextSource}`, { token, signal: request.controller.signal });
-      if (!cached) {
-        searchCache.set(cacheKey, nextResults);
-        if (searchCache.size > 60) searchCache.delete(searchCache.keys().next().value as string);
-      }
+      const nextResults = await api<Track[]>(`/api/search?q=${encodeURIComponent(q)}&source=${nextSource}`, { token, signal: request.controller.signal });
       if (searchRequestRef.current?.id === request.id) setResults(nextResults);
     } catch (err) {
       if (!(err instanceof Error && err.name === "AbortError") && searchRequestRef.current?.id === request.id) {
@@ -217,6 +211,7 @@ export function PlaylistsView({
   const [randomOrderTarget, setRandomOrderTarget] = useState<{ playlist: Playlist; itemCount: number } | null>(null);
   const [randomOrdering, setRandomOrdering] = useState(false);
   const [randomOrderError, setRandomOrderError] = useState("");
+  const [batchResult, setBatchResult] = useState<BatchOrderResult | null>(null);
   const itemsQuery = useQuery({
     queryKey: ["playlist-items", selected?.id, token],
     queryFn: () => api<PlaylistItem[]>(`/api/playlists/${selected?.id}/items`, { token }),
@@ -304,12 +299,13 @@ export function PlaylistsView({
     setRandomOrdering(true);
     setRandomOrderError("");
     try {
-      await api(`/api/rooms/${roomId}/queue/playlist`, {
+      const result = await api<BatchOrderResult>(`/api/rooms/${roomId}/queue/playlist`, {
         method: "POST",
         token,
         json: { playlist_id: randomOrderTarget.playlist.id, count },
       });
       setRandomOrderTarget(null);
+      if (result.skipped_unavailable?.length) setBatchResult(result);
       onChanged();
     } catch (err) {
       setRandomOrderError(err instanceof Error ? err.message : "随机点歌失败");
@@ -317,6 +313,8 @@ export function PlaylistsView({
       setRandomOrdering(false);
     }
   }
+
+  const unavailableDialog = batchResult?.skipped_unavailable?.length ? <UnavailableTracksDialog tracks={batchResult.skipped_unavailable} added={batchResult.added} onClose={() => setBatchResult(null)} /> : null;
 
   const randomOrderDialog = randomOrderTarget ? (
     <RandomPlaylistOrderDialog
@@ -387,6 +385,7 @@ export function PlaylistsView({
           </CardDialog>
         )}
         {randomOrderDialog}
+        {unavailableDialog}
       </div>
     );
   }
@@ -431,6 +430,7 @@ export function PlaylistsView({
         </article>
       ))}
       {randomOrderDialog}
+      {unavailableDialog}
       {deleteTarget && (
         <ConfirmDialog
           title="删除歌单"

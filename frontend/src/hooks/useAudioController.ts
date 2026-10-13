@@ -10,6 +10,8 @@ import {
   usesBackendLoudness,
 } from "./loudnessPolicy";
 import { useDynamicAudioNormalizer } from "./useDynamicAudioNormalizer";
+import { usePlaybackRecovery } from "./usePlaybackRecovery";
+import { useDirectAudioUrl } from "./useDirectAudioUrl";
 import type { PlaybackEnvelope, PlaybackState, QueueItem, Track } from "../types";
 
 const SEEK_TOLERANCE_MS = 3000;
@@ -51,7 +53,7 @@ function metadataGainFromTrack(track: Track | null): number | null {
   return clamp(10 ** (gainDb / 20), METADATA_MIN_GAIN, METADATA_MAX_GAIN);
 }
 
-export function useAudioController(roomId: number | null, token: string | null, fallbackQueue: QueueItem[] = [], backendLoudnessAvailable = false) {
+export function useAudioController(roomId: number | null, token: string | null, fallbackQueue: QueueItem[] = [], backendLoudnessAvailable = false, onAvailabilityChanged?: () => void) {
   const audio = useMemo(() => {
     const element = new Audio();
     element.preload = "none";
@@ -71,6 +73,9 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const [loudnessWaiting, setLoudnessWaiting] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
   const hasTrack = track != null;
+  const unavailable = track?.availability === "unavailable";
+  const unavailableRef = useRef(unavailable);
+  unavailableRef.current = unavailable;
 
   const volumeRef = useRef(volume);
   const anchorRef = useRef<SyncAnchor | null>(null);
@@ -104,14 +109,15 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, [audio, track]);
 
   const getRoomPositionMs = useCallback(() => {
+    if (unavailable) return Math.max(0, Number(playback?.position_ms || 0));
     const duration = getDurationMs();
     const raw = roomPositionFromState(playback, anchorRef.current);
     return duration > 0 ? clamp(raw, 0, duration) : raw;
-  }, [getDurationMs, playback]);
+  }, [getDurationMs, playback, unavailable]);
 
   const normalizerAudioUrl = useMemo(
     () => (track ? playableAudioUrl(track) : null),
-    [track?.audio_url, track?.id, track?.source, track?.source_track_id],
+    [track?.audio_url, track?.id, track?.source, track?.source_track_id, track?.availability],
   );
 
   const applyOutputVolume = useCallback((enabled = normalizerEnabled, nextVolume = volume, sourceUrl = normalizerAudioUrl) => {
@@ -164,7 +170,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
   }, []);
 
   const blockAudioForLoudnessWait = useCallback(() => {
-    return applyLoudnessWaitBlock(loudnessWaitingRef.current, {
+    return applyLoudnessWaitBlock(loudnessWaitingRef.current || unavailableRef.current, {
       clearPlayRetry,
       clearStreamRetry,
       pause: () => audio.pause(),
@@ -192,6 +198,15 @@ export function useAudioController(roomId: number | null, token: string | null, 
     lastAudioProgressAtRef.current = Date.now();
     lastAudioTimeRef.current = 0;
   }, [audio, cleanupAudioGraph, clearPlayRetry, clearStreamRetry]);
+
+  const refreshDirectAudioUrl = useDirectAudioUrl({
+    roomId, track, token, enabled: playEnabled, waiting: loudnessWaiting,
+    setTrack, setAudioError, onAvailabilityChanged,
+    stopLocalAudio: () => {
+      unavailableRef.current = true;
+      stopLocalAudio();
+    },
+  });
 
   const seekAudioTo = useCallback((seconds: number) => {
     if (blockAudioForLoudnessWait()) return;
@@ -258,7 +273,9 @@ export function useAudioController(roomId: number | null, token: string | null, 
       // Reload is best-effort; play retries below will handle the recoverable cases.
     }
     requestAudioPlay(retries);
-  }, [audio, blockAudioForLoudnessWait, clearStreamRetry, getRoomPositionMs, playEnabled, requestAudioPlay]);
+    // Only the server resolver may confirm a track as unavailable.
+    void refreshDirectAudioUrl(true).catch(() => {});
+  }, [audio, blockAudioForLoudnessWait, clearStreamRetry, getRoomPositionMs, playEnabled, refreshDirectAudioUrl, requestAudioPlay]);
 
   const unlockAudio = useCallback((force = false) => {
     if (!force && !playEnabled) return;
@@ -310,6 +327,10 @@ export function useAudioController(roomId: number | null, token: string | null, 
   const syncAudioToRoom = useCallback((force = false, shouldPlay = playEnabled) => {
     const audioUrl = normalizerAudioUrl;
     const localPlaybackEnabled = playEnabled || shouldPlay;
+    if (unavailable) {
+      stopLocalAudio();
+      return;
+    }
     if (blockAudioForLoudnessWait()) return;
     const allowLocalPlay = localPlaybackEnabled && shouldPlay;
     if (!localPlaybackEnabled) {
@@ -362,7 +383,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       clearPlayRetry();
       audio.pause();
     }
-  }, [applyOutputVolume, audio, blockAudioForLoudnessWait, clearPlayRetry, clearStreamRetry, getDurationMs, loudnessWaiting, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, stopLocalAudio, track]);
+  }, [applyOutputVolume, audio, blockAudioForLoudnessWait, clearPlayRetry, clearStreamRetry, getDurationMs, loudnessWaiting, normalizerAudioUrl, normalizerEnabled, playEnabled, playback, requestAudioPlay, seekAudioTo, stopLocalAudio, track, unavailable]);
 
   syncAudioToRoomRef.current = syncAudioToRoom;
 
@@ -401,68 +422,13 @@ export function useAudioController(roomId: number | null, token: string | null, 
     };
   }, [backendLoudnessAvailable, normalizerEnabled, playEnabled, roomId, token]);
 
-  const refreshDirectAudioUrl = useCallback(async (force = false) => {
-    if (!playEnabled || !token || !track?.id) return null;
-    const query = force ? "?force=true" : "";
-    let result: {
-        track_id: number;
-        audio_url?: string | null;
-        loudness_gain_db?: number | null;
-        loudness_peak?: number | null;
-        loudness_source?: string | null;
-        loudness_error?: string | null;
-      };
-    try {
-      result = await api(`/api/tracks/${track.id}/audio-url${query}`, { token });
-    } catch (error) {
-      if (track.source === "qq") setAudioError("QQ 音乐播放地址刷新失败，请稍后重试");
-      throw error;
-    }
-    const nextUrl = result.audio_url || null;
-    const hasAudioUpdate = Object.prototype.hasOwnProperty.call(result, "audio_url");
-    const hasLoudnessUpdate = Object.prototype.hasOwnProperty.call(result, "loudness_gain_db")
-      || Object.prototype.hasOwnProperty.call(result, "loudness_peak")
-      || Object.prototype.hasOwnProperty.call(result, "loudness_source")
-      || Object.prototype.hasOwnProperty.call(result, "loudness_error");
-    if (hasAudioUpdate || hasLoudnessUpdate) {
-      setTrack((previous) => (
-        previous && previous.id === track.id
-          ? {
-              ...previous,
-              audio_url: hasAudioUpdate ? nextUrl : previous.audio_url,
-              loudness_gain_db: hasLoudnessUpdate ? (result.loudness_gain_db ?? null) : previous.loudness_gain_db,
-              loudness_peak: hasLoudnessUpdate ? (result.loudness_peak ?? null) : previous.loudness_peak,
-              loudness_source: hasLoudnessUpdate ? (result.loudness_source ?? null) : previous.loudness_source,
-              loudness_error: hasLoudnessUpdate ? (result.loudness_error ?? null) : previous.loudness_error,
-            }
-          : previous
-      ));
-    }
-    if (track.source === "qq") {
-      if (nextUrl) {
-        setAudioError(null);
-      } else if (hasAudioUpdate) {
-        if (blockAudioForLoudnessWait()) return nextUrl;
-        clearStreamRetry();
-        audio.pause();
-        audio.removeAttribute("src");
-        try {
-          audio.load();
-        } catch {
-          // Removing src is enough to stop retrying the expired QQ URL.
-        }
-        setAudioError("QQ 音乐当前歌曲暂无可用的完整播放地址");
-      }
-    }
-    return nextUrl;
-  }, [audio, blockAudioForLoudnessWait, clearStreamRetry, playEnabled, token, track?.id, track?.source]);
 
   const fallbackNextQueueItem = useCallback((currentQueueItemId: number | null) => {
     const queue = fallbackQueueRef.current;
     if (!queue.length) return null;
     const startIndex = currentQueueItemId == null ? -1 : queue.findIndex((item) => item.id === currentQueueItemId);
     const candidates = startIndex >= 0 ? queue.slice(startIndex + 1) : queue;
-    return candidates.find((item) => item.status === "queued") || null;
+    return candidates.find((item) => item.status === "queued" && item.track.availability !== "unavailable") || null;
   }, []);
 
   const applyLocalQueueItem = useCallback((item: QueueItem) => {
@@ -604,8 +570,8 @@ export function useAudioController(roomId: number | null, token: string | null, 
       refreshedAudioTrackRef.current = null;
       return;
     }
-    if (!track?.id || !token) return;
-    const key = `${playback?.current_queue_item_id ?? "none"}:${track.id}:${track.source}:${track.source_track_id}`;
+    if (!track?.id || !token || unavailable || loudnessWaiting) return;
+    const key = `${roomId}:${playback?.current_queue_item_id ?? "none"}:${track.id}:${track.source}:${track.source_track_id}`;
     if (refreshedAudioTrackRef.current === key) return;
     const needsUrl = !playableAudioUrl(track);
     if (!needsUrl) return;
@@ -613,7 +579,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
     refreshDirectAudioUrl().catch(() => {
       refreshedAudioTrackRef.current = null;
     });
-  }, [playEnabled, playback?.current_queue_item_id, refreshDirectAudioUrl, token, track?.audio_url, track?.id, track?.source, track?.source_track_id]);
+  }, [loudnessWaiting, playEnabled, playback?.current_queue_item_id, refreshDirectAudioUrl, roomId, token, track?.audio_url, track?.id, track?.source, track?.source_track_id, unavailable]);
 
   useEffect(() => {
     const onCanPlay = () => {
@@ -641,22 +607,15 @@ export function useAudioController(roomId: number | null, token: string | null, 
     };
   }, [loudnessWaiting, playback?.is_playing, playEnabled, requestAudioPlay, unlockAudio]);
 
-  useEffect(() => {
-    const recoverPlayback = () => {
-      if (!playEnabled || !playback?.is_playing || !hasTrack || loudnessWaiting) return;
-      syncAudioToRoomRef.current(true, true);
-      reloadCurrentStream(2, true);
-    };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") recoverPlayback();
-    };
-    window.addEventListener("online", recoverPlayback);
-    document.addEventListener("visibilitychange", onVisibilityChange);
-    return () => {
-      window.removeEventListener("online", recoverPlayback);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
-    };
-  }, [hasTrack, loudnessWaiting, playback?.is_playing, playEnabled, reloadCurrentStream]);
+  usePlaybackRecovery({
+    audio,
+    enabled: playEnabled && Boolean(playback?.is_playing) && hasTrack && !loudnessWaiting && !unavailable,
+    lastAudioProgressAtRef,
+    lastAudioTimeRef,
+    syncAudioToRoomRef,
+    reloadCurrentStream,
+    stalledAfterMs: STALLED_AUDIO_RELOAD_MS,
+  });
 
   useEffect(() => () => {
     stopLocalAudio();
@@ -665,7 +624,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
 
   useEffect(() => {
     const onEnded = () => {
-      if (!playback?.is_playing) return;
+      if (!playback?.is_playing || unavailable) return;
       const duration = getDurationMs();
       const roomPosition = getRoomPositionMs();
       if (
@@ -705,16 +664,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       streamRetryCountRef.current += 1;
       clearStreamRetry();
       streamRetryTimerRef.current = window.setTimeout(() => {
-        refreshDirectAudioUrl(true)
-          .then((nextUrl) => {
-            if (blockAudioForLoudnessWait()) return;
-            if (nextUrl) {
-              const nextSrc = withBase(nextUrl);
-              audio.src = nextSrc;
-            }
-          })
-          .catch(() => {})
-          .finally(() => reloadCurrentStream(1, true));
+        reloadCurrentStream(1, true);
       }, 450);
     };
     audio.addEventListener("ended", onEnded);
@@ -729,11 +679,11 @@ export function useAudioController(roomId: number | null, token: string | null, 
       audio.removeEventListener("timeupdate", onTime);
       audio.removeEventListener("error", onError);
     };
-  }, [applyPendingSeek, audio, blockAudioForLoudnessWait, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, loudnessWaiting, next, playback?.is_playing, playEnabled, refreshDirectAudioUrl, reloadCurrentStream, track]);
+  }, [applyPendingSeek, audio, blockAudioForLoudnessWait, clearStreamRetry, getDurationMs, getRoomPositionMs, isSeeking, loudnessWaiting, next, playback?.is_playing, playEnabled, refreshDirectAudioUrl, reloadCurrentStream, track, unavailable]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      if (playEnabled && playback?.is_playing && hasTrack && audio.src && !loudnessWaiting) {
+      if (playEnabled && playback?.is_playing && hasTrack && audio.src && !loudnessWaiting && !unavailable) {
         const now = Date.now();
         const currentSeconds = audio.currentTime || 0;
         const moving = !audio.paused && !audio.ended && Math.abs(currentSeconds - lastAudioTimeRef.current) > 0.05;
@@ -748,7 +698,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
       setDurationMs(getDurationMs());
     }, 250);
     return () => window.clearInterval(timer);
-  }, [audio, getDurationMs, getRoomPositionMs, hasTrack, isSeeking, loudnessWaiting, playEnabled, playback?.is_playing, reloadCurrentStream]);
+  }, [audio, getDurationMs, getRoomPositionMs, hasTrack, isSeeking, loudnessWaiting, playEnabled, playback?.is_playing, reloadCurrentStream, unavailable]);
 
   const effectiveNormalizerState: NormalizerState = loudnessWaiting && normalizerEnabled ? "pending" : normalizerState;
 
@@ -760,7 +710,7 @@ export function useAudioController(roomId: number | null, token: string | null, 
     playEnabled,
     normalizerEnabled,
     loudnessWaiting,
-    audioError,
+    audioError: unavailable ? (track?.unavailable_reason || "歌曲已失效，请重新搜索替换或移出所有歌单") : audioError,
     normalizerState: effectiveNormalizerState,
     volume,
     positionMs,

@@ -46,6 +46,7 @@ from app.routers.playback_core import (
     _track_has_loudness,
 )
 from app.schemas import PlaybackControlIn, VolumeControlIn
+from app.track_availability import availability_fields, check_inputs, require_available
 from app.ws import hub
 
 
@@ -188,6 +189,7 @@ def _enqueue_track_payload(
         cover_url=track_input.cover_url,
     )
 
+    require_available(track)
     existing = _get_existing_queue_item(db, room_id, track.id)
     if existing and existing.status in (QueueStatus.playing, QueueStatus.queued):
         return existing, False
@@ -378,6 +380,7 @@ async def get_track_audio_url(
     has_loudness = _track_has_loudness(tr)
     return {
         "track_id": track_id,
+        **availability_fields(tr),
         "audio_url": _direct_playback_audio_url(tr),
         "loudness_gain_db": tr.loudness_gain_db if has_loudness else None,
         "loudness_peak": tr.loudness_peak if has_loudness else None,
@@ -451,6 +454,9 @@ async def add_to_queue(room_id: int, payload: dict, db: Session = Depends(get_db
     await _require_active_room_member(db, room_id, user)
     track_input = _validate_queue_track_payload(payload)
     db.rollback()
+    _, unavailable = await check_inputs([track_input])
+    if unavailable:
+        raise HTTPException(status_code=409, detail={"code": "track_unavailable", "message": "该歌曲已失效", "track": unavailable[0]})
 
     async with _playback_lock(room_id):
         queue_item_ids, added_count, _, first_queue_item_id = await asyncio.to_thread(
@@ -487,6 +493,7 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
         random.shuffle(items)
 
     db.rollback()
+    items, unavailable = await check_inputs(items[:requested_count] if requested_count is not None else items)
 
     async with _playback_lock(room_id):
         queue_item_ids, added_count, skipped_count, _ = await asyncio.to_thread(
@@ -509,7 +516,8 @@ async def add_to_queue_batch(room_id: int, payload: dict, db: Session = Depends(
     return {
         "ok": True,
         "added": added_count,
-        "skipped": skipped_count,
+        "skipped": skipped_count + len(unavailable),
+        "skipped_unavailable": unavailable,
         "queue_item_ids": queue_item_ids,
     }
 
@@ -549,6 +557,7 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
         for _, tr in rows
     ]
     db.rollback()
+    track_inputs, unavailable = await check_inputs(track_inputs[:requested_count] if requested_count is not None else track_inputs)
 
     async with _playback_lock(room_id):
         queue_item_ids, added_count, skipped_count, _ = await asyncio.to_thread(
@@ -571,7 +580,8 @@ async def add_playlist_to_queue(room_id: int, payload: dict, db: Session = Depen
     return {
         "ok": True,
         "added": added_count,
-        "skipped": skipped_count,
+        "skipped": skipped_count + len(unavailable),
+        "skipped_unavailable": unavailable,
         "queue_item_ids": queue_item_ids,
     }
 

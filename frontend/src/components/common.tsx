@@ -103,12 +103,14 @@ export function CardDialog({
   onClose,
   busy = false,
   dismissible = true,
+  className = "",
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   busy?: boolean;
   dismissible?: boolean;
+  className?: string;
 }) {
   useDialogViewportLock();
   const titleId = useId();
@@ -124,7 +126,7 @@ export function CardDialog({
     <div className="dialogOverlay" onMouseDown={(event) => event.target === event.currentTarget && closeDialog()}>
       <section
         ref={dialogRef}
-        className="dialogCard glassPanel"
+        className={`dialogCard glassPanel ${className}`}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}

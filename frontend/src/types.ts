@@ -41,6 +41,9 @@ export interface Track {
   duration_ms?: number | null;
   cover_url?: string | null;
   audio_url?: string | null;
+  availability?: "unknown" | "available" | "unavailable";
+  unavailable_reason?: string | null;
+  availability_checked_at?: string | null;
   loudness_gain_db?: number | null;
   loudness_peak?: number | null;
   loudness_source?: string | null;

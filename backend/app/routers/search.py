@@ -11,6 +11,7 @@ from app.bilibili import make_bilibili_source_track_id, normalize_bilibili_pic
 from app.core.config import settings
 from app.deps import get_current_user
 from app.models import TrackSource, User
+from app.track_availability import annotate_search_results
 from app.qq_music import QQMusicUnavailable, qq_music
 from app.schemas import SearchTrackOut, SearchTrackPartOut
 
@@ -368,11 +369,11 @@ async def search(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"{source} 搜索暂时不可用") from exc
-        return _rank_results(q, items)
+        return await asyncio.to_thread(annotate_search_results, _rank_results(q, items))
 
     gathered = await asyncio.gather(*(runner(q) for runner in runners.values()), return_exceptions=True)
     items: list[SearchTrackOut] = []
     for result in gathered:
         if not isinstance(result, Exception):
             items.extend(result)
-    return _rank_results(q, items)
+    return await asyncio.to_thread(annotate_search_results, _rank_results(q, items))

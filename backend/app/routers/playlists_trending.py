@@ -16,6 +16,7 @@ from app.deps import get_current_user, get_db
 from app.models import Track, TrackOrderStats, TrackSource, User, UserPlaylist, UserPlaylistItem
 from app.qq_music import QQMusicUnavailable, qq_music
 from app.routers.queue_playback import _ensure_bilibili_metadata, _get_or_create_track
+from app.track_availability import availability_fields, require_available
 
 
 router = APIRouter(prefix="/api", tags=["playlists", "trending"])
@@ -102,6 +103,7 @@ def _add_track_payload_to_playlist(
         duration_ms=payload.get("duration_ms"),
         cover_url=payload.get("cover_url"),
     )
+    require_available(tr)
     existing = db.exec(
         select(UserPlaylistItem).where(
             UserPlaylistItem.playlist_id == playlist_id,
@@ -221,6 +223,9 @@ def _import_tracks_transaction(
                     duration_ms=payload["duration_ms"],
                     cover_url=payload["cover_url"],
                 )
+                if track.availability == "unavailable":
+                    skipped += 1
+                    continue
                 existing = write_db.exec(
                     select(UserPlaylistItem).where(
                         UserPlaylistItem.playlist_id == playlist.id,
@@ -326,6 +331,7 @@ def playlist_items(playlist_id: int, db: Session = Depends(get_db), user: User =
             "created_at": it.created_at,
             "track": {
                 "id": tr.id,
+                **availability_fields(tr),
                 "source": tr.source,
                 "source_track_id": tr.source_track_id,
                 "title": tr.title,
@@ -364,6 +370,9 @@ def delete_playlist_item(playlist_id: int, item_id: int, db: Session = Depends(g
     it = db.get(UserPlaylistItem, item_id)
     if not it or it.playlist_id != playlist_id:
         raise HTTPException(status_code=404, detail="item not found")
+    track = db.get(Track, it.track_id)
+    if track:
+        require_available(track)
     db.delete(it)
     db.commit()
     return {"ok": True}
@@ -378,6 +387,9 @@ def move_playlist_item(playlist_id: int, item_id: int, payload: dict, db: Sessio
     it = db.get(UserPlaylistItem, item_id)
     if not it or it.playlist_id != playlist_id:
         raise HTTPException(status_code=404, detail="item not found")
+    track = db.get(Track, it.track_id)
+    if track:
+        require_available(track)
     target_id = payload.get("target_playlist_id")
     if not target_id:
         raise HTTPException(status_code=400, detail="target_playlist_id required")
@@ -628,6 +640,7 @@ def trending(limit: int | None = None, db: Session = Depends(get_db), user: User
         {
             "track": {
                 "id": tr.id,
+                **availability_fields(tr),
                 "source": tr.source,
                 "source_track_id": tr.source_track_id,
                 "title": tr.title,

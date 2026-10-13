@@ -1,6 +1,7 @@
 import type { Track } from "../types";
 
 export function playableAudioUrl(track: Track): string | null {
+  if (track.availability === "unavailable") return null;
   if (track.audio_url) return track.audio_url;
   if (track.source === "netease" && track.source_track_id) {
     return `https://music.163.com/song/media/outer/url?id=${encodeURIComponent(track.source_track_id)}.mp3`;

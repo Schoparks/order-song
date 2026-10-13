@@ -1,0 +1,21 @@
+.songInfo .unavailableLabel { color: var(--danger); white-space: normal; overflow-wrap: anywhere; }
+.songRowUnavailable { background: color-mix(in srgb, var(--danger) 5%, transparent); }
+.songRowUnavailable .rowActions { flex-wrap: wrap; }
+.unavailableTrackList { max-height: 360px; overflow: auto; }
+.replacementDialog { width: min(900px, 100%); display: flex; flex-direction: column; overflow: hidden; }
+.replacementDialog > .sheetHeader, .replacementDialog > form, .replacementFooter { flex-shrink: 0; }
+.replacementDialog > .dialogMessage { overflow-wrap: anywhere; flex-shrink: 0; }
+.replacementSources { flex-shrink: 0; width: 100%; margin: 12px 0; }
+.replacementSources button { min-width: 0; flex: 1; }
+.replacementResults { min-height: 120px; height: 340px; flex: 1 1 340px; }
+.replacementFooter .hintText { overflow-wrap: anywhere; }
+.replacementRow > .smallButton { min-height: 44px; }
+@media (max-width: 620px) {
+  .songRowUnavailable { grid-template-columns: 44px minmax(0, 1fr); }
+  .songRowUnavailable .rowActions { grid-column: 1 / -1; justify-content: flex-end; }
+  .songRowUnavailable .rowActions .smallButton { width: auto; min-width: 44px; min-height: 44px; padding: 8px 10px; font-size: 13px; gap: 6px; }
+  .replacementDialog { padding: 14px; }
+  .replacementSources button { padding-left: 4px; padding-right: 4px; }
+  .replacementRow { grid-template-columns: 44px minmax(0, 1fr) auto; }
+  .replacementDialog input { font-size: 16px; min-width: 0; }
+}

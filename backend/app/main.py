@@ -23,6 +23,7 @@ from app.routers.search import router as search_router
 from app.routers.queue_playback import router as queue_router
 from app.routers.playlists_trending import router as playlists_router
 from app.routers.admin import router as admin_router
+from app.routers.track_maintenance import router as track_maintenance_router
 from app.ws import hub
 
 
@@ -103,6 +104,7 @@ app.include_router(rooms_router)
 app.include_router(search_router)
 app.include_router(queue_router)
 app.include_router(playlists_router)
+app.include_router(track_maintenance_router)
 app.include_router(admin_router)
 
 

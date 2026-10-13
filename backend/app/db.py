@@ -54,6 +54,9 @@ def _migrate_columns():
     """Add any missing columns to existing tables (lightweight migration)."""
     migrations = [
         ("users", "is_admin", "BOOLEAN DEFAULT 0"),
+        ("tracks", "availability", "VARCHAR(16) NOT NULL DEFAULT 'unknown'"),
+        ("tracks", "unavailable_reason", "VARCHAR(240)"),
+        ("tracks", "availability_checked_at", "DATETIME"),
         ("tracks", "loudness_gain_db", "REAL"),
         ("tracks", "loudness_peak", "REAL"),
         ("tracks", "loudness_source", "VARCHAR(40)"),

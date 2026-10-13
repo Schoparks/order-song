@@ -4,6 +4,7 @@ import { api } from "../lib/api";
 import { trackKey, trackPayload } from "../lib/track";
 import type { Playlist, Track } from "../types";
 import { CardDialog, EmptyState, SegmentedTabs } from "./common";
+import { UnavailableTracksDialog, type BatchOrderResult } from "./TrackAvailability";
 import { RandomPlaylistOrderDialog } from "./RandomPlaylistOrderDialog";
 
 type CollectionMode = "create" | "existing";
@@ -73,17 +74,19 @@ function BilibiliCollectionRandomButton({
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [batchResult, setBatchResult] = useState<BatchOrderResult | null>(null);
 
   async function randomOrderCollection(count: number) {
     setBusy(true);
     setError("");
     try {
-      await api(`/api/rooms/${roomId}/queue/batch`, {
+      const result = await api<BatchOrderResult>(`/api/rooms/${roomId}/queue/batch`, {
         method: "POST",
         token,
         json: { items: parts.map(trackPayload), count, random: true },
       });
       setOpen(false);
+      if (result.skipped_unavailable?.length) setBatchResult(result);
       onChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : "随机点歌失败");
@@ -97,6 +100,7 @@ function BilibiliCollectionRandomButton({
       <button className="smallButton" disabled={busy || parts.length < 1} onClick={() => setOpen(true)}>
         <Shuffle />随机点歌
       </button>
+      {!!batchResult?.skipped_unavailable?.length && <UnavailableTracksDialog tracks={batchResult.skipped_unavailable} added={batchResult.added} onClose={() => setBatchResult(null)} />}
       {open && (
         <RandomPlaylistOrderDialog
           targetId={trackKey(track)}

@@ -135,7 +135,7 @@ class SearchSourceTests(unittest.IsolatedAsyncioTestCase):
         )
         with patch.object(search_router, "_run_bilibili", AsyncMock(side_effect=RuntimeError("down"))), patch.object(
             search_router, "_run_netease", AsyncMock(return_value=[result])
-        ):
+        ), patch.object(search_router, "annotate_search_results", side_effect=lambda items: items):
             response = await search_router.search("song", source="all", user=object())
         self.assertEqual([item.source_track_id for item in response], ["1"])
 

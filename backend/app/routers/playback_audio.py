@@ -11,7 +11,7 @@ from app.bilibili import find_bilibili_page, normalize_bilibili_pic, parse_bilib
 from app.core.config import settings
 from app.db import engine
 from app.models import Track, TrackSource
-from app.qq_music import QQMusicUnavailable, qq_music
+from app.qq_music import QQMusicUnavailable, QQTrackUnavailable, qq_music
 
 
 @dataclass
@@ -21,9 +21,12 @@ class AudioResolveResult:
     loudness_gain_db: float | None = None
     loudness_peak: float | None = None
     loudness_source: str | None = None
+    unavailable_reason: str | None = None
 
 
 def _direct_playback_audio_url(track: Track) -> str | None:
+    if track.availability == "unavailable":
+        return None
     if track.source == TrackSource.qq:
         return qq_music.current_audio_url(track.source_track_id, track.audio_url)
     if track.audio_url and validate_trusted_audio_url(track.audio_url, track.source.value) is None:
@@ -150,6 +153,10 @@ async def _resolve_netease_audio(source_track_id: str) -> AudioResolveResult:
             items = data.get("data") if isinstance(data, dict) else None
             item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else {}
             audio_url = item.get("url") if isinstance(item.get("url"), str) else None
+            if item.get("freeTrialInfo"):
+                return AudioResolveResult(unavailable_reason="该歌曲仅提供试听，无法完整播放")
+            if not audio_url and item and data.get("code") == 200 and item.get("code") in (200, 404, -110):
+                return AudioResolveResult(unavailable_reason="该歌曲已下架或当前无完整播放权限")
             return AudioResolveResult(
                 audio_url=audio_url,
                 analysis_audio_url=audio_url,
@@ -162,6 +169,8 @@ async def _resolve_qq_audio(source_track_id: str, *, force: bool = False) -> Aud
     try:
         audio_url = await qq_music.resolve_audio_url(source_track_id, force=force)
         return AudioResolveResult(audio_url=audio_url, analysis_audio_url=audio_url)
+    except QQTrackUnavailable:
+        return AudioResolveResult(unavailable_reason="该歌曲已下架或不再提供免费完整播放")
     except QQMusicUnavailable:
         return AudioResolveResult()
     except Exception:
@@ -184,11 +193,18 @@ async def _resolve_bilibili_audio(source_track_id: str, *, video_data: dict[str,
                 )
                 r.raise_for_status()
                 data = r.json()
+                if data.get("code") in (-404, 62002, 62004):
+                    return AudioResolveResult(unavailable_reason="该视频已删除、下架或不可见")
                 if data.get("code") != 0:
                     return AudioResolveResult()
                 vid = data["data"]
             if not vid:
                 return AudioResolveResult()
+            pages = vid.get("pages")
+            if ref.is_part and isinstance(pages, list) and pages:
+                exists = any(isinstance(p, dict) and (p.get("cid") == ref.cid if ref.cid else p.get("page") == ref.page) for p in pages)
+                if not exists:
+                    return AudioResolveResult(unavailable_reason="该视频分集已删除或替换")
             page = find_bilibili_page(vid, ref)
             cid = ref.cid or (page.get("cid") if page else None) or vid.get("cid")
             if not cid:

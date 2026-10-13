@@ -36,10 +36,12 @@ export function withBase(path: string): string {
 
 export class ApiError extends Error {
   status: number;
+  detail: unknown;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, detail?: unknown) {
     super(message);
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -58,13 +60,16 @@ export async function api<T>(path: string, options: RequestInit & { token?: stri
   if (!res.ok) {
     const text = await res.text();
     let message = text || `HTTP ${res.status}`;
+    let detail: unknown;
     try {
       const parsed = JSON.parse(text);
-      message = parsed.detail || message;
+      detail = parsed.detail;
+      message = typeof detail === "string" ? detail : detail && typeof detail === "object" && "message" in detail
+        ? String(detail.message) : message;
     } catch {
       // Keep plain text.
     }
-    throw new ApiError(message, res.status);
+    throw new ApiError(message, res.status, detail);
   }
   const contentType = res.headers.get("content-type") || "";
   if (contentType.includes("application/json")) return (await res.json()) as T;

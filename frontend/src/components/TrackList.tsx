@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { BadgePlus, Check, Heart, ListMusic, Plus } from "lucide-react";
 import { api } from "../lib/api";
+import { UnavailableTrackActions, unavailableTrackFromError } from "./TrackAvailability";
 import { trackKey, trackPayload } from "../lib/track";
 import type { Playlist, Track } from "../types";
 import { CardDialog, EmptyState, TrackCover } from "./common";
@@ -76,7 +77,7 @@ function isTrackInPlaylist(track: Track, playlistMap: Record<string, PlaylistMem
 }
 
 function TrackRow({
-  track,
+  track: initialTrack,
   meta,
   token,
   roomId,
@@ -102,6 +103,10 @@ function TrackRow({
   expandBilibiliParts: boolean;
   prioritizePlaylistMatches: boolean;
 }) {
+  const [failedTrack, setFailedTrack] = useState<Track | null>(null);
+  useEffect(() => { setFailedTrack(null); }, [initialTrack]);
+  const track = initialTrack.availability === "unavailable" ? initialTrack : failedTrack || initialTrack;
+  const unavailable = track.availability === "unavailable";
   const [busy, setBusy] = useState<"queue" | "playlist" | null>(null);
   const [queueError, setQueueError] = useState("");
   const [expanded, setExpanded] = useState(false);
@@ -110,11 +115,12 @@ function TrackRow({
   const expandable = expandBilibiliParts && parts.length > 0;
   return (
     <>
-      <article className={`songRow ${expandable ? "songRowExpandable" : ""}`}>
+      <article className={`songRow ${expandable ? "songRowExpandable" : ""} ${unavailable ? "songRowUnavailable" : ""}`}>
         <TrackCover track={track} />
         <div className="songInfo">
           <strong>{track.title}</strong>
           <span>{meta || `${track.source} · ${track.artist || "-"}`}</span>
+          {unavailable && <span className="unavailableLabel">已失效 · {track.unavailable_reason || "无法播放"}</span>}
         </div>
         <div className="rowActions">
           {expandable ? (
@@ -141,7 +147,7 @@ function TrackRow({
             <>
               <button
                 className={`smallButton ${queued ? "active" : ""}`}
-                disabled={busy === "queue"}
+                disabled={busy !== null || unavailable}
                 onClick={async () => {
                   setBusy("queue");
                   setQueueError("");
@@ -149,15 +155,17 @@ function TrackRow({
                     await api(`/api/rooms/${roomId}/queue`, { method: "POST", token, json: trackPayload(track) });
                     onChanged();
                   } catch (error) {
+                    const failed = unavailableTrackFromError(error);
+                    if (failed) { setFailedTrack(failed); onChanged(); }
                     setQueueError(error instanceof Error ? error.message : "点歌失败，请重试");
                   } finally {
                     setBusy(null);
                   }
                 }}
               >
-                <BadgePlus />{busy === "queue" ? "点歌中…" : queued ? "已点" : "点歌"}
+                <BadgePlus />{unavailable ? "已失效" : busy === "queue" ? "点歌中…" : queued ? "已点" : "点歌"}
               </button>
-              <PlaylistQuickButton
+              {unavailable ? <UnavailableTrackActions track={track} token={token} onChanged={onChanged} /> : <PlaylistQuickButton
                 track={track}
                 token={token}
                 playlists={playlists}
@@ -166,7 +174,7 @@ function TrackRow({
                 busy={busy === "playlist"}
                 setBusy={(value) => setBusy(value ? "playlist" : null)}
                 onChanged={onChanged}
-              />
+              />}
             </>
           )}
         </div>

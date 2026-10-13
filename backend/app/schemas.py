@@ -84,6 +84,9 @@ class TrackOut(BaseModel):
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
     audio_url: Optional[str] = None
+    availability: str = "unknown"
+    unavailable_reason: Optional[str] = None
+    availability_checked_at: Optional[datetime] = None
     loudness_gain_db: Optional[float] = None
     loudness_peak: Optional[float] = None
     loudness_source: Optional[str] = None
@@ -91,6 +94,10 @@ class TrackOut(BaseModel):
 
 
 class SearchTrackPartOut(BaseModel):
+    id: Optional[int] = None
+    availability: str = "unknown"
+    unavailable_reason: Optional[str] = None
+    availability_checked_at: Optional[datetime] = None
     source: TrackSource
     source_track_id: str
     title: str

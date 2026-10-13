@@ -65,6 +65,9 @@ class Track(SQLModel, table=True):
     duration_ms: Optional[int] = None
     cover_url: Optional[str] = None
     audio_url: Optional[str] = None
+    availability: str = Field(default="unknown", max_length=16)
+    unavailable_reason: Optional[str] = Field(default=None, max_length=240)
+    availability_checked_at: Optional[datetime] = None
     loudness_gain_db: Optional[float] = None
     loudness_peak: Optional[float] = None
     loudness_source: Optional[str] = Field(default=None, max_length=40)

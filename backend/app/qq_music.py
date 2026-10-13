@@ -27,6 +27,10 @@ class QQMusicUnavailable(RuntimeError):
     pass
 
 
+class QQTrackUnavailable(RuntimeError):
+    """Successful metadata lookup confirms the track cannot be played in full."""
+
+
 class QQMusicService:
     def __init__(self) -> None:
         self._client: Any | None = None
@@ -530,8 +534,8 @@ class QQMusicService:
 
         async def operation() -> str | None:
             response = await self._client.song.query_song([source_track_id])
-            if not response.tracks:
-                return None
+            if not response.tracks or not self._is_free_candidate(response.tracks[0]):
+                raise QQTrackUnavailable("track is unavailable")
             urls = await self._playable_urls(response.tracks[:1])
             return urls.get(source_track_id)
 

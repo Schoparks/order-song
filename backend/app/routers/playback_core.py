@@ -22,6 +22,7 @@ from app.routers.playback_audio import (
     _resolve_qq_audio,
 )
 from app.schemas import PlaybackControlIn, PlaybackStateOut, TrackOut
+from app.track_availability import begin_resolution, clear_invalid_loudness_metadata, persist_resolution, schedule_unavailable_pause
 from app.ws import hub
 
 
@@ -114,17 +115,11 @@ def _track_has_loudness(track: Track) -> bool:
 
 
 def _clear_invalid_loudness_metadata(track: Track) -> bool:
-    if not track.loudness_source or _track_has_loudness(track):
-        return False
-    track.loudness_gain_db = None
-    track.loudness_peak = None
-    track.loudness_source = None
-    track.loudness_fetched_at = None
-    return True
+    return clear_invalid_loudness_metadata(track)
 
 
 def _track_needs_backend_loudness(track: Track) -> bool:
-    return track.source in _BACKEND_LOUDNESS_SOURCES and not _track_has_loudness(track) and not _recent_loudness_error(track)
+    return track.availability != "unavailable" and track.source in _BACKEND_LOUDNESS_SOURCES and not _track_has_loudness(track) and not _recent_loudness_error(track)
 
 
 def _prune_room_normalizer_prefs(now: float | None = None) -> None:
@@ -268,6 +263,9 @@ def _clear_invalid_loudness_transaction(track_id: int) -> None:
 
 
 async def _ensure_playback_audio_url(db: Session, track: Track) -> None:
+    if track.availability == "unavailable":
+        schedule_unavailable_pause(track)
+        return
     if track.id and track.loudness_source and not _track_has_loudness(track):
         db.rollback()
         await asyncio.to_thread(_clear_invalid_loudness_transaction, track.id)
@@ -334,14 +332,16 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
             _schedule_loudness_analysis(track.id, track.source, track.audio_url)
         return track.audio_url
 
+    generation = begin_resolution(track.id)
     if track.source == TrackSource.netease:
         track_id = track.id
         source_track_id = track.source_track_id
         db.rollback()
         result = await _resolve_netease_audio(source_track_id)
-        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
+        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force, generation)
         db.expire_all()
         db.refresh(track)
+        schedule_unavailable_pause(track)
         if _track_needs_backend_loudness(track):
             _schedule_loudness_analysis(
                 track.id,
@@ -356,9 +356,10 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         source_track_id = track.source_track_id
         db.rollback()
         result = await _resolve_qq_audio(source_track_id, force=force)
-        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
+        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force, generation)
         db.expire_all()
         db.refresh(track)
+        schedule_unavailable_pause(track)
         if _track_needs_backend_loudness(track) and result.analysis_audio_url:
             _schedule_loudness_analysis(
                 track.id,
@@ -375,9 +376,10 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
         source_track_id = track.source_track_id
         db.rollback()
         result = await _resolve_bilibili_audio(source_track_id, video_data=video)
-        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force)
+        await asyncio.to_thread(_persist_audio_resolution_transaction, track_id, result, force, generation)
         db.expire_all()
         db.refresh(track)
+        schedule_unavailable_pause(track)
         if _track_needs_backend_loudness(track):
             _schedule_loudness_analysis(track.id, track.source, result.analysis_audio_url or track.audio_url, force=force)
         return track.audio_url
@@ -385,26 +387,8 @@ async def _resolve_audio_url(db: Session, track: Track, *, force: bool = False) 
     return None
 
 
-def _persist_audio_resolution_transaction(
-    track_id: int | None,
-    result: AudioResolveResult,
-    force: bool,
-) -> None:
-    if not track_id:
-        return
-    with Session(engine) as write_db:
-        track = write_db.get(Track, track_id)
-        if not track:
-            return
-        if track.source not in _BACKEND_LOUDNESS_SOURCES:
-            return
-        if track.source == TrackSource.netease:
-            track.audio_url = result.audio_url or f"https://music.163.com/song/media/outer/url?id={track.source_track_id}.mp3"
-        elif force or result.audio_url:
-            track.audio_url = result.audio_url
-        _clear_invalid_loudness_metadata(track)
-        write_db.add(track)
-        write_db.commit()
+def _persist_audio_resolution_transaction(track_id: int | None, result: AudioResolveResult, force: bool, generation: datetime | None = None) -> None:
+    persist_resolution(track_id, result, force, generation, db_engine=engine)
 
 
 def _schedule_track_loudness_prefetch(track_id: int | None) -> None:
@@ -485,6 +469,10 @@ async def _prepare_current_track_for_playback(db: Session, room_id: int, pb: Roo
         tr = db.get(Track, qi.track_id) if qi else None
     if not qi or not tr or not tr.id:
         return expected_queue_item_id is None
+    if tr.availability == "unavailable":
+        _ROOM_LOUDNESS_WAITING.pop(room_id, None)
+        schedule_unavailable_pause(tr)
+        return True
     if (
         _is_loudness_waiting(room_id, qi.id)
         and tr.id not in _LOUDNESS_ANALYSIS_TASKS

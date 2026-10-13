@@ -28,6 +28,8 @@ import { MiniPlayer, NowPlayingDock, PlayerSheet } from "./components/NowPlaying
 import { MembersPanel, UserMenu } from "./components/Popovers";
 import { PlaylistsView, SearchOverlay } from "./components/SearchPlaylists";
 import { ConfirmDialog, ScrollArea, SegmentedTabs } from "./components/common";
+import { TrackRepairContext } from "./components/TrackAvailability";
+import { TrackReplacementDialog } from "./components/TrackReplacementDialog";
 import { TrackList, type PlaylistMembership } from "./components/TrackList";
 import type {
   PlaybackEnvelope,
@@ -36,6 +38,7 @@ import type {
   QueueItem,
   Room,
   TrendingItem,
+  Track,
   UserPublic,
   WsMessage,
 } from "./types";
@@ -53,6 +56,8 @@ export function App() {
   const [tab, setTab] = useState<Tab>("trending");
   const [queueTab, setQueueTab] = useState<QueueTab>("queue");
   const [activeOverlay, setActiveOverlay] = useState<Overlay>(null);
+  const [replacementTarget, setReplacementTarget] = useState<Track | null>(null);
+  const [trackNotice, setTrackNotice] = useState("");
   const [leaveConfirmOpen, setLeaveConfirmOpen] = useState(false);
   const [connectionState, setConnectionState] = useRoomConnectionState(roomId);
   const [hint, setHint] = useState("");
@@ -99,7 +104,16 @@ export function App() {
     enabled: !!token && !!roomId,
   });
 
-  const audio = useAudioController(roomId, token, queueQuery.data || [], config.audio_loudness.ffmpeg_available);
+  const refreshRoomData = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ["queue", roomId, token] });
+    queryClient.invalidateQueries({ queryKey: ["history", roomId, token] });
+    queryClient.invalidateQueries({ queryKey: ["trending", token] });
+    queryClient.invalidateQueries({ queryKey: ["playlists", token] });
+    queryClient.invalidateQueries({ queryKey: ["playlist-map", token] });
+    queryClient.invalidateQueries({ queryKey: ["playlist-items"] });
+  }, [queryClient, roomId, token]);
+
+  const audio = useAudioController(roomId, token, queueQuery.data || [], config.audio_loudness.ffmpeg_available, refreshRoomData);
 
   const historyQuery = useQuery({
     queryKey: ["history", roomId, token],
@@ -152,6 +166,8 @@ export function App() {
   }, [queueTabInPrimary, tab]);
 
   useEffect(() => {
+    setReplacementTarget(null);
+    setTrackNotice("");
     if (token) resetMobileViewport();
   }, [roomId, token]);
 
@@ -177,13 +193,7 @@ export function App() {
     if (roomId) writeRoomIdForUser(roomId, meQuery.data.id);
   }, [meQuery.data, roomId]);
 
-  const refreshRoomData = useCallback(() => {
-    queryClient.invalidateQueries({ queryKey: ["queue", roomId, token] });
-    queryClient.invalidateQueries({ queryKey: ["history", roomId, token] });
-    queryClient.invalidateQueries({ queryKey: ["trending", token] });
-    queryClient.invalidateQueries({ queryKey: ["playlists", token] });
-    queryClient.invalidateQueries({ queryKey: ["playlist-map", token] });
-  }, [queryClient, roomId, token]);
+
 
   const applyPlaybackEnvelope = audio.applyPlaybackEnvelope;
 
@@ -402,6 +412,7 @@ export function App() {
   } as CSSProperties;
 
   return (
+    <TrackRepairContext.Provider value={{ onRepair: (track) => { setActiveOverlay(null); setTrackNotice(""); setReplacementTarget(track); }, canRepair: (track) => (playlistMap[trackKey(track)] || []).length > 0 }}>
     <div className="appFrame">
       <TopBar
         roomName={roomQuery.data?.name || `房间 #${roomId}`}
@@ -451,6 +462,7 @@ export function App() {
               items={libraryTabs}
             />
             <ScrollArea className="libraryScroll">
+              {trackNotice && <p className="hintText" role="status">{trackNotice}</p>}
               {tab === "trending" && (
                 <TrackList
                   items={(trendingQuery.data || []).map((item) => ({ track: item.track, meta: `${item.track.source} · ${item.track.artist || "-"} · ${item.order_count} 次` }))}
@@ -536,11 +548,13 @@ export function App() {
           onChanged={refreshRoomData}
         />
       )}
+      {replacementTarget && <TrackReplacementDialog key={trackKey(replacementTarget)} track={replacementTarget} token={token} qqMusicEnabled={config.qq_music.enabled} onClose={() => setReplacementTarget(null)} onReplaced={(message) => { setReplacementTarget(null); setTrackNotice(message); refreshRoomData(); }} />}
       {leaveConfirmOpen && <ConfirmDialog title="退出房间？" message="退出后需要重新加入才能继续点歌。" confirmText="退出房间" onCancel={() => setLeaveConfirmOpen(false)} onConfirm={async () => {
         await api(`/api/rooms/${roomId}/leave`, { method: "POST", token });
         setLeaveConfirmOpen(false);
         handleRoomGone();
       }} />}
     </div>
+    </TrackRepairContext.Provider>
   );
 }
